@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rebellion 2
+Comment=Rebellion 2 strategy game
+Exec=Rebellion2.x86_64
+Icon=rebellion2
+Categories=Game;StrategyGame;
+Terminal=false

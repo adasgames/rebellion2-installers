@@ -1,0 +1,235 @@
+name: Build Installers
+
+# Manually triggered from the Actions tab ("Run workflow").
+# Pulls game source (rebellion2) + art (rebellion2-media), cross-builds all three
+# desktop players on a single Linux runner, packages each into an installer, and
+# publishes them to a GitHub Release in this repo.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the installers (blank = read bundleVersion from ProjectSettings)"
+        required: false
+        default: ""
+      source_ref:
+        description: "rebellion2 (game) ref to build"
+        required: false
+        default: "master"
+      media_ref:
+        description: "rebellion2-media ref to bundle"
+        required: false
+        default: "28b6bca5c8246c98cb4f081ccbfc9ad13b552545"
+
+env:
+  UNITY_VERSION: 6000.4.0f1
+
+jobs:
+  # Resolve the version string once so every leg and the release agree on it.
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Checkout game ProjectSettings
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: ProjectSettings/ProjectSettings.asset
+          sparse-checkout-cone-mode: false
+          path: game
+
+      - name: Resolve version
+        id: resolve
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="$(grep -m1 'bundleVersion:' game/ProjectSettings/ProjectSettings.asset | sed 's/.*bundleVersion:[[:space:]]*//' | tr -d '\r')"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "Could not resolve a version string." >&2
+            exit 1
+          fi
+          echo "Resolved version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.targetPlatform }})
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        targetPlatform:
+          - StandaloneWindows64
+          - StandaloneLinux64
+          - StandaloneOSX
+
+    steps:
+      - name: Checkout installer repo (packaging scripts)
+        uses: actions/checkout@v4
+
+      - name: Checkout game source
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          path: game
+
+      - name: Checkout media
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2-media
+          ref: ${{ inputs.media_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          lfs: true
+          sparse-checkout: |
+            Art
+            Audio
+            Videos
+          path: .ci/rebellion2-media
+
+      - name: Install media into project
+        run: |
+          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Art/ game/Assets/Resources/Art/
+          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Audio/ game/Assets/Resources/Audio/
+          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Videos/ game/Assets/Resources/Videos/
+          rm -rf .ci
+
+      - name: Cache Library
+        uses: actions/cache@v4
+        with:
+          path: game/Library
+          key: Library-${{ matrix.targetPlatform }}-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
+          restore-keys: |
+            Library-${{ matrix.targetPlatform }}-
+            Library-
+
+      - name: Build player
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: game
+          unityVersion: ${{ env.UNITY_VERSION }}
+          targetPlatform: ${{ matrix.targetPlatform }}
+          buildName: Rebellion2
+          buildsPath: build
+          allowDirtyBuild: true
+          versioning: None
+
+      - name: Inspect build output
+        run: ls -R build/${{ matrix.targetPlatform }} | head -80
+
+      - name: Install packaging tools
+        run: |
+          set -euo pipefail
+          case "${{ matrix.targetPlatform }}" in
+            StandaloneWindows64)
+              sudo apt-get update
+              sudo apt-get install -y nsis
+              ;;
+            StandaloneLinux64)
+              sudo apt-get update
+              sudo apt-get install -y imagemagick
+              wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
+              sudo chmod +x /usr/local/bin/appimagetool
+              ;;
+            StandaloneOSX)
+              : # zip is preinstalled
+              ;;
+          esac
+
+      - name: Package installer
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          case "${{ matrix.targetPlatform }}" in
+            StandaloneWindows64)
+              makensis \
+                -DVERSION="$VERSION" \
+                -DSRCDIR="$PWD/build/StandaloneWindows64" \
+                -DOUTFILE="$PWD/dist/Rebellion2-$VERSION-Setup.exe" \
+                packaging/windows/rebellion2.nsi
+              ;;
+            StandaloneLinux64)
+              bash packaging/linux/build-appimage.sh \
+                "$PWD/build/StandaloneLinux64" \
+                "$VERSION" \
+                "$PWD/dist/Rebellion2-$VERSION-x86_64.AppImage"
+              ;;
+            StandaloneOSX)
+              bash packaging/macos/build-zip.sh \
+                "$PWD/build/StandaloneOSX" \
+                "$VERSION" \
+                "$PWD/dist/Rebellion2-$VERSION-macOS.zip"
+              ;;
+          esac
+          ls -lh dist
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.targetPlatform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Download all installers
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected installers
+        run: ls -lhR dist
+
+      - name: Publish rolling "latest" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Rolling release: replace assets each run so download URLs stay stable.
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Rebellion 2 (latest — v$VERSION)" \
+            --notes "Automated build of Rebellion 2 v$VERSION. Unsigned; see README for install notes." \
+            dist/*
+
+      - name: Publish immutable versioned release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it untouched."
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Rebellion 2 v$VERSION" \
+              --notes "Automated build of Rebellion 2 v$VERSION. Unsigned; see README for install notes." \
+              dist/*
+          fi
