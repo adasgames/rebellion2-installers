@@ -53,5 +53,15 @@ packaging/linux/rebellion2.desktop       # AppImage desktop entry
 packaging/macos/build-zip.sh             # .app -> zip
 ```
 
-Drop a real `packaging/linux/rebellion2.png` (256×256) and the AppImage will use it;
-otherwise a solid-color placeholder icon is generated at build time.
+## Icon
+
+`branding/rebellion2-icon.png` (512×512, transparent) is the single source of truth.
+The workflow derives the per-platform icons from it at build time:
+
+- Windows — a multi-size `.ico` used for the NSIS installer wizard and the Start-Menu shortcut.
+- macOS — an `.icns` swapped into the `.app` bundle so the game shows the icon in Dock/Finder.
+- Linux — a 256×256 `.png` the AppImage uses.
+
+Replace that one PNG to rebrand everything. Note: the **Windows `.exe`'s own embedded icon**
+(and the running window/taskbar icon) is baked by Unity PlayerSettings in the `rebellion2`
+repo, not here — brand that separately if you want the raw executable icon to match.
