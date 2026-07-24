@@ -18,7 +18,7 @@ on:
       media_ref:
         description: "rebellion2-media ref to bundle"
         required: false
-        default: "28b6bca5c8246c98cb4f081ccbfc9ad13b552545"
+        default: "b474094114320b0ea97455bdb0f12ef364fb09f6"
 
 env:
   UNITY_VERSION: 6000.4.0f1
