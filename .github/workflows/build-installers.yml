@@ -179,6 +179,31 @@ jobs:
               ;;
           esac
 
+      - name: Generate platform icon
+        run: |
+          set -euo pipefail
+          MASTER="branding/rebellion2-icon.png"
+          case "${{ matrix.targetPlatform }}" in
+            StandaloneWindows64)
+              sudo apt-get install -y imagemagick
+              convert "$MASTER" -background none -define icon:auto-resize=256,128,64,48,32,16 packaging/windows/rebellion2.ico
+              ;;
+            StandaloneLinux64)
+              convert "$MASTER" -background none -resize 256x256 packaging/linux/rebellion2.png
+              ;;
+            StandaloneOSX)
+              sudo apt-get update
+              sudo apt-get install -y imagemagick icnsutils
+              tmp="$(mktemp -d)"
+              for s in 16 32 48 128 256 512; do
+                convert "$MASTER" -background none -resize ${s}x${s} "$tmp/icon_${s}.png"
+              done
+              png2icns packaging/macos/rebellion2.icns \
+                "$tmp/icon_16.png" "$tmp/icon_32.png" "$tmp/icon_48.png" \
+                "$tmp/icon_128.png" "$tmp/icon_256.png" "$tmp/icon_512.png"
+              ;;
+          esac
+
       - name: Package installer
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -192,6 +217,7 @@ jobs:
                 -DVERSION="$VERSION" \
                 -DSRCDIR="$PWD/build/StandaloneWindows64" \
                 -DOUTFILE="$PWD/dist/Rebellion2-$VERSION-Setup.exe" \
+                -DICONFILE="$PWD/packaging/windows/rebellion2.ico" \
                 packaging/windows/rebellion2.nsi
               ;;
             StandaloneLinux64)
@@ -204,7 +230,8 @@ jobs:
               bash packaging/macos/build-zip.sh \
                 "$PWD/build/StandaloneOSX" \
                 "$VERSION" \
-                "$PWD/dist/Rebellion2-$VERSION-macOS.zip"
+                "$PWD/dist/Rebellion2-$VERSION-macOS.zip" \
+                "$PWD/packaging/macos/rebellion2.icns"
               ;;
           esac
           ls -lh dist
