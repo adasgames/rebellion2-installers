@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.nsi text eol=lf
+*.desktop text eol=lf
+*.md text eol=lf
+*.png binary
+*.ico binary
