@@ -1,60 +1,45 @@
-# rebellion2-installers
+# Rebellion 2
 
-Multi-platform installer pipeline for **Rebellion 2**.
+Download and install **Rebellion 2** for Windows, macOS, or Linux.
 
-A single manually-triggered GitHub Actions workflow pulls the game source
-([`rebellion2`](https://github.com/davidadas/rebellion2)) and art
-([`rebellion2-media`](https://github.com/davidadas/rebellion2-media)), cross-builds all
-three desktop players on one Linux runner, packages each into an installer, and publishes
-them to a GitHub Release in this repo.
+## Download
 
-| Platform | Package | Notes |
-|----------|---------|-------|
-| Windows  | `Rebellion2-<version>-Setup.exe`      | NSIS installer — Start-Menu shortcut + uninstaller. Installs to `Program Files`. |
-| Linux    | `Rebellion2-<version>-x86_64.AppImage`| Portable single file. `chmod +x` and run. |
-| macOS    | `Rebellion2-<version>-macOS.zip`      | Unzip, drag `Rebellion2.app` to Applications. |
+**➡️ [Get the latest version](https://github.com/davidadas/rebellion2-installers/releases/latest)**
 
-Everything is **unsigned** right now:
-- **macOS** — Gatekeeper blocks it on first launch. Users right-click the app → **Open**, then confirm.
-- **Windows** — SmartScreen shows a warning: **More info → Run anyway**.
-- **Linux** — no restriction.
+Grab the file for your system:
 
-When code signing is added later, the macOS leg moves to a `macos` runner to produce a
-signed/notarized `.dmg`, and the Windows leg gains an Authenticode signing step.
+| Your system | Download |
+|-------------|----------|
+| **Windows** | `Rebellion2-<version>-Setup.exe` |
+| **macOS**   | `Rebellion2-<version>-macOS.zip` |
+| **Linux**   | `Rebellion2-<version>-x86_64.AppImage` |
 
-## Running it
+## Install
 
-Actions tab → **Build Installers** → **Run workflow**. Inputs (all optional):
+### Windows
+1. Run **`Rebellion2-<version>-Setup.exe`**.
+2. Windows may show a blue **"Windows protected your PC"** box. Click **More info → Run anyway**.
+3. Follow the installer. Rebellion 2 lands in your Start Menu.
 
-- **version** — installer version string. Blank reads `bundleVersion` from the game's `ProjectSettings.asset`.
-- **source_ref** — `rebellion2` ref to build (default `master`).
-- **media_ref** — `rebellion2-media` ref to bundle (default: the revision pinned in the workflow).
+### macOS
+1. Unzip **`Rebellion2-<version>-macOS.zip`**.
+2. Drag **`Rebellion2.app`** into your **Applications** folder.
+3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
+   double-click will be blocked — you only need the right-click trick once.)
 
-Each run overwrites the rolling **`latest`** release and, if it does not already exist,
-creates an immutable **`v<version>`** release.
+### Linux
+1. Download **`Rebellion2-<version>-x86_64.AppImage`**.
+2. Make it executable — right-click → *Properties → Permissions → Allow executing*, or run:
+   ```bash
+   chmod +x Rebellion2-*.AppImage
+   ```
+3. Double-click it, or run `./Rebellion2-*.AppImage`.
 
-## Required secrets
+## Heads up
 
-Set these under **Settings → Secrets and variables → Actions** before the first run:
+These builds are **not yet code-signed**, which is why Windows and macOS show the warnings
+above — they're expected and safe to dismiss. Signing is on the roadmap.
 
-| Secret | Purpose |
-|--------|---------|
-| `SOURCE_REPO_TOKEN` | PAT with **read** access to `rebellion2` **and** `rebellion2-media` (contents + LFS). Used for the cross-repo checkouts. A fine-grained PAT scoped to those two repos is ideal. |
-| `UNITY_EMAIL`       | Unity account email (for license activation). |
-| `UNITY_PASSWORD`    | Unity account password. |
-| `UNITY_LICENSE`     | Contents of the Unity `.ulf` personal license file (same value already used by the `rebellion2` CI). |
+---
 
-`GITHUB_TOKEN` is provided automatically and is what publishes the releases.
-
-## Layout
-
-```
-.github/workflows/build-installers.yml   # the pipeline
-packaging/windows/rebellion2.nsi         # NSIS installer script
-packaging/linux/build-appimage.sh        # AppDir assembly + appimagetool
-packaging/linux/rebellion2.desktop       # AppImage desktop entry
-packaging/macos/build-zip.sh             # .app -> zip
-```
-
-Drop a real `packaging/linux/rebellion2.png` (256×256) and the AppImage will use it;
-otherwise a solid-color placeholder icon is generated at build time.
+*Building the installers yourself or maintaining the release pipeline? See [`docs/BUILD.md`](docs/BUILD.md).*
