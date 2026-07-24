@@ -68,8 +68,11 @@ jobs:
       matrix:
         targetPlatform:
           - StandaloneWindows64
-          - StandaloneLinux64
-          - StandaloneOSX
+          # Linux/macOS temporarily parked: they need a bigger runner or a warm
+          # cache. Windows (Mono) is the lightest build and OOM'd right at the cap,
+          # so it's the best free shot. Re-add these once the cache is warm.
+          # - StandaloneLinux64
+          # - StandaloneOSX
 
     steps:
       # Unity editor images are ~10GB; the default runner disk overflows while
@@ -157,8 +160,9 @@ jobs:
           allowDirtyBuild: true
           versioning: None
           # Default container cap (~7.5GB) OOM-kills this project's build (exit 137).
-          # The runner has 16GB; give the build 13GB and leave headroom for the host.
-          dockerMemoryLimit: 13g
+          # 13g still OOM'd Windows right at the cap; push to 14g — the practical max
+          # on a 16GB runner (leaves ~2GB for the host) — to try to clear the peak.
+          dockerMemoryLimit: 14g
 
       - name: Inspect build output
         run: ls -R build/${{ matrix.targetPlatform }} | head -80
