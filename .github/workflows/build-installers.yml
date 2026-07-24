@@ -156,6 +156,9 @@ jobs:
           buildsPath: build
           allowDirtyBuild: true
           versioning: None
+          # Default container cap (~7.5GB) OOM-kills this project's build (exit 137).
+          # The runner has 16GB; give the build 13GB and leave headroom for the host.
+          dockerMemoryLimit: 13g
 
       - name: Inspect build output
         run: ls -R build/${{ matrix.targetPlatform }} | head -80
