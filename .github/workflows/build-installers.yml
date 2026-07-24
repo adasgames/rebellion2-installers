@@ -22,6 +22,7 @@ on:
 
 env:
   UNITY_VERSION: 6000.4.0f1
+  UNITY_IMAGE_VERSION: 3
 
 jobs:
   # Resolve the version string once so every leg and the release agree on it.
@@ -71,6 +72,19 @@ jobs:
           - StandaloneOSX
 
     steps:
+      # Unity editor images are ~10GB; the default runner disk overflows while
+      # extracting them on top of the game + LFS media. Reclaim space first.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
       - name: Checkout installer repo (packaging scripts)
         uses: actions/checkout@v4
 
@@ -112,6 +126,21 @@ jobs:
           restore-keys: |
             Library-${{ matrix.targetPlatform }}-
             Library-
+
+      - name: Pre-pull Unity image
+        run: |
+          case "${{ matrix.targetPlatform }}" in
+            StandaloneLinux64)   MODULE="linux-il2cpp" ;;
+            StandaloneWindows64) MODULE="windows-mono" ;;
+            StandaloneOSX)       MODULE="mac-mono" ;;
+          esac
+          IMAGE="unityci/editor:ubuntu-${{ env.UNITY_VERSION }}-${MODULE}-${{ env.UNITY_IMAGE_VERSION }}"
+          for attempt in 1 2 3; do
+            docker pull "$IMAGE" && exit 0
+            echo "Attempt $attempt failed, retrying in 30s..."
+            sleep 30
+          done
+          exit 1
 
       - name: Build player
         uses: game-ci/unity-builder@v4
