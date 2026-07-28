@@ -112,6 +112,7 @@ jobs:
             Art
             Audio
             Videos
+            Models
           path: .ci/rebellion2-media
 
       - name: Install media into project
@@ -119,6 +120,8 @@ jobs:
           rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Art/ game/Assets/Resources/Art/
           rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Audio/ game/Assets/Resources/Audio/
           rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Videos/ game/Assets/Resources/Videos/
+          # 3D models (fbx + PBR textures) live in media; sync into Assets/Art/Models (not Resources).
+          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Models/ game/Assets/Art/Models/
           rm -rf .ci
 
       - name: Cache Library
