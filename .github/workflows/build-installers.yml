@@ -86,7 +86,7 @@ jobs:
         with:
           repository: davidadas/rebellion2-media
           ref: main
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
           persist-credentials: false
           lfs: false
           path: game/.ci/rebellion2-media
