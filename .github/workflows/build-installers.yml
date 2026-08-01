@@ -68,9 +68,7 @@ jobs:
           docker-images: true
           large-packages: false
 
-      # Asset-free by construction: art lives in rebellion2-media and is
-      # gitignored from the game repo, so a plain checkout has no assets baked in.
-      - name: Checkout game (no media)
+      - name: Checkout game
         uses: actions/checkout@v4
         with:
           repository: davidadas/rebellion2
@@ -79,13 +77,51 @@ jobs:
           persist-credentials: false
           path: game
 
+      # Media (content pack + main-menu models) is needed at BUILD time for prefab
+      # authoring/previews. StandalonePlayerBuild strips Assets/Content from the
+      # final player and verifies it did not leak, so the shipped player stays
+      # asset-free — the real content ships separately as content.zip on R2.
+      - name: Checkout media (git only, no LFS)
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2-media
+          ref: main
+          ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
+          persist-credentials: false
+          lfs: false
+          path: game/.ci/rebellion2-media
+
+      - name: Pull media LFS from R2
+        working-directory: game/.ci/rebellion2-media
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          HOST="${R2_ENDPOINT#https://}"
+          git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
+          git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
+            echo "Media checkout still contains Git LFS pointers."; exit 1
+          fi
+
+      - name: Install media (editor-preview content + main-menu models)
+        working-directory: game
+        run: |
+          mkdir -p Assets/Content Assets/Art/Models/MainMenu
+          test -f .ci/rebellion2-media/Content/Application/Schemas/game-config.xsd
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Content/ Assets/Content/
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Models/MainMenu/ Assets/Art/Models/MainMenu/
+          rm -rf .ci
+
       - name: Cache Library
         uses: actions/cache@v4
         with:
           path: game/Library
-          key: Library-assetfree-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
+          key: Library-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
           restore-keys: |
-            Library-assetfree-
+            Library-
 
       - name: Build player
         uses: game-ci/unity-builder@v4
@@ -99,8 +135,8 @@ jobs:
           targetPlatform: StandaloneWindows64
           buildName: Rebellion2
           buildsPath: build
+          buildMethod: StandalonePlayerBuild.Build
           allowDirtyBuild: true
-          versioning: None
 
       - name: Upload player
         uses: actions/upload-artifact@v4
