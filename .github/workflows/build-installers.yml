@@ -1,117 +1,91 @@
 name: Build Installers
 
-# Manually triggered from the Actions tab ("Run workflow").
-# Pulls game source (rebellion2) + art (rebellion2-media), cross-builds all three
-# desktop players on a single Linux runner, packages each into an installer, and
-# publishes them to a GitHub Release in this repo.
+# Tag-driven, launcher-model installer build.
+#
+# Push a tag like `v0.0.2` to cut a release: this builds the ASSET-FREE game
+# player, builds the launcher, stamps the game exe icon, packages a per-user
+# Inno installer, and publishes it to a GitHub Release named after the tag.
+# Content (art) is NOT in the installer — the launcher downloads content.zip
+# from R2 after ownership verification.
+#
+# workflow_dispatch is the escape hatch for test builds (no Release is cut).
+#
+# Currently Windows-complete. macOS/Linux jobs are parked below until the
+# Windows path is validated end to end (see the commented block).
+
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version string for the installers (blank = read bundleVersion from ProjectSettings)"
-        required: false
-        default: ""
       source_ref:
         description: "rebellion2 (game) ref to build"
         required: false
         default: "master"
-      media_ref:
-        description: "rebellion2-media ref to bundle"
+      launcher_ref:
+        description: "rebellion2-infrastructure (launcher) ref to build"
         required: false
-        default: "28b6bca5c8246c98cb4f081ccbfc9ad13b552545"
+        default: "main"
+      version:
+        description: "Version string (blank = 0.0.0-dev for dispatch builds)"
+        required: false
+        default: ""
 
 env:
   UNITY_VERSION: 6000.4.0f1
 
 jobs:
-  # Resolve the version string once so every leg and the release agree on it.
   prepare:
-    name: Prepare
+    name: Resolve version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.resolve.outputs.version }}
+      version: ${{ steps.v.outputs.version }}
     steps:
-      - name: Checkout game ProjectSettings
-        uses: actions/checkout@v4
-        with:
-          repository: davidadas/rebellion2
-          ref: ${{ inputs.source_ref }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          persist-credentials: false
-          sparse-checkout: ProjectSettings/ProjectSettings.asset
-          sparse-checkout-cone-mode: false
-          path: game
-
-      - name: Resolve version
-        id: resolve
+      - id: v
         run: |
-          VERSION="${{ inputs.version }}"
-          if [ -z "$VERSION" ]; then
-            VERSION="$(grep -m1 'bundleVersion:' game/ProjectSettings/ProjectSettings.asset | sed 's/.*bundleVersion:[[:space:]]*//' | tr -d '\r')"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="0.0.0-dev"
           fi
-          if [ -z "$VERSION" ]; then
-            echo "Could not resolve a version string." >&2
-            exit 1
-          fi
-          echo "Resolved version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Build (${{ matrix.targetPlatform }})
+  player:
+    name: Build asset-free player (Windows)
     runs-on: ubuntu-latest
     needs: prepare
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        targetPlatform:
-          - StandaloneWindows64
-          - StandaloneLinux64
-          - StandaloneOSX
-
     steps:
-      - name: Checkout installer repo (packaging scripts)
-        uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          docker-images: true
+          large-packages: false
 
-      - name: Checkout game source
+      # Asset-free by construction: art lives in rebellion2-media and is
+      # gitignored from the game repo, so a plain checkout has no assets baked in.
+      - name: Checkout game (no media)
         uses: actions/checkout@v4
         with:
           repository: davidadas/rebellion2
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_ref || 'master' }}
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
           path: game
-
-      - name: Checkout media
-        uses: actions/checkout@v4
-        with:
-          repository: davidadas/rebellion2-media
-          ref: ${{ inputs.media_ref }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          persist-credentials: false
-          lfs: true
-          sparse-checkout: |
-            Art
-            Audio
-            Videos
-          path: .ci/rebellion2-media
-
-      - name: Install media into project
-        run: |
-          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Art/ game/Assets/Resources/Art/
-          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Audio/ game/Assets/Resources/Audio/
-          rsync -a --ignore-existing --exclude=.DS_Store .ci/rebellion2-media/Videos/ game/Assets/Resources/Videos/
-          rm -rf .ci
 
       - name: Cache Library
         uses: actions/cache@v4
         with:
           path: game/Library
-          key: Library-${{ matrix.targetPlatform }}-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
+          key: Library-assetfree-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
           restore-keys: |
-            Library-${{ matrix.targetPlatform }}-
-            Library-
+            Library-assetfree-
 
       - name: Build player
         uses: game-ci/unity-builder@v4
@@ -122,114 +96,110 @@ jobs:
         with:
           projectPath: game
           unityVersion: ${{ env.UNITY_VERSION }}
-          targetPlatform: ${{ matrix.targetPlatform }}
+          targetPlatform: StandaloneWindows64
           buildName: Rebellion2
           buildsPath: build
           allowDirtyBuild: true
           versioning: None
 
-      - name: Inspect build output
-        run: ls -R build/${{ matrix.targetPlatform }} | head -80
-
-      - name: Install packaging tools
-        run: |
-          set -euo pipefail
-          case "${{ matrix.targetPlatform }}" in
-            StandaloneWindows64)
-              sudo apt-get update
-              sudo apt-get install -y nsis
-              ;;
-            StandaloneLinux64)
-              sudo apt-get update
-              sudo apt-get install -y imagemagick
-              wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
-              sudo chmod +x /usr/local/bin/appimagetool
-              ;;
-            StandaloneOSX)
-              : # zip is preinstalled
-              ;;
-          esac
-
-      - name: Package installer
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          case "${{ matrix.targetPlatform }}" in
-            StandaloneWindows64)
-              makensis \
-                -DVERSION="$VERSION" \
-                -DSRCDIR="$PWD/build/StandaloneWindows64" \
-                -DOUTFILE="$PWD/dist/Rebellion2-$VERSION-Setup.exe" \
-                packaging/windows/rebellion2.nsi
-              ;;
-            StandaloneLinux64)
-              bash packaging/linux/build-appimage.sh \
-                "$PWD/build/StandaloneLinux64" \
-                "$VERSION" \
-                "$PWD/dist/Rebellion2-$VERSION-x86_64.AppImage"
-              ;;
-            StandaloneOSX)
-              bash packaging/macos/build-zip.sh \
-                "$PWD/build/StandaloneOSX" \
-                "$VERSION" \
-                "$PWD/dist/Rebellion2-$VERSION-macOS.zip"
-              ;;
-          esac
-          ls -lh dist
-
-      - name: Upload installer artifact
+      - name: Upload player
         uses: actions/upload-artifact@v4
         with:
-          name: installer-${{ matrix.targetPlatform }}
+          name: player-windows
+          path: build/StandaloneWindows64
+          if-no-files-found: error
+
+  windows-installer:
+    name: Package Windows installer
+    runs-on: windows-latest
+    needs: [prepare, player]
+    steps:
+      - name: Checkout installer repo (packaging)
+        uses: actions/checkout@v4
+
+      - name: Checkout launcher source
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2-infrastructure
+          ref: ${{ inputs.launcher_ref || 'main' }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          path: infra
+
+      - name: Download player
+        uses: actions/download-artifact@v4
+        with:
+          name: player-windows
+          path: player
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build launcher
+        working-directory: infra/launcher/src-tauri
+        run: cargo build --release
+
+      - name: Stamp game exe icon
+        shell: pwsh
+        run: |
+          choco install rcedit -y --no-progress
+          rcedit "player\Rebellion2.exe" --set-icon "infra\launcher\src-tauri\icons\icon.ico"
+
+      - name: Package installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $iscc `
+            /DGameDir="$PWD\player" `
+            /DLauncherPath="$PWD\infra\launcher\src-tauri\target\release\rebellion2-launcher.exe" `
+            /DAppVersion="${{ needs.prepare.outputs.version }}" `
+            /DOutputDir="$PWD\dist" `
+            /DIconFile="$PWD\infra\launcher\src-tauri\icons\icon.ico" `
+            packaging\windows\rebellion2-launcher.iss
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
           path: dist/*
           if-no-files-found: error
 
   release:
     name: Publish Release
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    needs: [prepare, build]
+    needs: [prepare, windows-installer]
     permissions:
       contents: write
     steps:
-      - name: Download all installers
+      - name: Download installers
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: List collected installers
-        run: ls -lhR dist
-
-      - name: Publish rolling "latest" release
+      - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          set -euo pipefail
-          # Rolling release: replace assets each run so download URLs stay stable.
-          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create latest \
+          gh release create "${GITHUB_REF_NAME}" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Rebellion 2 (latest — v$VERSION)" \
-            --notes "Automated build of Rebellion 2 v$VERSION. Unsigned; see README for install notes." \
+            --title "Rebellion 2 ${GITHUB_REF_NAME}" \
+            --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
             dist/*
 
-      - name: Publish immutable versioned release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          TAG="v$VERSION"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; leaving it untouched."
-          else
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Rebellion 2 v$VERSION" \
-              --notes "Automated build of Rebellion 2 v$VERSION. Unsigned; see README for install notes." \
-              dist/*
-          fi
+  # ---------------------------------------------------------------------------
+  # PARKED: macOS and Linux installers.
+  #
+  # The launcher-model Windows path is validated first. macOS/Linux each need:
+  #   - a matching asset-free player (add StandaloneOSX / StandaloneLinux64 to
+  #     the `player` job as a matrix, or add sibling jobs),
+  #   - a per-OS launcher build (Tauri does not cross-compile: macos-latest and
+  #     ubuntu-latest runners),
+  #   - per-OS packaging (macOS: .app -> zip/dmg, ideally signed+notarized;
+  #     Linux: AppImage via packaging/linux/build-appimage.sh),
+  #   - per-OS icon handling.
+  # Unpark once the Windows job is green.
+  # ---------------------------------------------------------------------------
