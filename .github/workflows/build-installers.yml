@@ -68,11 +68,13 @@ jobs:
           docker-images: true
           large-packages: false
 
+      # Pin the game to the release tag so builds are reproducible: a tag build checks
+      # out rebellion2@<tag>; a dispatch build uses source_ref (default master).
       - name: Checkout game
         uses: actions/checkout@v4
         with:
           repository: davidadas/rebellion2
-          ref: ${{ inputs.source_ref || 'master' }}
+          ref: ${{ inputs.source_ref || github.ref_name }}
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
           path: game
@@ -85,7 +87,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: davidadas/rebellion2-media
-          ref: main
+          ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
           ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
           persist-credentials: false
           lfs: false
@@ -173,6 +175,10 @@ jobs:
 
       - name: Build launcher
         working-directory: infra/launcher/src-tauri
+        env:
+          # Baked into the launcher so it requests its own content pack (content-<ver>.zip).
+          # The version IS the release tag — game and media are checked out at that tag.
+          REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
         run: cargo build --release
 
       - name: Stamp game exe icon
