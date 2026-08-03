@@ -66,3 +66,12 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; Tasks: d
 
 [Run]
 Filename: "{app}\{#MyLauncherExe}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; The launcher downloads Content (and writes launcher.log / a partial download) into
+; {app} at runtime, so Inno's install log doesn't track them. Remove them explicitly
+; on uninstall, then drop {app} if nothing else remains.
+Type: filesandordirs; Name: "{app}\Content"
+Type: files; Name: "{app}\launcher.log"
+Type: files; Name: "{app}\content.zip.part"
+Type: dirifempty; Name: "{app}"
