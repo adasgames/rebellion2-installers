@@ -58,8 +58,6 @@ jobs:
     name: Build asset-free player (Windows)
     runs-on: ubuntu-latest
     needs: prepare
-    outputs:
-      content_version: ${{ steps.contentver.outputs.version }}
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -80,15 +78,6 @@ jobs:
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
           path: game
-
-      # The game declares which content pack it needs; fall back to the release version.
-      - name: Resolve content version
-        id: contentver
-        run: |
-          V="$(cat game/content-version 2>/dev/null | tr -d '[:space:]')"
-          [ -n "$V" ] || V="${{ needs.prepare.outputs.version }}"
-          echo "Content version: $V"
-          echo "version=$V" >> "$GITHUB_OUTPUT"
 
       # Media (content pack + main-menu models) is needed at BUILD time for prefab
       # authoring/previews. StandalonePlayerBuild strips Assets/Content from the
@@ -188,7 +177,8 @@ jobs:
         working-directory: infra/launcher/src-tauri
         env:
           # Baked into the launcher so it requests its own content pack (content-<ver>.zip).
-          REB2_CONTENT_VERSION: ${{ needs.player.outputs.content_version }}
+          # The version IS the release tag — game and media are checked out at that tag.
+          REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
         run: cargo build --release
 
       - name: Stamp game exe icon
