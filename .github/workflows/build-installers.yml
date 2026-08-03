@@ -210,11 +210,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download installers
+      - name: Download installer
         uses: actions/download-artifact@v4
         with:
+          name: installer-windows
           path: dist
-          merge-multiple: true
 
       - name: Create Release
         env:
@@ -224,7 +224,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Rebellion 2 ${GITHUB_REF_NAME}" \
             --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
-            dist/*
+            dist/*.exe
 
   # ---------------------------------------------------------------------------
   # PARKED: macOS and Linux installers.
