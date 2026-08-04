@@ -23,10 +23,6 @@ on:
         description: "rebellion2 (game) ref to build"
         required: false
         default: "master"
-      launcher_ref:
-        description: "rebellion2-infrastructure (launcher) ref to build"
-        required: false
-        default: "main"
       version:
         description: "Version string (blank = 0.0.0-dev for dispatch builds)"
         required: false
@@ -155,15 +151,6 @@ jobs:
       - name: Checkout installer repo (packaging)
         uses: actions/checkout@v4
 
-      - name: Checkout launcher source
-        uses: actions/checkout@v4
-        with:
-          repository: davidadas/rebellion2-infrastructure
-          ref: ${{ inputs.launcher_ref || 'main' }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          persist-credentials: false
-          path: infra
-
       - name: Download player
         uses: actions/download-artifact@v4
         with:
@@ -174,7 +161,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build launcher
-        working-directory: infra/launcher/src-tauri
+        working-directory: launcher/src-tauri
         env:
           # Baked into the launcher so it requests its own content pack (content-<ver>.zip).
           # The version IS the release tag — game and media are checked out at that tag.
@@ -185,7 +172,7 @@ jobs:
         shell: pwsh
         run: |
           choco install rcedit -y --no-progress
-          rcedit "player\Rebellion2.exe" --set-icon "infra\launcher\src-tauri\icons\icon.ico"
+          rcedit "player\Rebellion2.exe" --set-icon "launcher\src-tauri\icons\icon.ico"
 
       - name: Package installer (Inno Setup)
         shell: pwsh
@@ -195,10 +182,10 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           & $iscc `
             /DGameDir="$PWD\player" `
-            /DLauncherPath="$PWD\infra\launcher\src-tauri\target\release\rebellion2-launcher.exe" `
+            /DLauncherPath="$PWD\launcher\src-tauri\target\release\rebellion2-launcher.exe" `
             /DAppVersion="${{ needs.prepare.outputs.version }}" `
             /DOutputDir="$PWD\dist" `
-            /DIconFile="$PWD\infra\launcher\src-tauri\icons\icon.ico" `
+            /DIconFile="$PWD\launcher\src-tauri\icons\icon.ico" `
             packaging\windows\rebellion2-launcher.iss
 
       - name: Upload installer
