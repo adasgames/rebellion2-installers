@@ -24,6 +24,7 @@
 #define MyAppName "Rebellion 2"
 #define MyAppPublisher "AdasGames"
 #define MyLauncherExe "rebellion2-launcher.exe"
+#define MyGameExe "Rebellion2.exe"
 
 [Setup]
 AppId={{7C3F1E92-5A4B-4D8E-9F21-3B6C8A2D4E10}
@@ -32,7 +33,7 @@ AppVersion={#AppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\{#MyAppPublisher}\{#MyAppName}
 DefaultGroupName={#MyAppPublisher}\{#MyAppName}
-UninstallDisplayIcon={app}\{#MyLauncherExe}
+UninstallDisplayIcon={app}\{#MyGameExe}
 OutputDir={#OutputDir}
 OutputBaseFilename=Rebellion2-{#AppVersion}-Setup
 Compression=lzma2/max
@@ -59,12 +60,16 @@ Source: "{#GameDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 Source: "{#LauncherPath}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; Shortcuts point at the launcher — it is the entry point.
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"
+; Normal shortcuts launch the installed game directly. The launcher remains available
+; as an explicit repair tool for re-verifying and reinstalling Content.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyGameExe}"; WorkingDir: "{app}"
+Name: "{group}\Repair {#MyAppName} Content"; Filename: "{app}\{#MyLauncherExe}"; Parameters: "--repair"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyGameExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
+; First-run setup still goes through the launcher so it can verify ownership, install
+; Content, write the local version marker, and then start the game.
 Filename: "{app}\{#MyLauncherExe}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
