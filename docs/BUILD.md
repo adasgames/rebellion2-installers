@@ -45,7 +45,8 @@ The workflow has two entry points, and the difference matters:
 ## Jobs
 
 1. **prepare** — resolves the version: the tag name minus its `v`, else the `version` input,
-   else `0.0.0-dev`.
+   else `0.0.0-dev`. The workflow passes this value to the Unity player, launcher, content
+   package, and installer so releases do not require a source-controlled version bump.
 2. **player** (`ubuntu-latest`) — checks out the game and `rebellion2-media`, pulls media LFS
    from R2, and installs it into `Assets/Content` + `Assets/Art/Models/MainMenu` for prefab
    authoring. It then builds `StandaloneWindows64` via `StandalonePlayerBuild.Build`, which

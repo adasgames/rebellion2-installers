@@ -127,6 +127,7 @@ jobs:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          REB2_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
         with:
           projectPath: game
           unityVersion: ${{ env.UNITY_VERSION }}
