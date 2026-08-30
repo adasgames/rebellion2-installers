@@ -145,6 +145,7 @@ jobs:
 
   publish-content:
     name: Publish content + update layer to R2
+    if: github.ref_type == 'tag'
     runs-on: macos-latest  # tar is bsdtar here, which package.sh needs for zip creation
     needs: prepare
     steps:
@@ -258,7 +259,7 @@ jobs:
     name: Publish Release
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    needs: [prepare, windows-installer]
+    needs: [prepare, publish-content, windows-installer]
     permissions:
       contents: write
     steps:
