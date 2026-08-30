@@ -222,6 +222,37 @@ jobs:
             --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
             dist/*.exe
 
+      - name: Sign installer + publish launcher-update pointer
+        env:
+          LAUNCHER_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          INSTALLER=$(ls dist/*.exe | head -1)
+          NAME=$(basename "$INSTALLER")
+          # ed25519-sign the installer bytes (seed -> PKCS8) so the launcher verifies it.
+          SIG=$(node -e '
+            const c=require("crypto"),fs=require("fs");
+            const seed=Buffer.from(process.env.LAUNCHER_SIGNING_KEY.trim(),"hex");
+            const pkcs8=Buffer.concat([Buffer.from("302e020100300506032b657004220420","hex"),seed]);
+            const key=c.createPrivateKey({key:pkcs8,format:"der",type:"pkcs8"});
+            process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
+          ' "$INSTALLER")
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${NAME}"
+          printf '{"version":"%s","url":"%s","signature":"%s"}' "$VERSION" "$URL" "$SIG" > launcher.json
+          echo "launcher.json -> $(cat launcher.json)"
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          RCLONE_S3_PROVIDER=Cloudflare \
+          RCLONE_S3_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+          RCLONE_S3_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+          RCLONE_S3_ENDPOINT="$R2_ENDPOINT" \
+          RCLONE_S3_REGION=auto \
+            rclone copyto launcher.json ":s3:${R2_BUCKET}/dist/launcher.json"
+
   # ---------------------------------------------------------------------------
   # PARKED: macOS and Linux installers.
   #
