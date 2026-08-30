@@ -56,6 +56,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+Name: "launcherdesktopicon"; Description: "Add the &updater to the desktop"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
 ; Asset-free game player (no baked art — Content is downloaded by the launcher).
@@ -70,11 +71,12 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyGameExe}"; WorkingDir: "{app}
 Name: "{group}\Repair {#MyAppName} Content"; Filename: "{app}\{#MyLauncherExe}"; Parameters: "--repair"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyGameExe}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName} Launcher"; Filename: "{app}\{#MyLauncherExe}"; WorkingDir: "{app}"; Tasks: launcherdesktopicon
 
 [Run]
 ; First-run setup still goes through the launcher so it can verify ownership, install
 ; Content, write the local version marker, and then start the game.
-Filename: "{app}\{#MyLauncherExe}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName} Launcher"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; The launcher downloads Content (and writes launcher.log / a partial download) into
