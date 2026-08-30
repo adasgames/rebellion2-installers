@@ -448,7 +448,7 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
         None => {
             // No live channel configured — fall back to gate/zip behavior.
             if installed_present {
-                show_up_to_date(handle, installed_version.as_deref().unwrap_or("installed"));
+                auto_play(handle, installed_version.as_deref().unwrap_or("installed"));
             } else if PENDING.lock().unwrap().is_some() {
                 show_ready_to_install(handle, None);
             }
@@ -463,7 +463,7 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
                 show_ready_to_install(handle, Some(&latest.version));
             } else if installed_version.as_deref() == Some(latest.version.as_str()) {
                 log_line(&format!("[launcher] up to date ({}).", latest.version));
-                show_up_to_date(handle, &latest.version);
+                auto_play(handle, &latest.version);
             } else {
                 log_line(&format!(
                     "[launcher] update available: {} -> {}",
@@ -476,7 +476,7 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
         Err(err) => {
             log_line(&format!("[launcher] update check failed ({err}); offering to play installed."));
             if installed_present {
-                show_up_to_date(handle, installed_version.as_deref().unwrap_or("installed"));
+                auto_play(handle, installed_version.as_deref().unwrap_or("installed"));
             }
         }
     }
@@ -528,7 +528,7 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
             update_progress(handle, 100, "Update complete.");
             // Let the filled bar sit a beat, then land on the up-to-date screen.
             thread::sleep(Duration::from_millis(900));
-            show_up_to_date(handle, &latest.version);
+            auto_play(handle, &latest.version);
         }
         Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
             // A missing manifest/blob during an update means the channel is
@@ -850,6 +850,15 @@ fn show_status_page(handle: &tauri::AppHandle) {
 /// A result screen: kicker + status + one enabled action button.
 fn show_result(handle: &tauri::AppHandle, kicker: &str, status: &str, label: &str, choice: &str) {
     write_screen(handle, &render(kicker, false, status, &button(label, choice)));
+}
+
+/// Nothing to download: play straight through so the launcher stays invisible on a
+/// normal run. Only if the game can't start do we fall back to a manual screen.
+fn auto_play(handle: &tauri::AppHandle, version: &str) {
+    match launch_game() {
+        Ok(true) => handle.exit(0),
+        _ => show_up_to_date(handle, version),
+    }
 }
 
 fn show_up_to_date(handle: &tauri::AppHandle, _version: &str) {
