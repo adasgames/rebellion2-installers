@@ -166,6 +166,9 @@ jobs:
           # Baked into the launcher so it requests its own content pack (content-<ver>.zip).
           # The version IS the release tag — game and media are checked out at that tag.
           REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
+          # Content channel the launcher scans for updates and pulls token-gated
+          # patches from. Kept in a repo secret so the worker URL isn't committed.
+          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
         run: cargo build --release
 
       - name: Stamp game exe icon
