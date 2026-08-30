@@ -44,7 +44,7 @@ const GAME_EXE: &str = "Rebellion2";
 #[cfg(target_os = "macos")]
 const GAME_EXE: &str = "Rebellion2.app";
 
-const RELEASES_URL: &str = "https://github.com/davidadas/rebellion2-installers/releases/latest";
+const RELEASES_URL: &str = "https://github.com/adasgames/rebellion2-installers/releases/latest";
 
 /// Internal URL scheme the in-window buttons navigate to; intercepted in on_nav so
 /// the HTML can drive Rust without extra IPC wiring.
