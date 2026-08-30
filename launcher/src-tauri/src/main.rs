@@ -15,7 +15,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
@@ -54,6 +54,24 @@ const ACT: &str = "https://launcher.invalid/act";
 /// read when the user clicks a button in the webview.
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+/// A newer launcher release, if one is published; the user confirms before it runs.
+static PENDING_LAUNCHER: Mutex<Option<LauncherUpdate>> = Mutex::new(None);
+/// Set when the user picks "Not now" so we stop re-offering the launcher update.
+static LAUNCHER_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
+
+/// ed25519 public key (hex) that must have signed a launcher-update installer.
+const LAUNCHER_UPDATE_PUBKEY: &str =
+    "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
+
+/// The launcher-update pointer at `dist/launcher.json`.
+#[derive(Debug, Clone, Deserialize)]
+struct LauncherUpdate {
+    version: String,
+    /// URL of the new installer to download and run.
+    url: String,
+    /// Hex ed25519 signature over the installer bytes.
+    signature: String,
+}
 
 #[derive(Clone)]
 enum Pending {
@@ -233,6 +251,18 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             }
         }
         "quit" => handle.exit(0),
+        "launcher-update" => {
+            let upd = PENDING_LAUNCHER.lock().unwrap().clone();
+            if let Some(upd) = upd {
+                let handle = handle.clone();
+                thread::spawn(move || run_launcher_update(&handle, &upd));
+            }
+        }
+        "skip-launcher-update" => {
+            LAUNCHER_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
+            let handle = handle.clone();
+            thread::spawn(move || scan_and_prompt(&handle));
+        }
         "install" => {
             let pending = PENDING.lock().unwrap().clone();
             if let Some(Pending::FirstInstall { url }) = pending {
@@ -251,12 +281,135 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     }
 }
 
+// -- launcher self-update ----------------------------------------------------
+
+/// A newer launcher release if one is published, else None. Never fails hard:
+/// any error means "no launcher update" so play/patch continues normally. Stays
+/// dormant until dist/launcher.json exists on the channel.
+fn check_launcher_update() -> Option<LauncherUpdate> {
+    if LAUNCHER_UPDATE_DISMISSED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let base = content_base()?;
+    let current = CONTENT_VERSION.filter(|v| !v.is_empty())?;
+    let update: LauncherUpdate = fetch_json(&format!("{base}dist/launcher.json"), None).ok()?;
+    version_gt(&update.version, current).then_some(update)
+}
+
+/// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
+fn version_gt(a: &str, b: &str) -> bool {
+    let parts = |s: &str| {
+        s.split(['.', '-', '+'])
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (parts(a), parts(b));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+fn show_launcher_update(handle: &tauri::AppHandle) {
+    let buttons = format!(
+        "<a class=\"b primary\" href=\"{a}?choice=launcher-update\">Update launcher</a>\
+         <a class=\"b secondary\" href=\"{a}?choice=skip-launcher-update\">Not now</a>",
+        a = ACT,
+    );
+    write_screen(
+        handle,
+        &render(
+            "Launcher update",
+            false,
+            "A new launcher is available.<br>Update it, or continue with the current one.",
+            &buttons,
+        ),
+    );
+}
+
+/// Downloads the signed installer, verifies its signature, and runs it. The
+/// installer closes + replaces this launcher, then relaunches it.
+fn run_launcher_update(handle: &tauri::AppHandle, update: &LauncherUpdate) {
+    show_progress_ui(handle);
+    update_progress(handle, 10, "Downloading launcher update…");
+    match download_and_verify_installer(update) {
+        Ok(installer) => {
+            update_progress(handle, 100, "Starting installer…");
+            let spawned = {
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const DETACHED_BREAKAWAY: u32 = 0x0000_0008 | 0x0100_0000;
+                    std::process::Command::new(&installer)
+                        .creation_flags(DETACHED_BREAKAWAY)
+                        .spawn()
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    std::process::Command::new(&installer).spawn()
+                }
+            };
+            match spawned {
+                Ok(_) => handle.exit(0),
+                Err(err) => {
+                    log_line(&format!("[launcher] couldn't start the installer: {err}"));
+                    show_message(handle, "Update failed", "Couldn't start the installer — see launcher.log.", None);
+                }
+            }
+        }
+        Err(err) => {
+            log_line(&format!("[launcher] launcher update failed: {err}"));
+            show_message(
+                handle,
+                "Update failed",
+                "The launcher update couldn't be verified — see launcher.log.",
+                Some(("Continue", "skip-launcher-update")),
+            );
+        }
+    }
+}
+
+fn download_and_verify_installer(
+    update: &LauncherUpdate,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let mut bytes = Vec::new();
+    ureq::get(&update.url).call()?.into_reader().read_to_end(&mut bytes)?;
+
+    let key: [u8; 32] = hex::decode(LAUNCHER_UPDATE_PUBKEY)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "bad pubkey length")?;
+    let verifying = VerifyingKey::from_bytes(&key)?;
+    let sig = Signature::from_slice(&hex::decode(&update.signature)?)?;
+    verifying
+        .verify(&bytes, &sig)
+        .map_err(|_| "installer signature does not match")?;
+
+    let dst = std::env::temp_dir().join("Rebellion2-Update-Setup.exe");
+    fs::write(&dst, &bytes)?;
+    Ok(dst)
+}
+
 // -- scan --------------------------------------------------------------------
 
 /// Reads the channel pointer and decides what to show. Any network failure
 /// degrades to "launch what's installed" rather than forcing a re-download.
 fn scan_and_prompt(handle: &tauri::AppHandle) {
     update_status(handle, "Checking for updates…");
+
+    // A launcher/binary update supersedes content — offer it first. Dormant unless
+    // dist/launcher.json is published; any failure falls through to the content flow.
+    if let Some(upd) = check_launcher_update() {
+        log_line(&format!("[launcher] launcher update available: {}", upd.version));
+        *PENDING_LAUNCHER.lock().unwrap() = Some(upd);
+        show_launcher_update(handle);
+        return;
+    }
     let content_dir = match install_dir() {
         Ok(dir) => dir.join("Content"),
         Err(_) => return,

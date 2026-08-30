@@ -43,6 +43,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
+; Let a launcher self-update replace the running launcher: close it if it's holding
+; files, then our [Run] entry relaunches it. (RestartApplications off — we relaunch.)
+CloseApplications=yes
+RestartApplications=no
 #if IconFile != ""
 SetupIconFile={#IconFile}
 #endif
