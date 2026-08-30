@@ -4,7 +4,7 @@ Download and install **Rebellion 2** for Windows, macOS, or Linux.
 
 ## Download
 
-**➡️ [Get the latest version](https://github.com/davidadas/rebellion2-installers/releases/latest)**
+**➡️ [Get the latest version](https://github.com/adasgames/rebellion2-installers/releases/latest)**
 
 Grab the file for your system:
 

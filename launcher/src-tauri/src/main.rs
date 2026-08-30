@@ -44,7 +44,7 @@ const GAME_EXE: &str = "Rebellion2";
 #[cfg(target_os = "macos")]
 const GAME_EXE: &str = "Rebellion2.app";
 
-const RELEASES_URL: &str = "https://github.com/davidadas/rebellion2-installers/releases/latest";
+const RELEASES_URL: &str = "https://github.com/adasgames/rebellion2-installers/releases/latest";
 
 /// Internal URL scheme the in-window buttons navigate to; intercepted in on_nav so
 /// the HTML can drive Rust without extra IPC wiring.
@@ -461,7 +461,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
     let token = SESSION.lock().unwrap().clone();
     let remote: Option<Manifest> =
         fetch_json(&format!("{base}{}", latest.manifest), token.as_deref()).ok();
-    let (files, bytes) = match &remote {
+    let bytes = match &remote {
         Some(remote) => {
             let local = read_local_manifest(content_dir).or_else(|| {
                 read_installed_version(content_dir).and_then(|v| {
@@ -469,10 +469,10 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
                         .ok()
                 })
             });
-            let plan = diff(local.as_ref(), &remote);
-            (plan.changed.len(), plan.download_size())
+            let plan = diff(local.as_ref(), remote);
+            plan.download_size()
         }
-        None => (0, 0),
+        None => 0,
     };
 
     *PENDING.lock().unwrap() = Some(Pending::Update {

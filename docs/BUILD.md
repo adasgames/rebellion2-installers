@@ -30,13 +30,14 @@ The workflow has two entry points, and the difference matters:
   git push origin v0.1.0
   ```
   This runs the full pipeline and publishes a GitHub Release named after the tag. A tag points
-  at a commit (conventionally the tip of `main`), not a branch. Note that a tag build pulls the
-  **game from `rebellion2@master`** and the launcher from the tagged installer commit. To ship
-  specific game or launcher code, merge it before tagging.
+  at a commit (conventionally the tip of `main`), not a branch. Tag builds check out the matching
+  tag from both `rebellion2` and `rebellion2-media`, so all three repositories must carry the same
+  release tag.
 
-- **Manual dispatch — test build, NO Release.** Actions tab → **Build Installers** →
-  **Run workflow**. The `release` job is gated on `github.ref_type == 'tag'`, so dispatch runs
-  produce downloadable **artifacts** only; nothing is published to the Releases page. Inputs
+- **Manual dispatch — test build only.** Actions tab → **Build Installers** →
+  **Run workflow**. The publishing jobs are gated on `github.ref_type == 'tag'`, so dispatch runs
+  produce downloadable **artifacts** without publishing a GitHub Release or changing the live
+  content/update channel. Inputs
   (all optional):
   - **version** — version string (blank = `0.0.0-dev`).
   - **source_ref** — `rebellion2` ref to build (default `master`).
@@ -44,17 +45,20 @@ The workflow has two entry points, and the difference matters:
 ## Jobs
 
 1. **prepare** — resolves the version: the tag name minus its `v`, else the `version` input,
-   else `0.0.0-dev`.
+   else `0.0.0-dev`. The workflow passes this value to the Unity player, launcher, content
+   package, and installer so releases do not require a source-controlled version bump.
 2. **player** (`ubuntu-latest`) — checks out the game and `rebellion2-media`, pulls media LFS
    from R2, and installs it into `Assets/Content` + `Assets/Art/Models/MainMenu` for prefab
    authoring. It then builds `StandaloneWindows64` via `StandalonePlayerBuild.Build`, which
    strips `Assets/Content` and verifies it did not leak — so the shipped player stays
    asset-free.
-3. **windows-installer** (`windows-latest`) — builds the launcher (`cargo build --release`),
+3. **publish-content** (`macos-latest`, tag builds only) — packages and uploads the versioned
+   content archive, incremental manifest, blobs, and update pointer to R2.
+4. **windows-installer** (`windows-latest`) — builds the launcher (`cargo build --release`),
    stamps the game `.exe` icon (`rcedit`), and packages
    `packaging/windows/rebellion2-launcher.iss` with Inno Setup.
-4. **release** (`if: github.ref_type == 'tag'`) — downloads the installer artifacts and runs
-   `gh release create <tag>`.
+5. **release** (`if: github.ref_type == 'tag'`) — waits for both the installer and content publish,
+   then downloads the installer artifacts and runs `gh release create <tag>`.
 
 ## Required secrets and variables
 
