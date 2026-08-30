@@ -75,7 +75,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; WorkingD
 [Run]
 ; First-run setup still goes through the launcher so it can verify ownership, install
 ; Content, write the local version marker, and then start the game.
-Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName} Launcher"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; The launcher downloads Content (and writes launcher.log / a partial download) into
