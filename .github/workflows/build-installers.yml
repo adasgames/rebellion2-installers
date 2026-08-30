@@ -143,6 +143,62 @@ jobs:
           path: build/StandaloneWindows64
           if-no-files-found: error
 
+  publish-content:
+    name: Publish content + update layer to R2
+    runs-on: macos-latest  # tar is bsdtar here, which package.sh needs for zip creation
+    needs: prepare
+    steps:
+      - name: Checkout media (git only, no LFS)
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2-media
+          ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+          ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
+          persist-credentials: false
+          lfs: false
+          path: media
+
+      - name: Pull media LFS from R2
+        working-directory: media
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          git lfs install
+          HOST="${R2_ENDPOINT#https://}"
+          git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
+          git lfs pull --include="Content/**" --exclude=""
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content; then
+            echo "Media checkout still contains Git LFS pointers."; exit 1
+          fi
+
+      - name: Checkout infrastructure (publish script)
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2-infrastructure
+          ref: main
+          persist-credentials: false
+          path: infra
+
+      - name: Install rclone
+        run: brew install rclone
+
+      # Publishes dist/content-<ver>.zip (first-install), plus the incremental
+      # update layer the launcher patches from: dist/manifest-<ver>.json,
+      # blobs/<sha256>, and dist/latest.json. Derived from one file set so they
+      # can't drift.
+      - name: Publish content.zip + manifest + blobs + latest.json
+        env:
+          MEDIA_DIR: ${{ github.workspace }}/media
+          VERSION: ${{ needs.prepare.outputs.version }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: bash infra/content/package.sh
+
   windows-installer:
     name: Package Windows installer
     runs-on: windows-latest
