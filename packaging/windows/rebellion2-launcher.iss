@@ -55,7 +55,7 @@ SetupIconFile={#IconFile}
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+Name: "desktopicon"; Description: "Add &Rebellion 2 to the desktop"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
 ; Asset-free game player (no baked art — Content is downloaded by the launcher).
@@ -64,17 +64,18 @@ Source: "{#GameDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 Source: "{#LauncherPath}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; Normal shortcuts launch the installed game directly. The launcher remains available
-; as an explicit repair tool for re-verifying and reinstalling Content.
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyGameExe}"; WorkingDir: "{app}"
+; The "Rebellion 2" shortcuts point at the launcher: it checks for updates, then
+; plays (auto-launching straight through when nothing needs downloading). Repair
+; stays available as an explicit re-verify/reinstall entry.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; WorkingDir: "{app}"
 Name: "{group}\Repair {#MyAppName} Content"; Filename: "{app}\{#MyLauncherExe}"; Parameters: "--repair"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyGameExe}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 ; First-run setup still goes through the launcher so it can verify ownership, install
 ; Content, write the local version marker, and then start the game.
-Filename: "{app}\{#MyLauncherExe}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; The launcher downloads Content (and writes launcher.log / a partial download) into

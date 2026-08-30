@@ -277,6 +277,32 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 thread::spawn(move || run_update(&handle, &base, &latest));
             }
         }
+        // Return from the gate's sign-in screens to the launcher's own screen.
+        "back" => {
+            let installed = install_dir()
+                .map(|d| d.join("Content").join("catalog.xml").is_file())
+                .unwrap_or(false);
+            if installed {
+                show_status_page(handle);
+                let handle = handle.clone();
+                thread::spawn(move || scan_and_prompt(&handle));
+            } else {
+                show_message(
+                    handle,
+                    "Sign in",
+                    "Sign in to verify ownership and download the game.",
+                    Some(("Sign in", "signin")),
+                );
+            }
+        }
+        // Reopen the ownership gate (sign-in screens).
+        "signin" => {
+            if let Some(window) = handle.get_webview_window("main") {
+                if let Ok(url) = gate_landing().parse() {
+                    let _ = window.navigate(url);
+                }
+            }
+        }
         _ => {}
     }
 }
