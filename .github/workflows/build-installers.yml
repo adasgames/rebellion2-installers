@@ -50,6 +50,23 @@ jobs:
           echo "Resolved version: $V"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
+  validate-infrastructure-access:
+    name: Validate infrastructure repository access
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout infrastructure
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2-infrastructure
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          path: infra
+
+      - name: Verify content publisher
+        run: test -f infra/content/package.sh
+
   player:
     name: Build asset-free player (Windows)
     runs-on: ubuntu-latest
