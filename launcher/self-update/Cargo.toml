@@ -1,0 +1,12 @@
+[package]
+name = "rebellion2-self-update"
+version = "0.1.0"
+description = "Completes a staged Rebellion 2 launcher update after the launcher exits."
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.52"
+
+[dev-dependencies]
+tempfile = "3"

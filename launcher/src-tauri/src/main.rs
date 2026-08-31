@@ -14,13 +14,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use rebellion2_update_core::{apply, diff, BlobSource, Manifest};
+use rebellion2_update_core::{apply, diff, sha256_hex, BlobSource, FileEntry, Manifest, Plan};
 use serde::Deserialize;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -34,6 +34,19 @@ const CONTENT_BASE: Option<&str> = option_env!("REB2_CONTENT_BASE_URL");
 
 const CONTENT_VERSION_FILE: &str = ".content-version";
 const CONTENT_MANIFEST_FILE: &str = ".manifest.json";
+const APPLICATION_MANIFEST_FILE: &str = ".application-manifest.json";
+const APPLICATION_VERSION_FILE: &str = ".application-version";
+const PENDING_APPLICATION_MANIFEST_FILE: &str = ".application-manifest.pending.json";
+const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
+const STAGED_LAUNCHER_FILE_NAME: &str = ".rebellion2-launcher.next.exe";
+const UPDATE_HELPER_FILE_NAME: &str = "rebellion2-update-helper.exe";
+
+#[cfg(target_os = "windows")]
+const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher.exe";
+#[cfg(target_os = "linux")]
+const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher";
+#[cfg(target_os = "macos")]
+const LAUNCHER_FILE_NAME: &str = "Rebellion 2 Launcher.app";
 /// Cached ownership session token, stored next to the launcher.
 const SESSION_FILE: &str = ".session";
 
@@ -54,23 +67,25 @@ const ACT: &str = "https://launcher.invalid/act";
 /// read when the user clicks a button in the webview.
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
-/// A newer launcher release, if one is published; the user confirms before it runs.
-static PENDING_LAUNCHER: Mutex<Option<LauncherUpdate>> = Mutex::new(None);
-/// Set when the user picks "Not now" so we stop re-offering the launcher update.
-static LAUNCHER_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
+/// Set when the user continues after an update failure so the content flow can proceed.
+static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
 
-/// ed25519 public key (hex) that must have signed a launcher-update installer.
-const LAUNCHER_UPDATE_PUBKEY: &str =
-    "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
+/// Ed25519 public key (hex) that must have signed an application manifest.
+const APPLICATION_UPDATE_PUBKEY: &str = "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
 
-/// The launcher-update pointer at `dist/launcher.json`.
+/// The signed application-update pointer at `dist/application.json`.
 #[derive(Debug, Clone, Deserialize)]
-struct LauncherUpdate {
+struct ApplicationUpdate {
     version: String,
-    /// URL of the new installer to download and run.
-    url: String,
-    /// Hex ed25519 signature over the installer bytes.
+    manifest: String,
+    #[serde(default = "default_application_blobs")]
+    blobs: String,
+    /// Hex ed25519 signature over the application manifest bytes.
     signature: String,
+}
+
+fn default_application_blobs() -> String {
+    "application-blobs/".to_string()
 }
 
 #[derive(Clone)]
@@ -112,6 +127,10 @@ fn default_blobs() -> String {
 }
 
 fn main() {
+    if hand_off_pending_launcher_update() {
+        return;
+    }
+
     // Seed the session token from cache if we have a non-expired one.
     if let Some(token) = read_cached_token() {
         *SESSION.lock().unwrap() = Some(token);
@@ -134,16 +153,12 @@ fn main() {
 
             if need_signin {
                 // Open the gate; on_nav captures the token from /done, then scans.
-                WebviewWindowBuilder::new(
-                    app,
-                    "main",
-                    WebviewUrl::External(gate_landing().parse().unwrap()),
-                )
-                .title("Rebellion 2 Launcher")
-                .inner_size(520.0, 700.0)
-                .resizable(true)
-                .on_navigation(move |url| on_nav(&handle, url))
-                .build()?;
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::External(gate_landing().parse().unwrap()))
+                    .title("Rebellion 2 Launcher")
+                    .inner_size(520.0, 700.0)
+                    .resizable(true)
+                    .on_navigation(move |url| on_nav(&handle, url))
+                    .build()?;
             } else {
                 // Installed (or already signed in) — go straight to the scan. A scan
                 // failure degrades to "launch what's installed", so play never blocks.
@@ -187,9 +202,7 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
 
     // Gate result: /done?ok=1&url=<presigned>&token=<session>
     if target.starts_with(&format!("{GATE}done")) {
-        let ok = url
-            .query_pairs()
-            .any(|(k, v)| k == "ok" && v == "1");
+        let ok = url.query_pairs().any(|(k, v)| k == "ok" && v == "1");
         let presigned = query(url, "url");
         let token = query(url, "token");
         on_gate_result(handle, ok, presigned, token);
@@ -208,9 +221,7 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
 }
 
 fn query(url: &tauri::Url, key: &str) -> Option<String> {
-    url.query_pairs()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.into_owned())
+    url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
 }
 
 /// Returns whether the launcher must obtain a fresh presigned Content archive URL.
@@ -220,12 +231,7 @@ fn requires_ownership_gate(installed: bool, repair: bool) -> bool {
 
 /// Caches successful ownership verification and resumes the operation that requested it.
 /// Falls back to the presigned first-install archive when no update is pending.
-fn on_gate_result(
-    handle: &tauri::AppHandle,
-    ok: bool,
-    presigned: Option<String>,
-    token: Option<String>,
-) {
+fn on_gate_result(handle: &tauri::AppHandle, ok: bool, presigned: Option<String>, token: Option<String>) {
     if !ok {
         log_line("[launcher] DENIED — this account does not own the title.");
         show_message(handle, "Not verified", "This account does not own the game.", None);
@@ -283,17 +289,10 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             }
         }
         "quit" => handle.exit(0),
-        "launcher-update" => {
-            let upd = PENDING_LAUNCHER.lock().unwrap().clone();
-            if let Some(upd) = upd {
-                let handle = handle.clone();
-                thread::spawn(move || run_launcher_update(&handle, &upd));
-            }
-        }
-        "skip-launcher-update" => {
-            LAUNCHER_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
+        "skip-application-update" => {
+            APPLICATION_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
             let handle = handle.clone();
-            thread::spawn(move || scan_and_prompt(&handle));
+            thread::spawn(move || scan_content_and_prompt(&handle));
         }
         "install" => {
             let pending = PENDING.lock().unwrap().clone();
@@ -348,28 +347,22 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     }
 }
 
-// -- launcher self-update ----------------------------------------------------
+// -- application updates -----------------------------------------------------
 
-/// A newer launcher release if one is published, else None. Never fails hard:
-/// any error means "no launcher update" so play/patch continues normally. Stays
-/// dormant until dist/launcher.json exists on the channel.
-fn check_launcher_update() -> Option<LauncherUpdate> {
-    if LAUNCHER_UPDATE_DISMISSED.load(Ordering::Relaxed) {
+/// Returns a newer application release when the public channel publishes one.
+fn check_application_update() -> Option<ApplicationUpdate> {
+    if APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed) {
         return None;
     }
     let base = content_base()?;
-    let current = CONTENT_VERSION.filter(|v| !v.is_empty())?;
-    let update: LauncherUpdate = fetch_json(&format!("{base}dist/launcher.json"), None).ok()?;
-    version_gt(&update.version, current).then_some(update)
+    let current = read_application_version().or_else(|| CONTENT_VERSION.filter(|version| !version.is_empty()).map(str::to_string))?;
+    let update: ApplicationUpdate = fetch_json(&format!("{base}dist/application.json"), None).ok()?;
+    version_gt(&update.version, &current).then_some(update)
 }
 
 /// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
 fn version_gt(a: &str, b: &str) -> bool {
-    let parts = |s: &str| {
-        s.split(['.', '-', '+'])
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect::<Vec<_>>()
-    };
+    let parts = |s: &str| s.split(['.', '-', '+']).map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
     let (a, b) = (parts(a), parts(b));
     for i in 0..a.len().max(b.len()) {
         let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
@@ -380,86 +373,226 @@ fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-fn show_launcher_update(handle: &tauri::AppHandle) {
-    let buttons = format!(
-        "<a class=\"b primary\" href=\"{a}?choice=launcher-update\">Update launcher</a>\
-         <a class=\"b secondary\" href=\"{a}?choice=skip-launcher-update\">Not now</a>",
-        a = ACT,
-    );
-    write_screen(
-        handle,
-        &render(
-            "Launcher update",
-            false,
-            "A new launcher is available.<br>Update it, or continue with the current one.",
-            &buttons,
-        ),
-    );
-}
-
-/// Downloads the signed installer, verifies its signature, and runs it. The
-/// installer closes + replaces this launcher, then relaunches it.
-fn run_launcher_update(handle: &tauri::AppHandle, update: &LauncherUpdate) {
+/// Applies application changes while this launcher remains open, then resumes the
+/// normal content scan in the same window.
+fn run_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
     show_progress_ui(handle);
-    update_progress(handle, 10, "Downloading launcher update…");
-    match download_and_verify_installer(update) {
-        Ok(installer) => {
-            update_progress(handle, 100, "Starting installer…");
-            let spawned = {
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const DETACHED_BREAKAWAY: u32 = 0x0000_0008 | 0x0100_0000;
-                    std::process::Command::new(&installer)
-                        .creation_flags(DETACHED_BREAKAWAY)
-                        .spawn()
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    std::process::Command::new(&installer).spawn()
-                }
-            };
-            match spawned {
-                Ok(_) => handle.exit(0),
-                Err(err) => {
-                    log_line(&format!("[launcher] couldn't start the installer: {err}"));
-                    show_message(handle, "Update failed", "Couldn't start the installer — see launcher.log.", None);
-                }
-            }
+    update_progress(handle, 0, "Checking application update…");
+    match do_application_update(handle, update) {
+        Ok(changed) => {
+            log_line(&format!(
+                "[launcher] application update to {} staged ({changed} files).",
+                update.version
+            ));
+            update_progress(handle, 100, "Application update complete.");
+            thread::sleep(Duration::from_millis(400));
+            scan_content_and_prompt(handle);
         }
-        Err(err) => {
-            log_line(&format!("[launcher] launcher update failed: {err}"));
+        Err(error) => {
+            log_line(&format!("[launcher] application update failed: {error}"));
             show_message(
                 handle,
                 "Update failed",
-                "The launcher update couldn't be verified — see launcher.log.",
-                Some(("Continue", "skip-launcher-update")),
+                "The application update failed — see launcher.log.",
+                Some(("Continue", "skip-application-update")),
             );
         }
     }
 }
 
-fn download_and_verify_installer(
-    update: &LauncherUpdate,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// Verifies and applies a published application manifest without modifying Content
+/// or overwriting the currently running launcher executable.
+fn do_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) -> Result<usize, Box<dyn std::error::Error>> {
+    let base = content_base().ok_or("application update channel is not configured")?;
+    let manifest_bytes = fetch_bytes(&format!("{base}{}", update.manifest))?;
+    verify_application_manifest(&manifest_bytes, &update.signature)?;
+    let remote = Manifest::from_json(&manifest_bytes)?;
+    validate_application_manifest(&remote, &update.version)?;
+
+    let install_dir = install_dir()?;
+    let local = read_application_manifest(&install_dir).unwrap_or(snapshot_application_files(&install_dir, &remote)?);
+    let plan = diff(Some(&local), &remote);
+    update_progress(
+        handle,
+        5,
+        &format!("Downloading application update… {}", human_bytes(plan.download_size())),
+    );
+
+    let blobs = PublicHttpBlobs {
+        base: format!("{base}{}", update.blobs),
+    };
+    let launcher_entry = plan.changed.iter().find(|entry| entry.path == LAUNCHER_FILE_NAME).cloned();
+    let immediate_plan = Plan {
+        changed: plan
+            .changed
+            .iter()
+            .filter(|entry| entry.path != LAUNCHER_FILE_NAME)
+            .cloned()
+            .collect(),
+        removed: plan
+            .removed
+            .iter()
+            .filter(|path| path.as_str() != LAUNCHER_FILE_NAME)
+            .cloned()
+            .collect(),
+    };
+    let changed = apply(&immediate_plan, &install_dir, &blobs)?;
+
+    let launcher_changed = launcher_entry.is_some();
+    if let Some(entry) = launcher_entry {
+        let bytes = blobs.fetch(&entry.sha256)?;
+        if sha256_hex(&bytes) != entry.sha256 {
+            return Err("staged launcher hash does not match the manifest".into());
+        }
+        fs::write(install_dir.join(STAGED_LAUNCHER_FILE_NAME), bytes)?;
+    }
+    fs::write(install_dir.join(PENDING_APPLICATION_MANIFEST_FILE), manifest_bytes)?;
+    fs::write(install_dir.join(PENDING_APPLICATION_VERSION_FILE), &update.version)?;
+    start_update_helper(false)?;
+    Ok(changed + usize::from(launcher_changed))
+}
+
+/// Verifies that an application manifest was signed by the release pipeline.
+fn verify_application_manifest(manifest_bytes: &[u8], signature: &str) -> Result<(), Box<dyn std::error::Error>> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-    let mut bytes = Vec::new();
-    ureq::get(&update.url).call()?.into_reader().read_to_end(&mut bytes)?;
-
-    let key: [u8; 32] = hex::decode(LAUNCHER_UPDATE_PUBKEY)?
+    let key: [u8; 32] = hex::decode(APPLICATION_UPDATE_PUBKEY)?
         .as_slice()
         .try_into()
-        .map_err(|_| "bad pubkey length")?;
+        .map_err(|_| "bad application-update public key length")?;
     let verifying = VerifyingKey::from_bytes(&key)?;
-    let sig = Signature::from_slice(&hex::decode(&update.signature)?)?;
+    let signature = Signature::from_slice(&hex::decode(signature)?)?;
     verifying
-        .verify(&bytes, &sig)
-        .map_err(|_| "installer signature does not match")?;
+        .verify(manifest_bytes, &signature)
+        .map_err(|_| "application manifest signature does not match".into())
+}
 
-    let dst = std::env::temp_dir().join("Rebellion2-Update-Setup.exe");
-    fs::write(&dst, &bytes)?;
-    Ok(dst)
+/// Ensures an application manifest cannot modify content, mods, or paths outside
+/// the installation directory.
+fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Result<()> {
+    if manifest.version != version {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "application manifest version does not match its channel pointer",
+        ));
+    }
+    if !manifest.files.iter().any(|entry| entry.path == LAUNCHER_FILE_NAME) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "application manifest does not contain the launcher",
+        ));
+    }
+    for entry in &manifest.files {
+        let path = Path::new(&entry.path);
+        if path.is_absolute()
+            || path.components().any(|component| !matches!(component, Component::Normal(_)))
+            || path.starts_with("Content")
+            || path.starts_with("Mods")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "application manifest contains an unmanaged path",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reads the application manifest installed by setup or the previous update.
+fn read_application_manifest(install_dir: &Path) -> Option<Manifest> {
+    let bytes = fs::read(install_dir.join(APPLICATION_MANIFEST_FILE)).ok()?;
+    Manifest::from_json(&bytes).ok()
+}
+
+/// Builds a safe baseline for installers created before application manifests were
+/// shipped by hashing only paths named by the target manifest.
+fn snapshot_application_files(install_dir: &Path, remote_manifest: &Manifest) -> io::Result<Manifest> {
+    let mut files = Vec::new();
+    for remote_file in &remote_manifest.files {
+        let path = install_dir.join(&remote_file.path);
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(path)?;
+        files.push(FileEntry {
+            path: remote_file.path.clone(),
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+        });
+    }
+    Ok(Manifest {
+        version: "existing".to_string(),
+        files,
+    })
+}
+
+/// Reads the installed application version independently from the content version.
+fn read_application_version() -> Option<String> {
+    let install_dir = install_dir().ok()?;
+    fs::read_to_string(install_dir.join(APPLICATION_VERSION_FILE))
+        .ok()
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty())
+        .or_else(|| read_application_manifest(&install_dir).map(|manifest| manifest.version))
+}
+
+/// Downloads a public update-channel object.
+fn fetch_bytes(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    ureq::get(url).call()?.into_reader().read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Public application blob source. Manifest signatures authenticate every expected
+/// blob hash before this source is used.
+struct PublicHttpBlobs {
+    base: String,
+}
+
+impl BlobSource for PublicHttpBlobs {
+    fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
+        let response = ureq::get(&format!("{}{}", self.base, sha256)).call().map_err(io::Error::other)?;
+        let mut bytes = Vec::new();
+        response.into_reader().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Starts the installed helper outside the launcher's Windows job so it can wait
+/// for this process to exit and then promote the staged launcher.
+fn start_update_helper(relaunch: bool) -> io::Result<()> {
+    let install_dir = install_dir()?;
+    let helper = install_dir.join(UPDATE_HELPER_FILE_NAME);
+    let mut command = std::process::Command::new(helper);
+    command.current_dir(&install_dir);
+    if relaunch {
+        command.arg("--relaunch");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_BREAKAWAY: u32 = 0x0000_0008 | 0x0100_0000;
+        command.creation_flags(DETACHED_BREAKAWAY);
+    }
+    command.spawn()?;
+    Ok(())
+}
+
+/// Completes a previously interrupted launcher handoff before any window appears.
+fn hand_off_pending_launcher_update() -> bool {
+    let Ok(install_dir) = install_dir() else {
+        return false;
+    };
+    if !install_dir.join(STAGED_LAUNCHER_FILE_NAME).is_file() {
+        return false;
+    }
+    match start_update_helper(true) {
+        Ok(()) => true,
+        Err(error) => {
+            log_line(&format!("[launcher] couldn't resume the staged launcher update: {error}"));
+            false
+        }
+    }
 }
 
 // -- scan --------------------------------------------------------------------
@@ -469,14 +602,20 @@ fn download_and_verify_installer(
 fn scan_and_prompt(handle: &tauri::AppHandle) {
     update_status(handle, "Checking for updates…");
 
-    // A launcher/binary update supersedes content — offer it first. Dormant unless
-    // dist/launcher.json is published; any failure falls through to the content flow.
-    if let Some(upd) = check_launcher_update() {
-        log_line(&format!("[launcher] launcher update available: {}", upd.version));
-        *PENDING_LAUNCHER.lock().unwrap() = Some(upd);
-        show_launcher_update(handle);
+    // An application update supersedes content. Apply it without reopening the
+    // installer; any failure to discover it falls through to the content flow.
+    if let Some(upd) = check_application_update() {
+        log_line(&format!("[launcher] application update available: {}", upd.version));
+        let handle = handle.clone();
+        thread::spawn(move || run_application_update(&handle, &upd));
         return;
     }
+
+    scan_content_and_prompt(handle);
+}
+
+/// Reads the content channel and offers first install, patching, or launch.
+fn scan_content_and_prompt(handle: &tauri::AppHandle) {
     let content_dir = match install_dir() {
         Ok(dir) => dir.join("Content"),
         Err(_) => return,
@@ -542,23 +681,20 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
         show_update_signin(handle);
         return;
     };
-    let remote: Option<Manifest> =
-        match fetch_json(&format!("{base}{}", latest.manifest), Some(&token)) {
-            Ok(remote) => Some(remote),
-            Err(err) if is_authorization_required(err.as_ref()) => {
-                clear_token();
-                show_update_signin(handle);
-                return;
-            }
-            Err(_) => None,
-        };
+    let remote: Option<Manifest> = match fetch_json(&format!("{base}{}", latest.manifest), Some(&token)) {
+        Ok(remote) => Some(remote),
+        Err(err) if is_authorization_required(err.as_ref()) => {
+            clear_token();
+            show_update_signin(handle);
+            return;
+        }
+        Err(_) => None,
+    };
     let bytes = match &remote {
         Some(remote) => {
             let local = read_local_manifest(content_dir).or_else(|| {
-                read_installed_version(content_dir).and_then(|v| {
-                    fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), Some(&token))
-                        .ok()
-                })
+                read_installed_version(content_dir)
+                    .and_then(|v| fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), Some(&token)).ok())
             });
             let plan = diff(local.as_ref(), remote);
             plan.download_size()
@@ -608,20 +744,15 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
     }
 }
 
-fn do_update(
-    handle: &tauri::AppHandle,
-    base: &str,
-    latest: &Latest,
-) -> Result<usize, Box<dyn std::error::Error>> {
+fn do_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) -> Result<usize, Box<dyn std::error::Error>> {
     let content_dir = install_dir()?.join("Content");
     let token = SESSION.lock().unwrap().clone();
     update_progress(handle, 0, "Checking what changed…");
 
     let remote: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
     let local = read_local_manifest(&content_dir).or_else(|| {
-        read_installed_version(&content_dir).and_then(|v| {
-            fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), token.as_deref()).ok()
-        })
+        read_installed_version(&content_dir)
+            .and_then(|v| fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), token.as_deref()).ok())
     });
 
     let plan = diff(local.as_ref(), &remote);
@@ -661,13 +792,8 @@ impl BlobSource for HttpBlobs {
         }
         let response = match request.call() {
             Ok(response) => response,
-            Err(ureq::Error::Status(401 | 403, _)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    AuthorizationRequired,
-                ))
-            }
-            Err(other) => return Err(io::Error::new(io::ErrorKind::Other, other.to_string())),
+            Err(ureq::Error::Status(401 | 403, _)) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, AuthorizationRequired)),
+            Err(other) => return Err(io::Error::other(other.to_string())),
         };
         // Stream in chunks so the progress bar fills smoothly through a large
         // file, updating only when the whole-percent changes (≈90 evals total).
@@ -682,11 +808,11 @@ impl BlobSource for HttpBlobs {
             }
             bytes.extend_from_slice(&buf[..n]);
             let done = self.done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-            let percent = if self.total > 0 {
-                (5 + done.saturating_mul(90) / self.total).min(95)
-            } else {
-                50
-            };
+            let percent = done
+                .saturating_mul(90)
+                .checked_div(self.total)
+                .map(|percent| (5 + percent).min(95))
+                .unwrap_or(50);
             if percent != last_percent {
                 last_percent = percent;
                 update_progress(
@@ -707,14 +833,9 @@ fn start_install(handle: tauri::AppHandle, url: String) {
     thread::spawn(move || match install_content(&handle, &url) {
         Ok(content_dir) => {
             log_line(&format!("[launcher] Content installed to {}", content_dir.display()));
-            if let (Some(base), Some(version)) =
-                (content_base(), CONTENT_VERSION.filter(|v| !v.is_empty()))
-            {
+            if let (Some(base), Some(version)) = (content_base(), CONTENT_VERSION.filter(|v| !v.is_empty())) {
                 let token = SESSION.lock().unwrap().clone();
-                if let Ok(manifest) = fetch_json::<Manifest>(
-                    &format!("{base}dist/manifest-{version}.json"),
-                    token.as_deref(),
-                ) {
+                if let Ok(manifest) = fetch_json::<Manifest>(&format!("{base}dist/manifest-{version}.json"), token.as_deref()) {
                     let _ = store_manifest_and_version(&content_dir, &manifest, version);
                 }
             }
@@ -832,18 +953,14 @@ fn fetch_latest(base: &str) -> Result<Latest, Box<dyn std::error::Error>> {
     fetch_json(&format!("{base}dist/latest.json"), None)
 }
 
-fn fetch_json<T: serde::de::DeserializeOwned>(
-    url: &str,
-    token: Option<&str>,
-) -> Result<T, Box<dyn std::error::Error>> {
+fn fetch_json<T: serde::de::DeserializeOwned>(url: &str, token: Option<&str>) -> Result<T, Box<dyn std::error::Error>> {
     let mut request = ureq::get(url).timeout(Duration::from_secs(20));
     if let Some(token) = token {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
     let response = request.call().map_err(|err| match err {
         ureq::Error::Status(404, _) => Box::new(ContentUnavailable) as Box<dyn std::error::Error>,
-        ureq::Error::Status(401 | 403, _) =>
-            Box::new(AuthorizationRequired) as Box<dyn std::error::Error>,
+        ureq::Error::Status(401 | 403, _) => Box::new(AuthorizationRequired) as Box<dyn std::error::Error>,
         other => Box::new(other),
     })?;
     let mut body = String::new();
@@ -863,8 +980,7 @@ fn read_local_manifest(content_dir: &Path) -> Option<Manifest> {
 }
 
 fn store_manifest_and_version(content_dir: &Path, manifest: &Manifest, version: &str) -> io::Result<()> {
-    let json = serde_json::to_vec(manifest)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    let json = serde_json::to_vec(manifest).map_err(|err| io::Error::other(err.to_string()))?;
     fs::write(content_dir.join(CONTENT_MANIFEST_FILE), json)?;
     fs::write(content_dir.join(CONTENT_VERSION_FILE), version)?;
     Ok(())
@@ -933,7 +1049,12 @@ fn write_screen(handle: &tauri::AppHandle, html: &str) {
 fn show_status_page(handle: &tauri::AppHandle) {
     write_screen(
         handle,
-        &render("Checking for updates", true, "Looking for a newer version\u{2026}", &disabled_button("Launch Game")),
+        &render(
+            "Checking for updates",
+            true,
+            "Looking for a newer version\u{2026}",
+            &disabled_button("Launch Game"),
+        ),
     );
 }
 
@@ -947,7 +1068,13 @@ fn show_up_to_date(handle: &tauri::AppHandle, _version: &str) {
 }
 
 fn show_ready_to_install(handle: &tauri::AppHandle, _version: Option<&str>) {
-    show_result(handle, "Ready to install", "Download and install the game to play.", "Install & Launch", "install");
+    show_result(
+        handle,
+        "Ready to install",
+        "Download and install the game to play.",
+        "Install & Launch",
+        "install",
+    );
 }
 
 fn show_update_signin(handle: &tauri::AppHandle) {
@@ -958,12 +1085,7 @@ fn show_update_signin(handle: &tauri::AppHandle) {
     );
     write_screen(
         handle,
-        &render(
-            "Sign in required",
-            false,
-            "Verify ownership to download this update.",
-            &buttons,
-        ),
+        &render("Sign in required", false, "Verify ownership to download this update.", &buttons),
     );
 }
 
@@ -1031,10 +1153,7 @@ fn install_content(handle: &tauri::AppHandle, url: &str) -> Result<PathBuf, Box<
         Err(ureq::Error::Status(404, _)) => return Err(Box::new(ContentUnavailable)),
         Err(other) => return Err(Box::new(other)),
     };
-    let total: u64 = response
-        .header("Content-Length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let total: u64 = response.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
 
     let mut reader = response.into_reader();
     let mut file = fs::File::create(&archive_path)?;
@@ -1057,12 +1176,20 @@ fn install_content(handle: &tauri::AppHandle, url: &str) -> Result<PathBuf, Box<
             last_report = downloaded;
             let now = Instant::now();
             let elapsed = now.duration_since(last_time).as_secs_f64();
-            let speed = if elapsed > 0.0 { (downloaded - last_bytes) as f64 / mib / elapsed } else { 0.0 };
+            let speed = if elapsed > 0.0 {
+                (downloaded - last_bytes) as f64 / mib / elapsed
+            } else {
+                0.0
+            };
             last_time = now;
             last_bytes = downloaded;
             let gb = downloaded as f64 / gib;
-            let pct = if total > 0 { downloaded * 100 / total } else { 0 };
-            let amount = if total > 0 { format!("{gb:.2} / {total_gb:.2} GB") } else { format!("{gb:.2} GB") };
+            let pct = downloaded.saturating_mul(100).checked_div(total).unwrap_or(0);
+            let amount = if total > 0 {
+                format!("{gb:.2} / {total_gb:.2} GB")
+            } else {
+                format!("{gb:.2} GB")
+            };
             update_progress(handle, pct, &format!("Downloading Content… {amount} — {speed:.1} MB/s"));
         }
     }
@@ -1125,6 +1252,20 @@ fn launch_game() -> io::Result<bool> {
 mod tests {
     use super::*;
 
+    fn application_manifest(version: &str, paths: &[&str]) -> Manifest {
+        Manifest {
+            version: version.to_string(),
+            files: paths
+                .iter()
+                .map(|path| FileEntry {
+                    path: (*path).to_string(),
+                    sha256: sha256_hex(path.as_bytes()),
+                    size: path.len() as u64,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn requires_ownership_gate_without_installed_content_returns_true() {
         assert!(requires_ownership_gate(false, false));
@@ -1159,5 +1300,40 @@ mod tests {
         let error = io::Error::new(io::ErrorKind::PermissionDenied, "read-only file");
 
         assert!(!is_authorization_required(&error));
+    }
+
+    #[test]
+    fn validate_application_manifest_with_managed_paths_returns_ok() {
+        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "Rebellion2.exe"]);
+
+        assert!(validate_application_manifest(&manifest, "0.0.4").is_ok());
+    }
+
+    #[test]
+    fn validate_application_manifest_with_different_version_returns_error() {
+        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME]);
+
+        assert!(validate_application_manifest(&manifest, "0.0.5").is_err());
+    }
+
+    #[test]
+    fn validate_application_manifest_without_launcher_returns_error() {
+        let manifest = application_manifest("0.0.4", &["Rebellion2.exe"]);
+
+        assert!(validate_application_manifest(&manifest, "0.0.4").is_err());
+    }
+
+    #[test]
+    fn validate_application_manifest_with_content_path_returns_error() {
+        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME, "Content/catalog.xml"]);
+
+        assert!(validate_application_manifest(&manifest, "0.0.4").is_err());
+    }
+
+    #[test]
+    fn validate_application_manifest_with_parent_traversal_returns_error() {
+        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME, "../outside.txt"]);
+
+        assert!(validate_application_manifest(&manifest, "0.0.4").is_err());
     }
 }
