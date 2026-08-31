@@ -128,7 +128,9 @@ fn main() {
                 .map(|d| d.join("Content").join("catalog.xml").is_file())
                 .unwrap_or(false);
             let repair = std::env::args().any(|arg| arg == "--repair");
-            let need_signin = repair || (!installed && SESSION.lock().unwrap().is_none());
+            // A first install or repair needs a fresh presigned Content archive URL
+            // from the ownership gate. A cached patch token cannot supply that URL.
+            let need_signin = requires_ownership_gate(installed, repair);
 
             if need_signin {
                 // Open the gate; on_nav captures the token from /done, then scans.
@@ -211,6 +213,11 @@ fn query(url: &tauri::Url, key: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
+/// Returns whether the launcher must obtain a fresh presigned Content archive URL.
+fn requires_ownership_gate(installed: bool, repair: bool) -> bool {
+    repair || !installed
+}
+
 /// Caches successful ownership verification and resumes the operation that requested it.
 /// Falls back to the presigned first-install archive when no update is pending.
 fn on_gate_result(
@@ -290,8 +297,17 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         }
         "install" => {
             let pending = PENDING.lock().unwrap().clone();
-            if let Some(Pending::FirstInstall { url }) = pending {
-                start_install(handle.clone(), url);
+            match pending {
+                Some(Pending::FirstInstall { url }) => start_install(handle.clone(), url),
+                _ => {
+                    log_line("[launcher] install requested without a first-install URL.");
+                    show_message(
+                        handle,
+                        "Sign in required",
+                        "Verify ownership before downloading the game.",
+                        Some(("Sign in", "signin")),
+                    );
+                }
             }
         }
         "update" => {
@@ -483,9 +499,16 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
 
     match fetch_latest(&base) {
         Ok(latest) => {
-            if !installed_present {
-                // First install: reuse the gate's presigned zip captured earlier.
+            if matches!(*PENDING.lock().unwrap(), Some(Pending::FirstInstall { .. })) {
                 show_ready_to_install(handle, Some(&latest.version));
+            } else if !installed_present {
+                log_line("[launcher] first install requires ownership verification.");
+                show_message(
+                    handle,
+                    "Sign in required",
+                    "Verify ownership before downloading the game.",
+                    Some(("Sign in", "signin")),
+                );
             } else if installed_version.as_deref() == Some(latest.version.as_str()) {
                 log_line(&format!("[launcher] up to date ({}).", latest.version));
                 show_up_to_date(handle, &latest.version);
@@ -1101,6 +1124,21 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requires_ownership_gate_without_installed_content_returns_true() {
+        assert!(requires_ownership_gate(false, false));
+    }
+
+    #[test]
+    fn requires_ownership_gate_for_repair_returns_true() {
+        assert!(requires_ownership_gate(true, true));
+    }
+
+    #[test]
+    fn requires_ownership_gate_with_installed_content_returns_false() {
+        assert!(!requires_ownership_gate(true, false));
+    }
 
     #[test]
     fn is_authorization_required_with_authorization_error_returns_true() {
