@@ -56,11 +56,12 @@ The workflow has two entry points, and the difference matters:
 3. **publish-content** (`macos-latest`, tag builds only) — packages and uploads the versioned
    content archive, incremental manifest, blobs, and update pointer to R2.
 4. **windows-installer** (`windows-latest`) — builds the launcher (`cargo build --release`),
-   stamps the game `.exe` icon (`rcedit`), and packages
-   `packaging/windows/rebellion2-launcher.iss` with Inno Setup.
+   stamps the game `.exe` icon (`rcedit`), packages the one-time setup executable, and produces
+   the manifest, blobs, and installed handoff helper used for later incremental application updates.
 5. **release** (`if: github.ref_type == 'tag'`) — waits for both the installer and content publish,
-   creates the GitHub Release, signs the installer for launcher verification, publishes the
-   installer to R2, and updates `dist/launcher.json`.
+   creates the GitHub Release, signs and publishes the application manifest and blobs to R2, and
+   updates `dist/application.json`. Automatic updates patch the installation in place and never
+   reopen the setup wizard.
 
 ## Required secrets and variables
 
@@ -71,8 +72,8 @@ Set these under **Settings → Secrets and variables → Actions** before the fi
 | `SOURCE_REPO_TOKEN` | PAT with **read** access to `rebellion2` and `rebellion2-infrastructure` (contents). |
 | `REBELLION2_MEDIA_SSH_KEY` | Deploy key with read access to `rebellion2-media` (git checkout; mirrors the game CI). |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials for pulling media LFS through the proxy. |
-| `REB2_CONTENT_BASE_URL` | Public content Worker base URL baked into the launcher and used for signed installer updates. |
-| `LAUNCHER_SIGNING_KEY` | Ed25519 seed used to sign installers consumed by the launcher's automatic updater. |
+| `REB2_CONTENT_BASE_URL` | Public content Worker base URL used for content and signed application updates. |
+| `LAUNCHER_SIGNING_KEY` | Ed25519 seed used to sign application manifests consumed by the launcher's automatic updater. |
 | `UNITY_EMAIL` / `UNITY_PASSWORD` / `UNITY_LICENSE` | Unity license activation (same values as the `rebellion2` CI). |
 
 | Variable | Purpose |
@@ -87,6 +88,7 @@ Set these under **Settings → Secrets and variables → Actions** before the fi
 ```
 .github/workflows/build-installers.yml     # the pipeline
 launcher/                                  # Tauri launcher/patcher source
+launcher/self-update/                      # staged-launcher handoff helper
 packaging/windows/rebellion2-launcher.iss  # Windows (Inno Setup) installer — the live one
 packaging/windows/rebellion2.nsi           # legacy NSIS script, unused by the current pipeline
 packaging/linux/build-appimage.sh          # AppDir assembly + appimagetool (parked)

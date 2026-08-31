@@ -3,13 +3,25 @@
 ; the user verifies ownership and downloads Content before first play.
 ; Per-user install (no admin/UAC). Compile:
 ;   ISCC /DGameDir=<asset-free player dir> /DLauncherPath=<rebellion2-launcher.exe>
-;        /DAppVersion=<x.y.z> /DOutputDir=<dir> /DIconFile=<.ico> rebellion2-launcher.iss
+;        /DUpdateHelperPath=<rebellion2-self-update.exe>
+;        /DApplicationManifestPath=<manifest.json> /DApplicationVersionPath=<version.txt>
+;        /DAppVersion=<x.y.z>
+;        /DOutputDir=<dir> /DIconFile=<.ico> rebellion2-launcher.iss
 
 #ifndef GameDir
   #define GameDir "assetfree-player"
 #endif
 #ifndef LauncherPath
   #define LauncherPath "rebellion2-launcher.exe"
+#endif
+#ifndef ApplicationManifestPath
+  #define ApplicationManifestPath "application-manifest.json"
+#endif
+#ifndef ApplicationVersionPath
+  #define ApplicationVersionPath "application-version.txt"
+#endif
+#ifndef UpdateHelperPath
+  #define UpdateHelperPath "rebellion2-self-update.exe"
 #endif
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -43,8 +55,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
-; Let a launcher self-update replace the running launcher: close it if it's holding
-; files, then our [Run] entry relaunches it. (RestartApplications off — we relaunch.)
+; A user-requested reinstall may replace a running launcher. Setup closes it and
+; the [Run] entry starts the installed copy afterward.
 CloseApplications=yes
 RestartApplications=no
 #if IconFile != ""
@@ -62,6 +74,11 @@ Name: "desktopicon"; Description: "Add &Rebellion 2 to the desktop"; GroupDescri
 Source: "{#GameDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; The launcher (verifies ownership, downloads Content, starts the game).
 Source: "{#LauncherPath}"; DestDir: "{app}"; Flags: ignoreversion
+; A tiny installed helper promotes a staged launcher only after the running launcher exits.
+Source: "{#UpdateHelperPath}"; DestDir: "{app}"; DestName: "rebellion2-update-helper.exe"; Flags: ignoreversion
+; Baseline for incremental application updates. It intentionally excludes Content.
+Source: "{#ApplicationManifestPath}"; DestDir: "{app}"; DestName: ".application-manifest.json"; Flags: ignoreversion
+Source: "{#ApplicationVersionPath}"; DestDir: "{app}"; DestName: ".application-version"; Flags: ignoreversion
 
 [Icons]
 ; The "Rebellion 2" shortcuts point at the launcher: it checks for updates, then

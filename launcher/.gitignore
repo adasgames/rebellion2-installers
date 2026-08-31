@@ -1,4 +1,5 @@
 /src-tauri/target/
 /src-tauri/gen/
 /src-tauri/icons/source.png
+/self-update/target/
 node_modules/

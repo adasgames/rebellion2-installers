@@ -129,7 +129,7 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
         }
         let tmp = PathBuf::from(format!("{}.part", dst.display()));
         fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &dst)?; // atomic replace of this file
+        replace_file(&tmp, &dst)?;
     }
 
     for path in &plan.removed {
@@ -140,6 +140,36 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
     }
 
     Ok(plan.changed.len())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = OsStr::new(source).encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = OsStr::new(destination)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
 }
 
 /// The correctness oracle: does every file the manifest lists exist under
@@ -204,7 +234,8 @@ mod tests {
     #[test]
     fn parses_gen_manifest_json() {
         // Byte-for-byte the shape content/gen-manifest.py writes.
-        let json = br#"{"version":"0.0.2","files":[{"path":"catalog.xml","sha256":"aa","size":3}]}"#;
+        let json =
+            br#"{"version":"0.0.2","files":[{"path":"catalog.xml","sha256":"aa","size":3}]}"#;
         let m = Manifest::from_json(json).unwrap();
         assert_eq!(m.version, "0.0.2");
         assert_eq!(m.files[0].path, "catalog.xml");
@@ -233,7 +264,7 @@ mod tests {
         let changed: Vec<&str> = plan.changed.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(changed, vec!["b", "d"]); // a unchanged, b changed, d added
         assert_eq!(plan.removed, vec!["c".to_string()]); // c deleted
-        // only the changed bytes, not the whole set
+                                                         // only the changed bytes, not the whole set
         assert_eq!(plan.download_size(), (b"B2".len() + b"D".len()) as u64);
     }
 

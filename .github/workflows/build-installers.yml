@@ -270,6 +270,54 @@ jobs:
           choco install rcedit -y --no-progress
           rcedit "player\Rebellion2.exe" --set-icon "launcher\src-tauri\icons\icon.ico"
 
+      - name: Package application update layer
+        shell: pwsh
+        run: |
+          $payloadRoot = Join-Path $PWD "application-update"
+          $metadataRoot = Join-Path $PWD "application-update-metadata"
+          $blobsRoot = Join-Path $metadataRoot "application-blobs"
+          New-Item -ItemType Directory -Force $payloadRoot | Out-Null
+          New-Item -ItemType Directory -Force $blobsRoot | Out-Null
+          cargo build --release --manifest-path launcher/self-update/Cargo.toml
+          Copy-Item -Path "player\*" -Destination $payloadRoot -Recurse -Force
+          Copy-Item `
+            -LiteralPath "launcher\src-tauri\target\release\rebellion2-launcher.exe" `
+            -Destination $payloadRoot `
+            -Force
+          Copy-Item `
+            -LiteralPath "launcher\self-update\target\release\rebellion2-self-update.exe" `
+            -Destination (Join-Path $payloadRoot "rebellion2-update-helper.exe") `
+            -Force
+          if (Test-Path -LiteralPath (Join-Path $payloadRoot "Content")) {
+            throw "The application update payload must remain asset-free."
+          }
+          $files = @(
+            Get-ChildItem -LiteralPath $payloadRoot -Recurse -File |
+              Sort-Object FullName |
+              ForEach-Object {
+                $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                $blobPath = Join-Path $blobsRoot $hash
+                if (-not (Test-Path -LiteralPath $blobPath)) {
+                  Copy-Item -LiteralPath $_.FullName -Destination $blobPath
+                }
+                [ordered]@{
+                  path = [System.IO.Path]::GetRelativePath($payloadRoot, $_.FullName).Replace('\', '/')
+                  sha256 = $hash
+                  size = $_.Length
+                }
+              }
+          )
+          $manifest = [ordered]@{
+            version = "${{ needs.prepare.outputs.version }}"
+            files = $files
+          }
+          $manifest | ConvertTo-Json -Depth 4 -Compress |
+            Set-Content -LiteralPath (Join-Path $metadataRoot "application-manifest.json") -Encoding utf8
+          Set-Content `
+            -LiteralPath (Join-Path $metadataRoot "application-version.txt") `
+            -Value "${{ needs.prepare.outputs.version }}" `
+            -NoNewline
+
       - name: Package installer (Inno Setup)
         shell: pwsh
         run: |
@@ -279,6 +327,9 @@ jobs:
           & $iscc `
             /DGameDir="$PWD\player" `
             /DLauncherPath="$PWD\launcher\src-tauri\target\release\rebellion2-launcher.exe" `
+            /DUpdateHelperPath="$PWD\launcher\self-update\target\release\rebellion2-self-update.exe" `
+            /DApplicationManifestPath="$PWD\application-update-metadata\application-manifest.json" `
+            /DApplicationVersionPath="$PWD\application-update-metadata\application-version.txt" `
             /DAppVersion="${{ needs.prepare.outputs.version }}" `
             /DOutputDir="$PWD\dist" `
             /DIconFile="$PWD\launcher\src-tauri\icons\icon.ico" `
@@ -288,7 +339,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: installer-windows
-          path: dist/*
+          path: dist/*-Setup.exe
+          if-no-files-found: error
+
+      - name: Upload application update layer
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-update-layer
+          path: application-update-metadata
           if-no-files-found: error
 
   release:
@@ -305,6 +363,12 @@ jobs:
           name: installer-windows
           path: dist
 
+      - name: Download application update layer
+        uses: actions/download-artifact@v4
+        with:
+          name: application-update-layer
+          path: application-update-metadata
+
       - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -313,9 +377,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Rebellion 2 ${GITHUB_REF_NAME}" \
             --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
-            dist/*.exe
+            dist/*-Setup.exe
 
-      - name: Sign installer + publish launcher-update pointer
+      - name: Sign and publish application update layer
         env:
           LAUNCHER_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -326,27 +390,26 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          INSTALLER=$(ls dist/*.exe | head -1)
-          NAME=$(basename "$INSTALLER")
-          # ed25519-sign the installer bytes (seed -> PKCS8) so the launcher verifies it.
+          MANIFEST=application-update-metadata/application-manifest.json
+          # Ed25519-sign the manifest bytes so every application path and blob hash is authenticated.
           SIG=$(node -e '
             const c=require("crypto"),fs=require("fs");
             const seed=Buffer.from(process.env.LAUNCHER_SIGNING_KEY.trim(),"hex");
             const pkcs8=Buffer.concat([Buffer.from("302e020100300506032b657004220420","hex"),seed]);
             const key=c.createPrivateKey({key:pkcs8,format:"der",type:"pkcs8"});
             process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
-          ' "$INSTALLER")
-          URL="${REB2_CONTENT_BASE_URL%/}/dist/${NAME}"
-          printf '{"version":"%s","url":"%s","signature":"%s"}' "$VERSION" "$URL" "$SIG" > launcher.json
-          echo "launcher.json -> $(cat launcher.json)"
+          ' "$MANIFEST")
+          printf '{"version":"%s","manifest":"dist/application-manifest-%s.json","blobs":"application-blobs/","signature":"%s"}' "$VERSION" "$VERSION" "$SIG" > application.json
+          echo "application.json -> $(cat application.json)"
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
           export RCLONE_S3_PROVIDER=Cloudflare
           export RCLONE_S3_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export RCLONE_S3_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export RCLONE_S3_ENDPOINT="$R2_ENDPOINT"
           export RCLONE_S3_REGION=auto
-          rclone copyto "$INSTALLER" ":s3:${R2_BUCKET}/dist/${NAME}"
-          rclone copyto launcher.json ":s3:${R2_BUCKET}/dist/launcher.json"
+          rclone copyto "$MANIFEST" ":s3:${R2_BUCKET}/dist/application-manifest-${VERSION}.json"
+          rclone copy application-update-metadata/application-blobs ":s3:${R2_BUCKET}/application-blobs"
+          rclone copyto application.json ":s3:${R2_BUCKET}/dist/application.json"
 
   # ---------------------------------------------------------------------------
   # PARKED: macOS and Linux installers.
