@@ -17,8 +17,9 @@ the bottom of the workflow until the Windows path is validated end to end.
 | macOS    | `Rebellion2-<version>-macOS.zip`       | `zip` of the `.app`     | parked |
 | Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`          | parked |
 
-Everything is **unsigned** for now, which is why Windows and macOS warn on first launch.
-Code signing (Authenticode on Windows, notarization on macOS) is on the roadmap.
+The packages do not have platform signatures yet, which is why Windows and macOS warn on first
+launch. The release workflow does apply an Ed25519 signature used only by the launcher to verify
+automatic updates. Authenticode on Windows and notarization on macOS remain on the roadmap.
 
 ## Triggering a build
 
@@ -58,7 +59,8 @@ The workflow has two entry points, and the difference matters:
    stamps the game `.exe` icon (`rcedit`), and packages
    `packaging/windows/rebellion2-launcher.iss` with Inno Setup.
 5. **release** (`if: github.ref_type == 'tag'`) — waits for both the installer and content publish,
-   then downloads the installer artifacts and runs `gh release create <tag>`.
+   creates the GitHub Release, signs the installer for launcher verification, publishes the
+   installer to R2, and updates `dist/launcher.json`.
 
 ## Required secrets and variables
 
@@ -69,6 +71,8 @@ Set these under **Settings → Secrets and variables → Actions** before the fi
 | `SOURCE_REPO_TOKEN` | PAT with **read** access to `rebellion2` and `rebellion2-infrastructure` (contents). |
 | `REBELLION2_MEDIA_SSH_KEY` | Deploy key with read access to `rebellion2-media` (git checkout; mirrors the game CI). |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials for pulling media LFS through the proxy. |
+| `REB2_CONTENT_BASE_URL` | Public content Worker base URL baked into the launcher and used for signed installer updates. |
+| `LAUNCHER_SIGNING_KEY` | Ed25519 seed used to sign installers consumed by the launcher's automatic updater. |
 | `UNITY_EMAIL` / `UNITY_PASSWORD` / `UNITY_LICENSE` | Unity license activation (same values as the `rebellion2` CI). |
 
 | Variable | Purpose |
