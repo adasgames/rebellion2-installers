@@ -66,7 +66,7 @@ Set these under **Settings → Secrets and variables → Actions** before the fi
 
 | Secret | Purpose |
 |--------|---------|
-| `SOURCE_REPO_TOKEN` | PAT with **read** access to `rebellion2` (contents). |
+| `SOURCE_REPO_TOKEN` | PAT with **read** access to `rebellion2` and `rebellion2-infrastructure` (contents). |
 | `REBELLION2_MEDIA_SSH_KEY` | Deploy key with read access to `rebellion2-media` (git checkout; mirrors the game CI). |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials for pulling media LFS through the proxy. |
 | `UNITY_EMAIL` / `UNITY_PASSWORD` / `UNITY_LICENSE` | Unity license activation (same values as the `rebellion2` CI). |

@@ -99,7 +99,17 @@ jobs:
         run: |
           HOST="${R2_ENDPOINT#https://}"
           git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
-          git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""
+          for attempt in 1 2 3; do
+            if git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            delay=$((attempt * 30))
+            echo "Media LFS pull failed; retrying in ${delay} seconds."
+            sleep "$delay"
+          done
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
             echo "Media checkout still contains Git LFS pointers."; exit 1
           fi
@@ -171,7 +181,17 @@ jobs:
           git lfs install
           HOST="${R2_ENDPOINT#https://}"
           git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
-          git lfs pull --include="Content/**" --exclude=""
+          for attempt in 1 2 3; do
+            if git lfs pull --include="Content/**" --exclude=""; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            delay=$((attempt * 30))
+            echo "Media LFS pull failed; retrying in ${delay} seconds."
+            sleep "$delay"
+          done
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content; then
             echo "Media checkout still contains Git LFS pointers."; exit 1
           fi
@@ -181,6 +201,7 @@ jobs:
         with:
           repository: davidadas/rebellion2-infrastructure
           ref: main
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
           path: infra
 
