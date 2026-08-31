@@ -90,6 +90,15 @@ impl std::fmt::Display for ContentUnavailable {
 }
 impl std::error::Error for ContentUnavailable {}
 
+#[derive(Debug)]
+struct AuthorizationRequired;
+impl std::fmt::Display for AuthorizationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ownership verification required")
+    }
+}
+impl std::error::Error for AuthorizationRequired {}
+
 /// The public channel pointer at `dist/latest.json`.
 #[derive(Debug, Clone, Deserialize)]
 struct Latest {
@@ -202,9 +211,8 @@ fn query(url: &tauri::Url, key: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
-/// After the gate verifies ownership: cache the token (model A) and scan. Falls
-/// back to legacy behavior (presigned zip, no token) so it still works against a
-/// gate that has not yet been upgraded to mint tokens.
+/// Caches successful ownership verification and resumes the operation that requested it.
+/// Falls back to the presigned first-install archive when no update is pending.
 fn on_gate_result(
     handle: &tauri::AppHandle,
     ok: bool,
@@ -221,14 +229,31 @@ fn on_gate_result(
         store_token(&token);
         *SESSION.lock().unwrap() = Some(token);
     }
-    // Remember the presigned zip for a possible first install.
-    if let Some(url) = presigned {
-        *PENDING.lock().unwrap() = Some(Pending::FirstInstall { url });
+    let pending_update = {
+        let pending = PENDING.lock().unwrap();
+        match pending.as_ref() {
+            Some(Pending::Update { base, latest }) => Some((base.clone(), latest.clone())),
+            _ => None,
+        }
+    };
+    // Remember the presigned zip for a possible first install without replacing an
+    // update that was waiting for renewed authorization.
+    if pending_update.is_none() {
+        if let Some(url) = presigned {
+            *PENDING.lock().unwrap() = Some(Pending::FirstInstall { url });
+        }
     }
-    // Repaint the window to our local status page, then scan.
-    show_status_page(handle);
-    let handle = handle.clone();
-    thread::spawn(move || scan_and_prompt(&handle));
+    // Repaint the window to our local status page, then continue the operation that
+    // requested ownership verification.
+    if let Some((base, latest)) = pending_update {
+        show_progress_ui(handle);
+        let handle = handle.clone();
+        thread::spawn(move || run_update(&handle, &base, &latest));
+    } else {
+        show_status_page(handle);
+        let handle = handle.clone();
+        thread::spawn(move || scan_and_prompt(&handle));
+    }
 }
 
 /// Handles a button click from any of the launcher screens.
@@ -482,16 +507,33 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
     }
 }
 
-/// Computes the update size, then shows the confirm prompt.
+/// Requests authorization when necessary, then computes the update size and prompts.
 fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content_dir: &Path) {
     let token = SESSION.lock().unwrap().clone();
+    *PENDING.lock().unwrap() = Some(Pending::Update {
+        base: base.to_string(),
+        latest: latest.clone(),
+    });
+
+    let Some(token) = token else {
+        show_update_signin(handle);
+        return;
+    };
     let remote: Option<Manifest> =
-        fetch_json(&format!("{base}{}", latest.manifest), token.as_deref()).ok();
+        match fetch_json(&format!("{base}{}", latest.manifest), Some(&token)) {
+            Ok(remote) => Some(remote),
+            Err(err) if is_authorization_required(err.as_ref()) => {
+                clear_token();
+                show_update_signin(handle);
+                return;
+            }
+            Err(_) => None,
+        };
     let bytes = match &remote {
         Some(remote) => {
             let local = read_local_manifest(content_dir).or_else(|| {
                 read_installed_version(content_dir).and_then(|v| {
-                    fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), token.as_deref())
+                    fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), Some(&token))
                         .ok()
                 })
             });
@@ -500,11 +542,6 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
         }
         None => 0,
     };
-
-    *PENDING.lock().unwrap() = Some(Pending::Update {
-        base: base.to_string(),
-        latest: latest.clone(),
-    });
 
     let detail = if bytes > 0 {
         format!("An update is available ({}).", human_bytes(bytes))
@@ -535,6 +572,11 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
             // unreachable or misconfigured — NOT that this version is retired.
             log_line("[launcher] update content unavailable (404 from channel).");
             update_progress(handle, 0, "Update failed — content unavailable. Please try again later.");
+        }
+        Err(err) if is_authorization_required(err.as_ref()) => {
+            log_line("[launcher] update authorization expired; requesting ownership verification.");
+            clear_token();
+            show_update_signin(handle);
         }
         Err(err) => {
             log_line(&format!("[launcher] update failed: {err}"));
@@ -597,7 +639,10 @@ impl BlobSource for HttpBlobs {
         let response = match request.call() {
             Ok(response) => response,
             Err(ureq::Error::Status(401 | 403, _)) => {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unauthorized"))
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    AuthorizationRequired,
+                ))
             }
             Err(other) => return Err(io::Error::new(io::ErrorKind::Other, other.to_string())),
         };
@@ -685,6 +730,26 @@ fn store_token(token: &str) {
     }
 }
 
+fn clear_token() {
+    *SESSION.lock().unwrap() = None;
+    if let Ok(base) = install_dir() {
+        let path = base.join(SESSION_FILE);
+        if let Err(err) = fs::remove_file(path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                log_line(&format!("[launcher] couldn't remove the expired session: {err}"));
+            }
+        }
+    }
+}
+
+fn is_authorization_required(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<AuthorizationRequired>().is_some()
+        || error
+            .downcast_ref::<io::Error>()
+            .and_then(|error| error.get_ref())
+            .is_some_and(|error| error.downcast_ref::<AuthorizationRequired>().is_some())
+}
+
 /// Best-effort expiry pre-check: decode the token payload and read `exp`. A token
 /// we can't parse is treated as expired so we re-verify.
 fn token_expired(token: &str) -> bool {
@@ -754,6 +819,8 @@ fn fetch_json<T: serde::de::DeserializeOwned>(
     }
     let response = request.call().map_err(|err| match err {
         ureq::Error::Status(404, _) => Box::new(ContentUnavailable) as Box<dyn std::error::Error>,
+        ureq::Error::Status(401 | 403, _) =>
+            Box::new(AuthorizationRequired) as Box<dyn std::error::Error>,
         other => Box::new(other),
     })?;
     let mut body = String::new();
@@ -858,6 +925,23 @@ fn show_up_to_date(handle: &tauri::AppHandle, _version: &str) {
 
 fn show_ready_to_install(handle: &tauri::AppHandle, _version: Option<&str>) {
     show_result(handle, "Ready to install", "Download and install the game to play.", "Install & Launch", "install");
+}
+
+fn show_update_signin(handle: &tauri::AppHandle) {
+    let buttons = format!(
+        "<a class=\"b primary\" href=\"{a}?choice=signin\">Sign in &amp; Update</a>\
+         <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
+        a = ACT,
+    );
+    write_screen(
+        handle,
+        &render(
+            "Sign in required",
+            false,
+            "Verify ownership to download this update.",
+            &buttons,
+        ),
+    );
 }
 
 /// A plain message screen: kicker + status + an optional single action button.
@@ -1012,4 +1096,30 @@ fn launch_game() -> io::Result<bool> {
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_authorization_required_with_authorization_error_returns_true() {
+        let error = AuthorizationRequired;
+
+        assert!(is_authorization_required(&error));
+    }
+
+    #[test]
+    fn is_authorization_required_with_wrapped_authorization_error_returns_true() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, AuthorizationRequired);
+
+        assert!(is_authorization_required(&error));
+    }
+
+    #[test]
+    fn is_authorization_required_with_filesystem_permission_error_returns_false() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "read-only file");
+
+        assert!(!is_authorization_required(&error));
+    }
 }
