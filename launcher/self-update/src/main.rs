@@ -120,23 +120,20 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
-#[cfg(target_os = "windows")]
-/// Reads the per-user installation directory recorded by Inno Setup.
+/// Returns the installation directory containing the running update helper.
 fn find_install_dir() -> io::Result<PathBuf> {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
-
-    let current_user = RegKey::predef(HKEY_CURRENT_USER);
-    let uninstall_key = current_user.open_subkey(UNINSTALL_REGISTRY_KEY)?;
-    let install_location: String = uninstall_key.get_value("InstallLocation")?;
-    Ok(PathBuf::from(install_location))
+    let executable = std::env::current_exe()?;
+    install_dir_from_executable(&executable)
 }
 
-#[cfg(not(target_os = "windows"))]
-fn find_install_dir() -> io::Result<PathBuf> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "launcher updates are currently available only on Windows",
-    ))
+/// Returns the parent directory of an update-helper executable.
+fn install_dir_from_executable(executable: &Path) -> io::Result<PathBuf> {
+    executable.parent().map(Path::to_path_buf).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "update helper has no parent directory",
+        )
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -144,16 +141,34 @@ fn find_install_dir() -> io::Result<PathBuf> {
 fn update_installed_version(install_dir: &Path) -> io::Result<()> {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
-    let version = fs::read_to_string(install_dir.join(APPLICATION_VERSION_FILE))?;
-    let version = version.trim();
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
-    let uninstall_key = current_user.open_subkey_with_flags(
+    let Ok(uninstall_key) = current_user.open_subkey_with_flags(
         UNINSTALL_REGISTRY_KEY,
         winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
-    )?;
+    ) else {
+        return Ok(());
+    };
+    let Ok(registered_install_dir) = uninstall_key.get_value::<String, _>("InstallLocation") else {
+        return Ok(());
+    };
+    if !paths_refer_to_same_directory(install_dir, Path::new(&registered_install_dir)) {
+        return Ok(());
+    }
+
+    let version = fs::read_to_string(install_dir.join(APPLICATION_VERSION_FILE))?;
+    let version = version.trim();
     uninstall_key.set_value("DisplayVersion", &version)?;
     uninstall_key.set_value("DisplayName", &format!("Rebellion 2 version {version}"))?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+/// Returns whether two paths resolve to the same directory.
+fn paths_refer_to_same_directory(first: &Path, second: &Path) -> bool {
+    match (fs::canonicalize(first), fs::canonicalize(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => first == second,
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -222,5 +237,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
 
         assert!(validate_install_dir(directory.path()).is_err());
+    }
+
+    #[test]
+    fn install_dir_from_executable_returns_executable_parent() {
+        let executable = Path::new("installation").join("rebellion2-update-helper.exe");
+
+        assert_eq!(
+            install_dir_from_executable(&executable).unwrap(),
+            Path::new("installation")
+        );
     }
 }
