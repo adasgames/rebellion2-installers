@@ -22,7 +22,10 @@ use std::{fs, io, thread};
 
 use rebellion2_update_core::{apply, diff, sha256_hex, BlobSource, FileEntry, Manifest, Plan};
 use serde::Deserialize;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    webview::{PageLoadEvent, PageLoadPayload},
+    Manager, WebviewUrl, WebviewWindowBuilder,
+};
 
 const GATE: &str = "https://rebellion2-content-gate.pages.dev/";
 
@@ -71,6 +74,8 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 static PENDING_APPLICATION_UPDATE: Mutex<Option<ApplicationUpdate>> = Mutex::new(None);
 /// Set when the user continues after an update failure so the content flow can proceed.
 static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
+/// Set while ownership verification returns the remote webview to bundled launcher content.
+static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Ed25519 public key (hex) that must have signed an application manifest.
 const APPLICATION_UPDATE_PUBKEY: &str = "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
@@ -155,15 +160,19 @@ fn main() {
 
             if need_signin {
                 // Open the gate; on_nav captures the token from /done, then scans.
+                let navigation_handle = handle.clone();
+                let page_load_handle = handle.clone();
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::External(gate_landing().parse().unwrap()))
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
                     .resizable(true)
-                    .on_navigation(move |url| on_nav(&handle, url))
+                    .on_navigation(move |url| on_nav(&navigation_handle, url))
+                    .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
                     .build()?;
             } else {
                 // Installed (or already signed in) — go straight to the scan. A scan
                 // failure degrades to "launch what's installed", so play never blocks.
+                let page_load_handle = handle.clone();
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
@@ -172,6 +181,7 @@ fn main() {
                         let h = handle.clone();
                         move |url| on_nav(&h, url)
                     })
+                    .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
                     .build()?;
                 thread::spawn(move || scan_and_prompt(&handle));
             }
@@ -208,7 +218,7 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
         let presigned = query(url, "url");
         let token = query(url, "token");
         on_gate_result(handle, ok, presigned, token);
-        return true;
+        return false;
     }
 
     // In-window button: intercept, don't navigate.
@@ -220,6 +230,23 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     }
 
     true
+}
+
+/// Resumes launcher work after ownership verification returns to bundled content.
+fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
+    if payload.event() != PageLoadEvent::Finished
+        || !is_local_app_url(payload.url())
+        || !GATE_RETURN_PENDING.swap(false, Ordering::Relaxed)
+    {
+        return;
+    }
+
+    resume_after_gate(handle);
+}
+
+/// Returns whether a URL belongs to the bundled Tauri application.
+fn is_local_app_url(url: &tauri::Url) -> bool {
+    url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost")
 }
 
 fn query(url: &tauri::Url, key: &str) -> Option<String> {
@@ -258,8 +285,29 @@ fn on_gate_result(handle: &tauri::AppHandle, ok: bool, presigned: Option<String>
             *PENDING.lock().unwrap() = Some(Pending::FirstInstall { url });
         }
     }
-    // Repaint the window to our local status page, then continue the operation that
-    // requested ownership verification.
+    // Return to bundled content before rendering actionable launcher controls. Pages
+    // written over the remote ownership origin do not reliably route action links back
+    // through Tauri's navigation callback.
+    GATE_RETURN_PENDING.store(true, Ordering::Relaxed);
+    let handle = handle.clone();
+    thread::spawn(move || {
+        if !navigate_to_local_app(&handle) {
+            GATE_RETURN_PENDING.store(false, Ordering::Relaxed);
+            resume_after_gate(&handle);
+        }
+    });
+}
+
+/// Continues the first install or content update that requested ownership verification.
+fn resume_after_gate(handle: &tauri::AppHandle) {
+    let pending_update = {
+        let pending = PENDING.lock().unwrap();
+        match pending.as_ref() {
+            Some(Pending::Update { base, latest }) => Some((base.clone(), latest.clone())),
+            _ => None,
+        }
+    };
+
     if let Some((base, latest)) = pending_update {
         show_progress_ui(handle);
         let handle = handle.clone();
@@ -268,6 +316,22 @@ fn on_gate_result(handle: &tauri::AppHandle, ok: bool, presigned: Option<String>
         show_status_page(handle);
         let handle = handle.clone();
         thread::spawn(move || scan_and_prompt(&handle));
+    }
+}
+
+/// Navigates the ownership webview back to the bundled launcher page.
+fn navigate_to_local_app(handle: &tauri::AppHandle) -> bool {
+    let Some(window) = handle.get_webview_window("main") else {
+        return false;
+    };
+    #[cfg(any(target_os = "windows", target_os = "android"))]
+    let url = "http://tauri.localhost";
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    let url = "tauri://localhost";
+
+    match url.parse() {
+        Ok(url) => window.navigate(url).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -1314,6 +1378,27 @@ mod tests {
     }
 
     #[test]
+    fn is_local_app_url_with_tauri_scheme_returns_true() {
+        let url = tauri::Url::parse("tauri://localhost").unwrap();
+
+        assert!(is_local_app_url(&url));
+    }
+
+    #[test]
+    fn is_local_app_url_with_windows_tauri_host_returns_true() {
+        let url = tauri::Url::parse("http://tauri.localhost").unwrap();
+
+        assert!(is_local_app_url(&url));
+    }
+
+    #[test]
+    fn is_local_app_url_with_remote_host_returns_false() {
+        let url = tauri::Url::parse("https://rebellion2-content-gate.pages.dev/done").unwrap();
+
+        assert!(!is_local_app_url(&url));
+    }
+
+    #[test]
     fn is_authorization_required_with_authorization_error_returns_true() {
         let error = AuthorizationRequired;
 
@@ -1336,45 +1421,45 @@ mod tests {
 
     #[test]
     fn application_update_screen_with_available_update_offers_install_and_launch() {
-        let screen = application_update_screen("0.0.4");
+        let screen = application_update_screen("1.2.3");
 
-        assert!(screen.contains("Version 0.0.4 is available. Install it now?"));
+        assert!(screen.contains("Version 1.2.3 is available. Install it now?"));
         assert!(screen.contains("choice=application-update\">Install Update"));
         assert!(screen.contains("choice=play\">Launch Game"));
     }
 
     #[test]
     fn validate_application_manifest_with_managed_paths_returns_ok() {
-        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "Rebellion2.exe"]);
+        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "Rebellion2.exe"]);
 
-        assert!(validate_application_manifest(&manifest, "0.0.4").is_ok());
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_ok());
     }
 
     #[test]
     fn validate_application_manifest_with_different_version_returns_error() {
-        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME]);
+        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME]);
 
-        assert!(validate_application_manifest(&manifest, "0.0.5").is_err());
+        assert!(validate_application_manifest(&manifest, "1.2.4").is_err());
     }
 
     #[test]
     fn validate_application_manifest_without_launcher_returns_error() {
-        let manifest = application_manifest("0.0.4", &["Rebellion2.exe"]);
+        let manifest = application_manifest("1.2.3", &["Rebellion2.exe"]);
 
-        assert!(validate_application_manifest(&manifest, "0.0.4").is_err());
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
     }
 
     #[test]
     fn validate_application_manifest_with_content_path_returns_error() {
-        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME, "Content/catalog.xml"]);
+        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, "Content/catalog.xml"]);
 
-        assert!(validate_application_manifest(&manifest, "0.0.4").is_err());
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
     }
 
     #[test]
     fn validate_application_manifest_with_parent_traversal_returns_error() {
-        let manifest = application_manifest("0.0.4", &[LAUNCHER_FILE_NAME, "../outside.txt"]);
+        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, "../outside.txt"]);
 
-        assert!(validate_application_manifest(&manifest, "0.0.4").is_err());
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
     }
 }
