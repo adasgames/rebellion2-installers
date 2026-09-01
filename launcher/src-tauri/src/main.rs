@@ -67,6 +67,8 @@ const ACT: &str = "https://launcher.invalid/act";
 /// read when the user clicks a button in the webview.
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+/// A newer application release waiting for the user to approve its installation.
+static PENDING_APPLICATION_UPDATE: Mutex<Option<ApplicationUpdate>> = Mutex::new(None);
 /// Set when the user continues after an update failure so the content flow can proceed.
 static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
 
@@ -289,6 +291,13 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             }
         }
         "quit" => handle.exit(0),
+        "application-update" => {
+            let update = PENDING_APPLICATION_UPDATE.lock().unwrap().clone();
+            if let Some(update) = update {
+                let handle = handle.clone();
+                thread::spawn(move || run_application_update(&handle, &update));
+            }
+        }
         "skip-application-update" => {
             APPLICATION_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
             let handle = handle.clone();
@@ -602,12 +611,15 @@ fn hand_off_pending_launcher_update() -> bool {
 fn scan_and_prompt(handle: &tauri::AppHandle) {
     update_status(handle, "Checking for updates…");
 
-    // An application update supersedes content. Apply it without reopening the
-    // installer; any failure to discover it falls through to the content flow.
-    if let Some(upd) = check_application_update() {
-        log_line(&format!("[launcher] application update available: {}", upd.version));
-        let handle = handle.clone();
-        thread::spawn(move || run_application_update(&handle, &upd));
+    // An application update supersedes content, but nothing is downloaded until
+    // the user approves it. Discovery failures fall through to the content flow.
+    if let Some(update) = check_application_update() {
+        log_line(&format!(
+            "[launcher] application update available: {}",
+            update.version
+        ));
+        *PENDING_APPLICATION_UPDATE.lock().unwrap() = Some(update.clone());
+        show_application_update(handle, &update.version);
         return;
     }
 
@@ -1077,6 +1089,26 @@ fn show_ready_to_install(handle: &tauri::AppHandle, _version: Option<&str>) {
     );
 }
 
+/// Offers an available application update without beginning its download.
+fn show_application_update(handle: &tauri::AppHandle, version: &str) {
+    write_screen(handle, &application_update_screen(version));
+}
+
+/// Builds the confirmation screen shown before an application update downloads.
+fn application_update_screen(version: &str) -> String {
+    let buttons = format!(
+        "<a class=\"b primary\" href=\"{a}?choice=application-update\">Install Update</a>\
+         <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
+        a = ACT,
+    );
+    render(
+        "Update available",
+        false,
+        &format!("Version {version} is available. Install it now?"),
+        &buttons,
+    )
+}
+
 fn show_update_signin(handle: &tauri::AppHandle) {
     let buttons = format!(
         "<a class=\"b primary\" href=\"{a}?choice=signin\">Sign in &amp; Update</a>\
@@ -1300,6 +1332,15 @@ mod tests {
         let error = io::Error::new(io::ErrorKind::PermissionDenied, "read-only file");
 
         assert!(!is_authorization_required(&error));
+    }
+
+    #[test]
+    fn application_update_screen_with_available_update_offers_install_and_launch() {
+        let screen = application_update_screen("0.0.4");
+
+        assert!(screen.contains("Version 0.0.4 is available. Install it now?"));
+        assert!(screen.contains("choice=application-update\">Install Update"));
+        assert!(screen.contains("choice=play\">Launch Game"));
     }
 
     #[test]
