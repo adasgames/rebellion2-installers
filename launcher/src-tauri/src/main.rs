@@ -264,8 +264,13 @@ fn requires_ownership_gate(installed: bool, repair: bool) -> bool {
 /// Falls back to the presigned first-install archive when no update is pending.
 fn on_gate_result(handle: &tauri::AppHandle, ok: bool, presigned: Option<String>, token: Option<String>) {
     if !ok {
-        log_line("[launcher] DENIED — this account does not own the title.");
-        show_message(handle, "Not verified", "This account does not own the game.", None);
+        log_line("[launcher] DENIED — this account does not own either eligible game.");
+        show_message(
+            handle,
+            "Not verified",
+            "This account does not own Star Wars: Rebellion or Star Wars: Empire at War: Gold Pack.",
+            None,
+        );
         return;
     }
     log_line("[launcher] VERIFIED via the content gate.");

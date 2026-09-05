@@ -25,6 +25,9 @@ Download and install **Rebellion 2** for Windows or macOS.
 
 [View release notes and all assets](https://github.com/adasgames/rebellion2-installers/releases/latest).
 
+The launcher verifies ownership automatically before downloading game content. You must own
+either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG** or **Steam**.
+
 ## Install
 
 ### Windows
