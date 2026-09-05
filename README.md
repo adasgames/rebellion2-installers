@@ -28,6 +28,20 @@ Download and install **Rebellion 2** for Windows or macOS.
 The launcher verifies ownership automatically before downloading game content. You must own
 either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG** or **Steam**.
 
+## FAQ
+
+### Why is Empire at War accepted?
+
+*Star Wars: Rebellion* is no longer available for purchase through its former digital storefronts,
+leaving new players without the original—and preferred—ownership path. To keep Rebellion II
+accessible while still requiring ownership of a commercially available Star Wars strategy game,
+the installer also accepts *Star Wars: Empire at War: Gold Pack*.
+
+This is only an alternative ownership check. Rebellion II does not copy, extract, install, or
+otherwise use any files, code, artwork, audio, or other assets from *Empire at War*. Existing
+owners can continue verifying *Rebellion*; players who can no longer purchase it may instead
+verify ownership of *Empire at War: Gold Pack*.
+
 ## Install
 
 ### Windows
