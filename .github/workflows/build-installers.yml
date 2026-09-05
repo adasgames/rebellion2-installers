@@ -410,7 +410,7 @@ jobs:
             echo "REB2_CONTENT_BASE_URL is not configured." >&2
             exit 1
           fi
-          curl --fail --silent --show-error "${REB2_CONTENT_BASE_URL%/}/dist/latest.json" |
+          curl --fail --location --silent --show-error "${REB2_CONTENT_BASE_URL%/}/dist/latest.json" |
             python3 -c 'import json,sys; pointer=json.load(sys.stdin); assert pointer.get("version"), "The configured update channel did not return a content pointer."'
 
       - name: Build universal launcher app
