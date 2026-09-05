@@ -57,8 +57,9 @@ const SESSION_FILE: &str = ".session";
 const GAME_EXE: &str = "Rebellion2.exe";
 #[cfg(target_os = "linux")]
 const GAME_EXE: &str = "Rebellion2";
+
 #[cfg(target_os = "macos")]
-const GAME_EXE: &str = "Rebellion2.app";
+const MACOS_GAME_APP_NAME: &str = "Rebellion2 Game.app";
 
 const RELEASES_URL: &str = "https://github.com/adasgames/rebellion2-installers/releases/latest";
 
@@ -134,6 +135,7 @@ fn default_blobs() -> String {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
     if hand_off_pending_launcher_update() {
         return;
     }
@@ -422,7 +424,8 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
 
 // -- application updates -----------------------------------------------------
 
-/// Returns a newer application release when the public channel publishes one.
+/// Returns a newer Windows application release when the public channel publishes one.
+#[cfg(target_os = "windows")]
 fn check_application_update() -> Option<ApplicationUpdate> {
     if APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed) {
         return None;
@@ -431,6 +434,12 @@ fn check_application_update() -> Option<ApplicationUpdate> {
     let current = read_application_version().or_else(|| CONTENT_VERSION.filter(|version| !version.is_empty()).map(str::to_string))?;
     let update: ApplicationUpdate = fetch_json(&format!("{base}dist/application.json"), None).ok()?;
     version_gt(&update.version, &current).then_some(update)
+}
+
+/// Automatic application updates are currently disabled for non-Windows packages.
+#[cfg(not(target_os = "windows"))]
+fn check_application_update() -> Option<ApplicationUpdate> {
+    None
 }
 
 /// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
@@ -1222,11 +1231,58 @@ fn update_progress(handle: &tauri::AppHandle, percent: u64, label: &str) {
 
 // -- filesystem + process ----------------------------------------------------
 
+#[cfg(not(target_os = "macos"))]
 fn install_dir() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     exe.parent()
         .map(|dir| dir.to_path_buf())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "launcher has no parent directory"))
+}
+
+#[cfg(target_os = "macos")]
+fn install_dir() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not configured"))?;
+    let directory = macos_data_dir(&home);
+    fs::create_dir_all(&directory)?;
+    Ok(directory)
+}
+
+fn macos_data_dir(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("Rebellion 2")
+}
+
+fn macos_bundle_contents_dir(executable: &Path) -> io::Result<PathBuf> {
+    let macos_directory = executable.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "launcher executable has no parent directory")
+    })?;
+    let contents_directory = macos_directory.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "launcher bundle has no Contents directory")
+    })?;
+    if macos_directory.file_name().and_then(|name| name.to_str()) != Some("MacOS")
+        || contents_directory.file_name().and_then(|name| name.to_str()) != Some("Contents")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "launcher is not running from a macOS app bundle",
+        ));
+    }
+    Ok(contents_directory.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn game_path() -> io::Result<PathBuf> {
+    Ok(macos_bundle_contents_dir(&std::env::current_exe()?)?
+        .join("Resources")
+        .join(MACOS_GAME_APP_NAME))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn game_path() -> io::Result<PathBuf> {
+    Ok(install_dir()?.join(GAME_EXE))
 }
 
 fn log_line(message: &str) {
@@ -1308,7 +1364,7 @@ fn install_content(handle: &tauri::AppHandle, url: &str) -> Result<PathBuf, Box<
 
 fn launch_game() -> io::Result<bool> {
     let base = install_dir()?;
-    let exe = base.join(GAME_EXE);
+    let exe = game_path()?;
     if !exe.exists() {
         log_line(&format!("[launcher] game exe not found at {}", exe.display()));
         return Ok(false);
@@ -1316,7 +1372,12 @@ fn launch_game() -> io::Result<bool> {
     log_line(&format!("[launcher] launching {}", exe.display()));
 
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").arg(&exe).spawn()?;
+    std::process::Command::new("/usr/bin/open")
+        .arg(&exe)
+        .arg("--args")
+        .arg("-contentPath")
+        .arg(base.join("Content"))
+        .spawn()?;
 
     #[cfg(target_os = "linux")]
     std::process::Command::new(&exe).current_dir(&base).spawn()?;
@@ -1461,5 +1522,28 @@ mod tests {
         let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, "../outside.txt"]);
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
+    }
+
+    #[test]
+    fn macos_data_dir_uses_application_support() {
+        assert_eq!(
+            macos_data_dir(Path::new("/Users/player")),
+            Path::new("/Users/player/Library/Application Support/Rebellion 2")
+        );
+    }
+
+    #[test]
+    fn macos_bundle_contents_dir_returns_contents_directory() {
+        let executable = Path::new("/Applications/Rebellion2.app/Contents/MacOS/rebellion2-launcher");
+
+        assert_eq!(
+            macos_bundle_contents_dir(executable).unwrap(),
+            Path::new("/Applications/Rebellion2.app/Contents")
+        );
+    }
+
+    #[test]
+    fn macos_bundle_contents_dir_rejects_unbundled_executable() {
+        assert!(macos_bundle_contents_dir(Path::new("/tmp/rebellion2-launcher")).is_err());
     }
 }

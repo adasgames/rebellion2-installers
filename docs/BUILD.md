@@ -4,17 +4,16 @@ How the installers in this repo are produced. For players, see the [README](../R
 
 A single GitHub Actions workflow (`build-installers.yml`) builds an **asset-free** game
 player from [`rebellion2`](https://github.com/davidadas/rebellion2), builds the launcher in
-this repository, packages the two into a per-user Windows installer, and publishes it to a
-GitHub Release. The installer ships **no art** — the launcher downloads `content.zip` from
-R2 after ownership verification.
+this repository, packages native Windows and macOS downloads, and publishes them to a GitHub
+Release. The packages ship **no art** — the launcher downloads `content.zip` from R2 after
+ownership verification.
 
-Only the **Windows** leg is live today. macOS and Linux are parked in a commented block at
-the bottom of the workflow until the Windows path is validated end to end.
+The **Windows** and **macOS** legs are live. Linux remains parked.
 
 | Platform | Package | Tool | Status |
 |----------|---------|------|--------|
-| Windows  | `Rebellion2-<version>-Setup.exe`       | Inno Setup (`ISCC.exe`) | live   |
-| macOS    | `Rebellion2-<version>-macOS.zip`       | `zip` of the `.app`     | parked |
+| Windows  | `Rebellion2-Windows-Setup.exe`         | Inno Setup (`ISCC.exe`) | live   |
+| macOS    | `Rebellion2-macOS.zip`                 | universal `.app` archive | live   |
 | Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`          | parked |
 
 The packages do not have platform signatures yet, which is why Windows and macOS warn on first
@@ -48,20 +47,28 @@ The workflow has two entry points, and the difference matters:
 1. **prepare** — resolves the version: the tag name minus its `v`, else the `version` input,
    else `0.0.0-dev`. The workflow passes this value to the Unity player, launcher, content
    package, and installer so releases do not require a source-controlled version bump.
-2. **player** (`ubuntu-latest`) — checks out the game and `rebellion2-media`, pulls media LFS
-   from R2, and installs it into `Assets/Content` + `Assets/Art/Models/MainMenu` for prefab
-   authoring. It then builds `StandaloneWindows64` via `StandalonePlayerBuild.Build`, which
-   strips `Assets/Content` and verifies it did not leak — so the shipped player stays
-   asset-free.
+2. **player-windows / player-macos** (independent `ubuntu-latest` jobs) — call the shared player
+   workflow, check out the game and `rebellion2-media`, pull media LFS from R2, and install it
+   into `Assets/Content` + `Assets/Art/Models/MainMenu` for prefab
+   authoring. It then builds `StandaloneWindows64` and `StandaloneOSX` via
+   `StandalonePlayerBuild.Build`, which strips `Assets/Content` and verifies it did not leak —
+   so the shipped players stay asset-free.
 3. **publish-content** (`macos-latest`, tag builds only) — packages and uploads the versioned
    content archive, incremental manifest, blobs, and update pointer to R2.
-4. **windows-installer** (`windows-latest`) — builds the launcher (`cargo build --release`),
+4. **windows-installer** (`windows-latest`) — starts as soon as `player-windows` finishes, builds
+   the launcher (`cargo build --release`),
    stamps the game `.exe` icon (`rcedit`), packages the one-time setup executable, and produces
    the manifest, blobs, and installed handoff helper used for later incremental application updates.
-5. **release** (`if: github.ref_type == 'tag'`) — waits for both the installer and content publish,
+5. **macos-installer** (`macos-latest`) — starts as soon as `player-macos` finishes, builds a
+   universal Tauri launcher, embeds the Unity
+   player, and archives the resulting single draggable `Rebellion2.app`. Mutable content and
+   launcher state live under `~/Library/Application Support/Rebellion 2` rather than inside the
+   application bundle. Application self-updates remain Windows-only; macOS application upgrades
+   use a newly downloaded release archive.
+6. **release** (`if: github.ref_type == 'tag'`) — waits for both installers and content publish,
    creates the GitHub Release, signs and publishes the application manifest and blobs to R2, and
-   updates `dist/application.json`. Automatic updates patch the installation in place and never
-   reopen the setup wizard.
+   updates the Windows `dist/application.json`. Windows automatic updates patch the installation
+   in place and never reopen the setup wizard.
 
 ## Required secrets and variables
 
@@ -93,5 +100,5 @@ packaging/windows/rebellion2-launcher.iss  # Windows (Inno Setup) installer — 
 packaging/windows/rebellion2.nsi           # legacy NSIS script, unused by the current pipeline
 packaging/linux/build-appimage.sh          # AppDir assembly + appimagetool (parked)
 packaging/linux/rebellion2.desktop         # AppImage desktop entry (parked)
-packaging/macos/build-zip.sh               # .app -> zip (parked)
+packaging/macos/build-zip.sh               # launcher + Unity player -> one macOS app archive
 ```
