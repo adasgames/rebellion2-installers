@@ -12,8 +12,8 @@ The **Windows** and **macOS** legs are live. Linux remains parked.
 
 | Platform | Package | Tool | Status |
 |----------|---------|------|--------|
-| Windows  | `Rebellion2-<version>-Setup.exe`       | Inno Setup (`ISCC.exe`) | live   |
-| macOS    | `Rebellion2-<version>-macOS.zip`       | universal `.app` archive | live   |
+| Windows  | `Rebellion2-Windows-Setup.exe`         | Inno Setup (`ISCC.exe`) | live   |
+| macOS    | `Rebellion2-macOS.zip`                 | universal `.app` archive | live   |
 | Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`          | parked |
 
 The packages do not have platform signatures yet, which is why Windows and macOS warn on first

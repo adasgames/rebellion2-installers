@@ -478,6 +478,11 @@ jobs:
           name: application-update-layer
           path: application-update-metadata
 
+      - name: Name platform downloads
+        run: |
+          mv dist/*-Setup.exe dist/Rebellion2-Windows-Setup.exe
+          mv dist/*-macOS.zip dist/Rebellion2-macOS.zip
+
       - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -486,8 +491,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Rebellion 2 ${GITHUB_REF_NAME}" \
             --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
-            dist/*-Setup.exe \
-            dist/*-macOS.zip
+            dist/Rebellion2-Windows-Setup.exe \
+            dist/Rebellion2-macOS.zip
 
       - name: Sign and publish application update layer
         env:
