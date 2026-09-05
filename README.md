@@ -23,7 +23,8 @@ Grab the file for your system:
 
 ### macOS
 1. Unzip **`Rebellion2-<version>-macOS.zip`**.
-2. Drag **`Rebellion2.app`** into your **Applications** folder.
+2. Drag **`Rebellion2.app`** into your **Applications** folder. The launcher and game are both
+   contained in that single app.
 3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
    double-click will be blocked — you only need the right-click trick once.)
 

@@ -3,15 +3,14 @@ name: Build Installers
 # Tag-driven, launcher-model installer build.
 #
 # Push a tag like `v0.0.2` to cut a release: this builds the ASSET-FREE game
-# player, builds the launcher, stamps the game exe icon, packages a per-user
-# Inno installer, and publishes it to a GitHub Release named after the tag.
+# player, builds the launcher, packages native Windows and macOS downloads, and
+# publishes them to a GitHub Release named after the tag.
 # Content (art) is NOT in the installer — the launcher downloads content.zip
 # from R2 after ownership verification.
 #
 # workflow_dispatch is the escape hatch for test builds (no Release is cut).
 #
-# Currently Windows-complete. macOS/Linux jobs are parked below until the
-# Windows path is validated end to end (see the commented block).
+# Windows and macOS are live. Linux remains parked below.
 
 on:
   push:
@@ -51,9 +50,19 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
   player:
-    name: Build asset-free player (Windows)
+    name: Build asset-free player (${{ matrix.name }})
     runs-on: ubuntu-latest
     needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            target: StandaloneWindows64
+            artifact: player-windows
+          - name: macOS
+            target: StandaloneOSX
+            artifact: player-macos
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -127,8 +136,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: game/Library
-          key: Library-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
+          key: Library-${{ matrix.target }}-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
           restore-keys: |
+            Library-${{ matrix.target }}-
             Library-
 
       - name: Build player
@@ -140,18 +150,33 @@ jobs:
         with:
           projectPath: game
           unityVersion: ${{ env.UNITY_VERSION }}
-          targetPlatform: StandaloneWindows64
+          targetPlatform: ${{ matrix.target }}
           buildName: Rebellion2
           buildsPath: build
           buildMethod: StandalonePlayerBuild.Build
           customParameters: -buildVersion ${{ needs.prepare.outputs.version }}
           allowDirtyBuild: true
 
-      - name: Upload player
+      - name: Upload Windows player
+        if: matrix.target == 'StandaloneWindows64'
         uses: actions/upload-artifact@v4
         with:
-          name: player-windows
-          path: build/StandaloneWindows64
+          name: ${{ matrix.artifact }}
+          path: build/${{ matrix.target }}
+          if-no-files-found: error
+
+      # Preserve the app bundle's executable modes and symlinks across the
+      # Linux-to-macOS artifact handoff.
+      - name: Archive macOS player
+        if: matrix.target == 'StandaloneOSX'
+        run: tar -czf player-macos.tar.gz -C build/StandaloneOSX .
+
+      - name: Upload macOS player
+        if: matrix.target == 'StandaloneOSX'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: player-macos.tar.gz
           if-no-files-found: error
 
   publish-content:
@@ -349,18 +374,102 @@ jobs:
           path: application-update-metadata
           if-no-files-found: error
 
+  macos-installer:
+    name: Package macOS application
+    runs-on: macos-latest
+    needs: [prepare, player]
+    steps:
+      - name: Checkout installer repo (packaging)
+        uses: actions/checkout@v4
+
+      - name: Download player
+        uses: actions/download-artifact@v4
+        with:
+          name: player-macos
+          path: player-archive
+
+      - name: Extract player
+        run: |
+          mkdir player
+          tar -xzf player-archive/player-macos.tar.gz -C player
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Verify update channel
+        env:
+          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REB2_CONTENT_BASE_URL:-}" ]; then
+            echo "REB2_CONTENT_BASE_URL is not configured." >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error "${REB2_CONTENT_BASE_URL%/}/dist/latest.json" |
+            python3 -c 'import json,sys; pointer=json.load(sys.stdin); assert pointer.get("version"), "The configured update channel did not return a content pointer."'
+
+      - name: Build universal launcher app
+        working-directory: launcher/src-tauri
+        env:
+          REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
+          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          jq --arg version "$REB2_CONTENT_VERSION" '.version = $version' \
+            tauri.conf.json > tauri.release.conf.json
+          cargo tauri build \
+            --config tauri.release.conf.json \
+            --target universal-apple-darwin \
+            --bundles app
+
+      - name: Package application
+        run: |
+          bash packaging/macos/build-zip.sh \
+            "launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app" \
+            "$PWD/player" \
+            "${{ needs.prepare.outputs.version }}" \
+            "$PWD/dist/Rebellion2-${{ needs.prepare.outputs.version }}-macOS.zip"
+
+      - name: Verify packaged application
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          ditto -x -k "dist/Rebellion2-${{ needs.prepare.outputs.version }}-macOS.zip" "$work"
+          test -x "$work/Rebellion2.app/Contents/MacOS/rebellion2-launcher"
+          test -d "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app"
+          test -n "$(find "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          codesign --verify --deep --strict "$work/Rebellion2.app"
+
+      - name: Upload application
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-macos
+          path: dist/*-macOS.zip
+          if-no-files-found: error
+
   release:
     name: Publish Release
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    needs: [prepare, publish-content, windows-installer]
+    needs: [prepare, publish-content, windows-installer, macos-installer]
     permissions:
       contents: write
     steps:
-      - name: Download installer
+      - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
           name: installer-windows
+          path: dist
+
+      - name: Download macOS application
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-macos
           path: dist
 
       - name: Download application update layer
@@ -377,7 +486,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Rebellion 2 ${GITHUB_REF_NAME}" \
             --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
-            dist/*-Setup.exe
+            dist/*-Setup.exe \
+            dist/*-macOS.zip
 
       - name: Sign and publish application update layer
         env:
@@ -412,15 +522,8 @@ jobs:
           rclone copyto application.json ":s3:${R2_BUCKET}/dist/application.json"
 
   # ---------------------------------------------------------------------------
-  # PARKED: macOS and Linux installers.
+  # PARKED: Linux installer.
   #
-  # The launcher-model Windows path is validated first. macOS/Linux each need:
-  #   - a matching asset-free player (add StandaloneOSX / StandaloneLinux64 to
-  #     the `player` job as a matrix, or add sibling jobs),
-  #   - a per-OS launcher build (Tauri does not cross-compile: macos-latest and
-  #     ubuntu-latest runners),
-  #   - per-OS packaging (macOS: .app -> zip/dmg, ideally signed+notarized;
-  #     Linux: AppImage via packaging/linux/build-appimage.sh),
-  #   - per-OS icon handling.
-  # Unpark once the Windows job is green.
+  # Linux still needs a matching player matrix entry, a native Tauri launcher,
+  # AppImage packaging, and per-platform application updates.
   # ---------------------------------------------------------------------------
