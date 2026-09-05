@@ -217,9 +217,10 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     // Gate result: /done?ok=1&url=<presigned>&token=<session>
     if target.starts_with(&format!("{GATE}done")) {
         let ok = url.query_pairs().any(|(k, v)| k == "ok" && v == "1");
+        let message = query(url, "msg");
         let presigned = query(url, "url");
         let token = query(url, "token");
-        on_gate_result(handle, ok, presigned, token);
+        on_gate_result(handle, ok, message, presigned, token);
         return false;
     }
 
@@ -262,14 +263,24 @@ fn requires_ownership_gate(installed: bool, repair: bool) -> bool {
 
 /// Caches successful ownership verification and resumes the operation that requested it.
 /// Falls back to the presigned first-install archive when no update is pending.
-fn on_gate_result(handle: &tauri::AppHandle, ok: bool, presigned: Option<String>, token: Option<String>) {
+fn on_gate_result(
+    handle: &tauri::AppHandle,
+    ok: bool,
+    message: Option<String>,
+    presigned: Option<String>,
+    token: Option<String>,
+) {
     if !ok {
-        log_line("[launcher] DENIED — this account does not own either eligible game.");
+        let message = message
+            .as_deref()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("This account does not own either eligible game.");
+        log_line("[launcher] Ownership verification was not completed.");
         show_message(
             handle,
             "Not verified",
-            "This account does not own Star Wars: Rebellion or Star Wars: Empire at War: Gold Pack.",
-            None,
+            message,
+            Some(("Try Again", "signin")),
         );
         return;
     }
@@ -1108,11 +1119,21 @@ fn js_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', " ")
 }
 
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 /// One shared card, matching the content gate exactly: kicker + REBELLION II
 /// wordmark top-aligned, an optional spinner, a status line, a progress bar, and
 /// buttons pinned toward the bottom. Fixed height so the frame never resizes.
 fn render(kicker: &str, spinner: bool, status: &str, buttons: &str) -> String {
     let spin = if spinner { r#"<div class="spin"></div>"# } else { "" };
+    let kicker = html_escape(kicker);
+    let status = html_escape(status);
     format!(
         r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:min(94vw,440px);height:min(560px,92vh);overflow:hidden;padding:40px 34px 30px;background:rgba(16,22,43,.72);border:1px solid rgba(120,160,255,.18);border-radius:18px;backdrop-filter:blur(14px);box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 24px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.btns{{margin-top:auto}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="card"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="sub" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div><div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
         kicker = kicker,
@@ -1492,6 +1513,14 @@ mod tests {
         assert!(screen.contains("Version 1.2.3 is available. Install it now?"));
         assert!(screen.contains("choice=application-update\">Install Update"));
         assert!(screen.contains("choice=play\">Launch Game"));
+    }
+
+    #[test]
+    fn render_escapes_status_text() {
+        let screen = render("Status", false, "<script>alert('gate')</script>", "");
+
+        assert!(screen.contains("&lt;script&gt;alert(&#39;gate&#39;)&lt;/script&gt;"));
+        assert!(!screen.contains("<script>alert('gate')</script>"));
     }
 
     #[test]
