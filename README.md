@@ -15,7 +15,7 @@ Download and install **Rebellion 2** for Windows or macOS.
     </td>
     <td align="center" width="50%">
       <a href="https://github.com/adasgames/rebellion2-installers/releases/latest/download/Rebellion2-macOS.zip">
-        <img src="docs/assets/apple.svg" width="64" alt="Apple"><br>
+        <img src="docs/assets/apple.svg" width="64" alt="macOS"><br>
         <strong>Download latest for macOS</strong>
       </a><br>
       <sub>Universal Intel + Apple Silicon app</sub>

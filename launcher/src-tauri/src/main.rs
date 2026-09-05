@@ -436,7 +436,7 @@ fn check_application_update() -> Option<ApplicationUpdate> {
     version_gt(&update.version, &current).then_some(update)
 }
 
-/// Non-Windows packages currently update by downloading a new release artifact.
+/// Automatic application updates are currently disabled for non-Windows packages.
 #[cfg(not(target_os = "windows"))]
 fn check_application_update() -> Option<ApplicationUpdate> {
     None

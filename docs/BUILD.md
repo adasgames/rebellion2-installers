@@ -47,17 +47,20 @@ The workflow has two entry points, and the difference matters:
 1. **prepare** — resolves the version: the tag name minus its `v`, else the `version` input,
    else `0.0.0-dev`. The workflow passes this value to the Unity player, launcher, content
    package, and installer so releases do not require a source-controlled version bump.
-2. **player** (`ubuntu-latest`, Windows/macOS matrix) — checks out the game and `rebellion2-media`, pulls media LFS
-   from R2, and installs it into `Assets/Content` + `Assets/Art/Models/MainMenu` for prefab
+2. **player-windows / player-macos** (independent `ubuntu-latest` jobs) — call the shared player
+   workflow, check out the game and `rebellion2-media`, pull media LFS from R2, and install it
+   into `Assets/Content` + `Assets/Art/Models/MainMenu` for prefab
    authoring. It then builds `StandaloneWindows64` and `StandaloneOSX` via
    `StandalonePlayerBuild.Build`, which strips `Assets/Content` and verifies it did not leak —
    so the shipped players stay asset-free.
 3. **publish-content** (`macos-latest`, tag builds only) — packages and uploads the versioned
    content archive, incremental manifest, blobs, and update pointer to R2.
-4. **windows-installer** (`windows-latest`) — builds the launcher (`cargo build --release`),
+4. **windows-installer** (`windows-latest`) — starts as soon as `player-windows` finishes, builds
+   the launcher (`cargo build --release`),
    stamps the game `.exe` icon (`rcedit`), packages the one-time setup executable, and produces
    the manifest, blobs, and installed handoff helper used for later incremental application updates.
-5. **macos-installer** (`macos-latest`) — builds a universal Tauri launcher, embeds the Unity
+5. **macos-installer** (`macos-latest`) — starts as soon as `player-macos` finishes, builds a
+   universal Tauri launcher, embeds the Unity
    player, and archives the resulting single draggable `Rebellion2.app`. Mutable content and
    launcher state live under `~/Library/Application Support/Rebellion 2` rather than inside the
    application bundle. Application self-updates remain Windows-only; macOS application upgrades

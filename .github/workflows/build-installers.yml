@@ -27,9 +27,6 @@ on:
         required: false
         default: ""
 
-env:
-  UNITY_VERSION: 6000.4.0f1
-
 jobs:
   prepare:
     name: Resolve version
@@ -49,135 +46,29 @@ jobs:
           echo "Resolved version: $V"
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-  player:
-    name: Build asset-free player (${{ matrix.name }})
-    runs-on: ubuntu-latest
+  player-windows:
+    name: Build asset-free player (Windows)
     needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows
-            target: StandaloneWindows64
-            artifact: player-windows
-          - name: macOS
-            target: StandaloneOSX
-            artifact: player-macos
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          docker-images: true
-          large-packages: false
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-windows
+      media_ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+      source_ref: ${{ inputs.source_ref || github.ref_name }}
+      target: StandaloneWindows64
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
 
-      # Pin the game to the release tag so builds are reproducible: a tag build checks
-      # out rebellion2@<tag>; a dispatch build uses source_ref (default master).
-      - name: Checkout game
-        uses: actions/checkout@v4
-        with:
-          repository: davidadas/rebellion2
-          ref: ${{ inputs.source_ref || github.ref_name }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          persist-credentials: false
-          path: game
-
-      # Media (content pack + main-menu models) is needed at BUILD time for prefab
-      # authoring/previews. StandalonePlayerBuild strips Assets/Content from the
-      # final player and verifies it did not leak, so the shipped player stays
-      # asset-free — the real content ships separately as content.zip on R2.
-      - name: Checkout media (git only, no LFS)
-        uses: actions/checkout@v4
-        with:
-          repository: adasgames/rebellion2-media
-          ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
-          ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
-          persist-credentials: false
-          lfs: false
-          path: game/.ci/rebellion2-media
-
-      - name: Pull media LFS from R2
-        working-directory: game/.ci/rebellion2-media
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
-        run: |
-          HOST="${R2_ENDPOINT#https://}"
-          git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
-          for attempt in 1 2 3; do
-            if git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            delay=$((attempt * 30))
-            echo "Media LFS pull failed; retrying in ${delay} seconds."
-            sleep "$delay"
-          done
-          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
-            echo "Media checkout still contains Git LFS pointers."; exit 1
-          fi
-
-      - name: Install media (editor-preview content + main-menu models)
-        working-directory: game
-        run: |
-          mkdir -p Assets/Content Assets/Art/Models/MainMenu
-          test -f .ci/rebellion2-media/Content/Application/Schemas/game-config.xsd
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Content/ Assets/Content/
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Models/MainMenu/ Assets/Art/Models/MainMenu/
-          rm -rf .ci
-
-      - name: Cache Library
-        uses: actions/cache@v4
-        with:
-          path: game/Library
-          key: Library-${{ matrix.target }}-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
-          restore-keys: |
-            Library-${{ matrix.target }}-
-            Library-
-
-      - name: Build player
-        uses: game-ci/unity-builder@v4
-        env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-        with:
-          projectPath: game
-          unityVersion: ${{ env.UNITY_VERSION }}
-          targetPlatform: ${{ matrix.target }}
-          buildName: Rebellion2
-          buildsPath: build
-          buildMethod: StandalonePlayerBuild.Build
-          customParameters: -buildVersion ${{ needs.prepare.outputs.version }}
-          allowDirtyBuild: true
-
-      - name: Upload Windows player
-        if: matrix.target == 'StandaloneWindows64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: build/${{ matrix.target }}
-          if-no-files-found: error
-
-      # Preserve the app bundle's executable modes and symlinks across the
-      # Linux-to-macOS artifact handoff.
-      - name: Archive macOS player
-        if: matrix.target == 'StandaloneOSX'
-        run: tar -czf player-macos.tar.gz -C build/StandaloneOSX .
-
-      - name: Upload macOS player
-        if: matrix.target == 'StandaloneOSX'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: player-macos.tar.gz
-          if-no-files-found: error
+  player-macos:
+    name: Build asset-free player (macOS)
+    needs: prepare
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-macos
+      media_ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+      source_ref: ${{ inputs.source_ref || github.ref_name }}
+      target: StandaloneOSX
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
 
   publish-content:
     name: Publish content + update layer to R2
@@ -250,7 +141,7 @@ jobs:
   windows-installer:
     name: Package Windows installer
     runs-on: windows-latest
-    needs: [prepare, player]
+    needs: [prepare, player-windows]
     steps:
       - name: Checkout installer repo (packaging)
         uses: actions/checkout@v4
@@ -377,7 +268,7 @@ jobs:
   macos-installer:
     name: Package macOS application
     runs-on: macos-latest
-    needs: [prepare, player]
+    needs: [prepare, player-macos]
     steps:
       - name: Checkout installer repo (packaging)
         uses: actions/checkout@v4
@@ -529,6 +420,6 @@ jobs:
   # ---------------------------------------------------------------------------
   # PARKED: Linux installer.
   #
-  # Linux still needs a matching player matrix entry, a native Tauri launcher,
+  # Linux still needs a matching player workflow call, a native Tauri launcher,
   # AppImage packaging, and per-platform application updates.
   # ---------------------------------------------------------------------------

@@ -1,0 +1,150 @@
+name: Build Player
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        required: true
+        type: string
+      media_ref:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      unity_version:
+        default: 6000.4.0f1
+        required: false
+        type: string
+      version:
+        required: true
+        type: string
+    secrets:
+      REBELLION2_MEDIA_SSH_KEY:
+        required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      SOURCE_REPO_TOKEN:
+        required: true
+      UNITY_EMAIL:
+        required: true
+      UNITY_LICENSE:
+        required: true
+      UNITY_PASSWORD:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          docker-images: true
+          large-packages: false
+
+      - name: Checkout game
+        uses: actions/checkout@v4
+        with:
+          repository: davidadas/rebellion2
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          path: game
+
+      - name: Checkout media (git only, no LFS)
+        uses: actions/checkout@v4
+        with:
+          repository: adasgames/rebellion2-media
+          ref: ${{ inputs.media_ref }}
+          ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
+          persist-credentials: false
+          lfs: false
+          path: game/.ci/rebellion2-media
+
+      - name: Pull media LFS from R2
+        working-directory: game/.ci/rebellion2-media
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          HOST="${R2_ENDPOINT#https://}"
+          git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
+          for attempt in 1 2 3; do
+            if git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            delay=$((attempt * 30))
+            echo "Media LFS pull failed; retrying in ${delay} seconds."
+            sleep "$delay"
+          done
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
+            echo "Media checkout still contains Git LFS pointers."
+            exit 1
+          fi
+
+      - name: Install media (editor-preview content + main-menu models)
+        working-directory: game
+        run: |
+          mkdir -p Assets/Content Assets/Art/Models/MainMenu
+          test -f .ci/rebellion2-media/Content/Application/Schemas/game-config.xsd
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Content/ Assets/Content/
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Models/MainMenu/ Assets/Art/Models/MainMenu/
+          rm -rf .ci
+
+      - name: Cache Library
+        uses: actions/cache@v4
+        with:
+          path: game/Library
+          key: Library-${{ inputs.target }}-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
+          restore-keys: |
+            Library-${{ inputs.target }}-
+
+      - name: Build player
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: game
+          unityVersion: ${{ inputs.unity_version }}
+          targetPlatform: ${{ inputs.target }}
+          buildName: Rebellion2
+          buildsPath: build
+          buildMethod: StandalonePlayerBuild.Build
+          customParameters: -buildVersion ${{ inputs.version }}
+          allowDirtyBuild: true
+
+      - name: Upload Windows player
+        if: inputs.target == 'StandaloneWindows64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: build/${{ inputs.target }}
+          if-no-files-found: error
+
+      - name: Archive macOS player
+        if: inputs.target == 'StandaloneOSX'
+        run: tar -czf player-macos.tar.gz -C build/StandaloneOSX .
+
+      - name: Upload macOS player
+        if: inputs.target == 'StandaloneOSX'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: player-macos.tar.gz
+          if-no-files-found: error
