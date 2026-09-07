@@ -77,6 +77,8 @@ static PENDING_APPLICATION_UPDATE: Mutex<Option<ApplicationUpdate>> = Mutex::new
 static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
 /// Set while ownership verification returns the remote webview to bundled launcher content.
 static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
+/// Set until the bundled launcher page is ready for its first channel scan.
+static INITIAL_SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Ed25519 public key (hex) that must have signed an application manifest.
 const APPLICATION_UPDATE_PUBKEY: &str = "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
@@ -178,6 +180,7 @@ fn main() {
                 // Installed (or already signed in) — go straight to the scan. A scan
                 // failure degrades to "launch what's installed", so play never blocks.
                 let page_load_handle = handle.clone();
+                INITIAL_SCAN_PENDING.store(true, Ordering::Relaxed);
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
@@ -188,7 +191,6 @@ fn main() {
                     })
                     .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
                     .build()?;
-                thread::spawn(move || scan_and_prompt(&handle));
             }
             Ok(())
         })
@@ -238,16 +240,18 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     true
 }
 
-/// Resumes launcher work after ownership verification returns to bundled content.
+/// Starts launcher work after bundled content finishes loading.
 fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
-    if payload.event() != PageLoadEvent::Finished
-        || !is_local_app_url(payload.url())
-        || !GATE_RETURN_PENDING.swap(false, Ordering::Relaxed)
-    {
+    if payload.event() != PageLoadEvent::Finished || !is_local_app_url(payload.url()) {
         return;
     }
 
-    resume_after_gate(handle);
+    if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
+        resume_after_gate(handle);
+    } else if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
+        let handle = handle.clone();
+        thread::spawn(move || scan_and_prompt(&handle));
+    }
 }
 
 /// Returns whether a URL belongs to the bundled Tauri application.
