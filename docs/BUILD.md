@@ -4,9 +4,9 @@ How the installers in this repo are produced. For players, see the [README](../R
 
 Separate GitHub Actions workflows build **asset-free** game players from
 [`rebellion2`](https://github.com/davidadas/rebellion2) and package the launcher in this
-repository. The normal tag-driven workflow publishes Windows and the shared update channel.
-The macOS workflow is manual and only attaches its archive to an existing release, keeping
-the expensive macOS runner opt-in. The packages ship **no art** — the launcher downloads
+repository. OS-specific tags select which platform to build. The Windows workflow publishes
+the shared update channel; the macOS workflow only attaches its archive to an existing release,
+keeping the expensive macOS runner opt-in. The packages ship **no art** — the launcher downloads
 content from R2 after ownership verification.
 
 The **Windows** and **macOS** legs are live. Linux remains parked.
@@ -25,17 +25,16 @@ automatic updates. Authenticode on Windows and notarization on macOS remain on t
 
 The workflows have three entry points, and the difference matters:
 
-- **Tag push — cuts a Release.** Push a tag matching `v*` to _this_ repo:
+- **Windows tag — cuts a Release.** Push a tag matching `windows-*` to _this_ repo:
 
   ```bash
-  git tag v0.1.0
-  git push origin v0.1.0
+  git tag windows-0.1.0
+  git push origin windows-0.1.0
   ```
 
-  This runs the Windows pipeline and publishes a GitHub Release named after the tag. A tag points
-  at a commit (conventionally the tip of `main`), not a branch. Tag builds check out the matching
-  tag from both `rebellion2` and `rebellion2-media`, so all three repositories must carry the same
-  release tag.
+  This runs the Windows pipeline and publishes GitHub Release `v0.1.0`. Tag builds check out
+  `v0.1.0` from both `rebellion2` and `rebellion2-media`, so those repositories must carry the
+  ordinary matching version tag before the installer tag is pushed.
 
 - **Manual Windows dispatch — test build only.** Actions tab → **Build Windows Installer** →
   **Run workflow**. The publishing jobs are gated on `github.ref_type == 'tag'`, so dispatch runs
@@ -45,17 +44,24 @@ The workflows have three entry points, and the difference matters:
   - **version** — version string (blank = `0.0.0-dev`).
   - **source_ref** — `rebellion2` ref to build (default `master`).
 
-- **Manual macOS dispatch — release attachment.** After the Windows release succeeds, open
-  **Build macOS Installer**, choose **Run workflow**, and enter its existing `v*` release tag.
+- **macOS tag — release attachment.** After the Windows release succeeds, push the corresponding
+  platform tag:
+
+  ```bash
+  git tag macos-0.1.0
+  git push origin macos-0.1.0
+  ```
+
   The workflow verifies that the release and live content version match before starting either
   expensive build. It then attaches `Rebellion2-macOS.zip` to that release without changing the
   R2 release pointer or creating another release.
 
 ## Jobs
 
-1. **prepare** — resolves the version: the tag name minus its `v`, else the `version` input,
-   else `0.0.0-dev`. The workflow passes this value to the Unity player, launcher, content
-   package, and installer so releases do not require a source-controlled version bump.
+1. **prepare** — resolves the version: the tag name minus its `windows-` prefix, else the
+   `version` input, else `0.0.0-dev`. The workflow passes this value to the Unity player,
+   launcher, content package, and installer so releases do not require a source-controlled
+   version bump.
 2. **player-windows** (`ubuntu-latest`) — calls the shared player workflow, checks out the game
    and `rebellion2-media`, pulls media LFS from R2, and installs it into `Assets/Content` plus
    `Assets/Art/Models/MainMenu` for prefab authoring. It builds `StandaloneWindows64` via
@@ -73,9 +79,9 @@ The workflows have three entry points, and the difference matters:
    verifies both versions through the direct and public channel, and restores the previous pointer
    if publication fails. Legacy `latest.json` remains pinned for older launchers.
 
-The manual macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
+The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
 packaging job uses `macos-latest`; it builds the universal Tauri launcher, embeds the Unity player,
-verifies the archive, and attaches it to the existing release. macOS upgrades remain manual.
+verifies the archive, and attaches it to the existing release.
 
 ## Required secrets and variables
 
@@ -100,8 +106,8 @@ Set these under **Settings → Secrets and variables → Actions** before the fi
 ## Layout
 
 ```
-.github/workflows/build-windows-installer.yml # tag-driven Windows release and live channel
-.github/workflows/build-macos-installer.yml   # opt-in macOS release attachment
+.github/workflows/build-windows-installer.yml # windows-* release and live channel
+.github/workflows/build-macos-installer.yml   # macos-* opt-in release attachment
 .github/workflows/build-player.yml            # shared Ubuntu Unity player build
 launcher/                                  # Tauri launcher/patcher source
 launcher/self-update/                      # staged-launcher handoff helper

@@ -1,18 +1,16 @@
 name: Build macOS Installer
 
-# macOS is intentionally opt-in. Run this only after the matching Windows release
-# exists; the workflow attaches a macOS download without changing live channels.
+# macOS is intentionally opt-in. Push a tag like `macos-0.0.11` only after the
+# matching Windows release exists. The workflow attaches a macOS download
+# without changing live channels.
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing release tag to build, for example v0.0.11"
-        required: true
-        type: string
+  push:
+    tags:
+      - "macos-*"
 
 concurrency:
-  group: macos-release-${{ inputs.release_tag }}
+  group: macos-release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -28,13 +26,13 @@ jobs:
       - id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$GITHUB_REF_NAME" =~ ^macos-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          version="${GITHUB_REF_NAME#macos-}"
+          RELEASE_TAG="v$version"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
-          version="${RELEASE_TAG#v}"
           base="${REB2_CONTENT_BASE_URL%/}"
           release=$(curl --fail --location --silent --show-error "$base/dist/application.json")
           test "$(jq -r .version <<<"$release")" = "$version"

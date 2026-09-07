@@ -2,19 +2,19 @@ name: Build Windows Installer
 
 # Tag-driven, launcher-model installer build.
 #
-# Push a tag like `v0.0.2` to cut a release: this builds the ASSET-FREE Windows
-# player, packages the launcher, and publishes the Windows GitHub Release.
+# Push a tag like `windows-0.0.2` to cut a release: this builds the ASSET-FREE
+# Windows player, packages the launcher, and publishes release `v0.0.2`.
 # Content (art) is NOT in the installer — the launcher downloads content.zip
 # from R2 after ownership verification.
 #
 # workflow_dispatch is the escape hatch for test builds (no Release is cut).
 #
-# macOS is built separately and manually so its runner cost is opt-in.
+# macOS is built separately from a `macos-*` tag so its runner cost is opt-in.
 
 on:
   push:
     tags:
-      - "v*"
+      - "windows-*"
   workflow_dispatch:
     inputs:
       source_ref:
@@ -36,11 +36,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      release_tag: ${{ steps.v.outputs.release_tag }}
     steps:
       - id: v
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            V="${GITHUB_REF_NAME#v}"
+            [[ "$GITHUB_REF_NAME" =~ ^windows-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+            V="${GITHUB_REF_NAME#windows-}"
           elif [ -n "${{ inputs.version }}" ]; then
             V="${{ inputs.version }}"
           else
@@ -48,6 +50,7 @@ jobs:
           fi
           echo "Resolved version: $V"
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v$V" >> "$GITHUB_OUTPUT"
 
   player-windows:
     name: Build asset-free player (Windows)
@@ -55,8 +58,8 @@ jobs:
     uses: ./.github/workflows/build-player.yml
     with:
       artifact: player-windows
-      media_ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
-      source_ref: ${{ inputs.source_ref || github.ref_name }}
+      media_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
+      source_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || inputs.source_ref || 'master' }}
       target: StandaloneWindows64
       version: ${{ needs.prepare.outputs.version }}
     secrets: inherit
@@ -80,7 +83,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: adasgames/rebellion2-media
-          ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+          ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
           ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
           persist-credentials: false
           lfs: false
@@ -307,17 +310,19 @@ jobs:
       - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" \
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
               dist/Rebellion2-Windows-Setup.exe \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "${GITHUB_REF_NAME}" \
+            gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Rebellion 2 ${GITHUB_REF_NAME}" \
-              --notes "Automated Windows build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification. The macOS archive is published separately." \
+              --target "$GITHUB_SHA" \
+              --title "Rebellion 2 $RELEASE_TAG" \
+              --notes "Automated Windows build of Rebellion 2 $RELEASE_TAG. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification. The macOS archive is published separately." \
               dist/Rebellion2-Windows-Setup.exe
           fi
 
