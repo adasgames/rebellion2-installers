@@ -39,15 +39,25 @@ jobs:
       release_tag: ${{ steps.v.outputs.release_tag }}
     steps:
       - id: v
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            [[ "$GITHUB_REF_NAME" =~ ^windows-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+            [[ "$GITHUB_REF_NAME" =~ ^windows-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+              echo "Invalid Windows release tag: $GITHUB_REF_NAME" >&2
+              exit 1
+            }
             V="${GITHUB_REF_NAME#windows-}"
-          elif [ -n "${{ inputs.version }}" ]; then
-            V="${{ inputs.version }}"
+          elif [ -n "$REQUESTED_VERSION" ]; then
+            V="$REQUESTED_VERSION"
           else
             V="0.0.0-dev"
           fi
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "Invalid release version: $V" >&2
+            exit 1
+          }
           echo "Resolved version: $V"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "release_tag=v$V" >> "$GITHUB_OUTPUT"

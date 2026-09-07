@@ -456,6 +456,13 @@ fn check_application_update() -> Option<ApplicationUpdate> {
     let base = content_base()?;
     let current = current_application_version()?;
     let update: ApplicationUpdate = fetch_json(&format!("{base}dist/application.json"), None).ok()?;
+    if !application_release_is_coherent(&update) {
+        log_line(&format!(
+            "[launcher] refusing application {} because its content release does not match.",
+            update.version
+        ));
+        return None;
+    }
     version_gt(&update.version, &current).then_some(update)
 }
 
@@ -589,12 +596,17 @@ fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Resu
             "application manifest does not contain the launcher",
         ));
     }
+    if !manifest.files.iter().any(|entry| entry.path == UPDATE_HELPER_FILE_NAME) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "application manifest does not contain the update helper",
+        ));
+    }
     for entry in &manifest.files {
         let path = Path::new(&entry.path);
         if path.is_absolute()
             || path.components().any(|component| !matches!(component, Component::Normal(_)))
-            || path.starts_with("Content")
-            || path.starts_with("Mods")
+            || is_unmanaged_application_path(path)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -603,6 +615,15 @@ fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Resu
         }
     }
     Ok(())
+}
+
+/// Returns whether a path belongs to player-managed content rather than the application.
+fn is_unmanaged_application_path(path: &Path) -> bool {
+    let Some(Component::Normal(component)) = path.components().next() else {
+        return false;
+    };
+    let component = component.to_string_lossy();
+    component.eq_ignore_ascii_case("Content") || component.eq_ignore_ascii_case("Mods")
 }
 
 /// Reads the application manifest installed by setup or the previous update.
@@ -656,6 +677,15 @@ fn current_application_version() -> Option<String> {
 /// Content is safe to load only when it was published for this application build.
 fn content_matches_application(application_version: Option<&str>, content_version: &str) -> bool {
     application_version == Some(content_version)
+}
+
+/// Returns whether embedded content uses the same version as its application release.
+fn application_release_is_coherent(update: &ApplicationUpdate) -> bool {
+    update
+        .content
+        .as_ref()
+        .map(|content| content.version == update.version)
+        .unwrap_or(true)
 }
 
 /// Downloads a public update-channel object.
@@ -1570,7 +1600,28 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(release.content.unwrap().version, "0.0.11");
+        assert_eq!(release.content.as_ref().unwrap().version, "0.0.11");
+        assert!(application_release_is_coherent(&release));
+    }
+
+    #[test]
+    fn application_update_with_mismatched_content_is_incoherent() {
+        let release: ApplicationUpdate = serde_json::from_str(
+            r#"{
+                "version":"0.0.11",
+                "manifest":"dist/application-manifest-0.0.11.json",
+                "blobs":"application-blobs/",
+                "signature":"signed",
+                "content":{
+                    "version":"0.0.10",
+                    "manifest":"dist/manifest-0.0.10.json",
+                    "blobs":"blobs/"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!application_release_is_coherent(&release));
     }
 
     #[test]
@@ -1586,6 +1637,7 @@ mod tests {
         .unwrap();
 
         assert!(release.content.is_none());
+        assert!(application_release_is_coherent(&release));
     }
 
     #[test]
@@ -1670,14 +1722,37 @@ mod tests {
 
     #[test]
     fn validate_application_manifest_with_content_path_returns_error() {
-        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, "Content/catalog.xml"]);
+        let manifest = application_manifest(
+            "1.2.3",
+            &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "Content/catalog.xml"],
+        );
+
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
+    }
+
+    #[test]
+    fn validate_application_manifest_with_lowercase_content_path_returns_error() {
+        let manifest = application_manifest(
+            "1.2.3",
+            &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "content/catalog.xml"],
+        );
+
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
+    }
+
+    #[test]
+    fn validate_application_manifest_without_update_helper_returns_error() {
+        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, "Rebellion2.exe"]);
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
     }
 
     #[test]
     fn validate_application_manifest_with_parent_traversal_returns_error() {
-        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, "../outside.txt"]);
+        let manifest = application_manifest(
+            "1.2.3",
+            &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "../outside.txt"],
+        );
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
     }
