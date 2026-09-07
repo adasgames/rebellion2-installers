@@ -1,0 +1,124 @@
+name: Build macOS Installer
+
+# macOS is intentionally opt-in. Run this only after the matching Windows release
+# exists; the workflow attaches a macOS download without changing live channels.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build, for example v0.0.11"
+        required: true
+        type: string
+
+concurrency:
+  group: macos-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify existing release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          version="${RELEASE_TAG#v}"
+          base="${REB2_CONTENT_BASE_URL%/}"
+          release=$(curl --fail --location --silent --show-error "$base/dist/application.json")
+          test "$(jq -r .version <<<"$release")" = "$version"
+          test "$(jq -r .content.version <<<"$release")" = "$version"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  player:
+    name: Build asset-free player (macOS)
+    needs: prepare
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-macos
+      media_ref: ${{ needs.prepare.outputs.tag }}
+      source_ref: ${{ needs.prepare.outputs.tag }}
+      target: StandaloneOSX
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
+
+  package:
+    name: Package macOS application
+    runs-on: macos-latest
+    needs: [prepare, player]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout installer repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download player
+        uses: actions/download-artifact@v4
+        with:
+          name: player-macos
+          path: player-archive
+
+      - name: Extract player
+        run: |
+          mkdir player
+          tar -xzf player-archive/player-macos.tar.gz -C player
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build universal launcher app
+        working-directory: launcher/src-tauri
+        env:
+          REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
+          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          jq --arg version "$REB2_CONTENT_VERSION" '.version = $version' \
+            tauri.conf.json > tauri.release.conf.json
+          cargo tauri build \
+            --config tauri.release.conf.json \
+            --target universal-apple-darwin \
+            --bundles app
+
+      - name: Package application
+        run: |
+          bash packaging/macos/build-zip.sh \
+            "launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app" \
+            "$PWD/player" \
+            "${{ needs.prepare.outputs.version }}" \
+            "$PWD/Rebellion2-macOS.zip"
+
+      - name: Verify packaged application
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          ditto -x -k Rebellion2-macOS.zip "$work"
+          test -x "$work/Rebellion2.app/Contents/MacOS/rebellion2-launcher"
+          test -d "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app"
+          test -n "$(find "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          codesign --verify --deep --strict "$work/Rebellion2.app"
+
+      - name: Attach macOS download to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release upload "$RELEASE_TAG" Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"

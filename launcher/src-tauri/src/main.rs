@@ -3,8 +3,8 @@
 // Flow:
 //   1. Ownership — reuse a cached session token if still valid; otherwise open the
 //      content gate (Steam/GOG/GitHub), which mints a signed token we cache.
-//   2. Scan — read the public channel pointer (latest.json) and compare to what's
-//      installed: nothing installed / behind / current.
+//   2. Scan — read the public release pointer and compare its matching application
+//      and content versions to what's installed: nothing / behind / current.
 //   3. Act — first install or an incremental patch require the user to confirm;
 //      "already current" just says so and offers Play.
 //
@@ -31,8 +31,8 @@ const GATE: &str = "https://rebellion2-content-gate.pages.dev/";
 
 /// The content version this launcher was built for (REB2_CONTENT_VERSION).
 const CONTENT_VERSION: Option<&str> = option_env!("REB2_CONTENT_VERSION");
-/// Public base URL of the content channel (REB2_CONTENT_BASE_URL): holds the public
-/// dist/latest.json and the token-gated manifest + blobs.
+/// Public base URL of the release channel (REB2_CONTENT_BASE_URL): holds the public
+/// atomic application pointer and token-gated content manifests + blobs.
 const CONTENT_BASE: Option<&str> = option_env!("REB2_CONTENT_BASE_URL");
 
 const CONTENT_VERSION_FILE: &str = ".content-version";
@@ -81,7 +81,7 @@ static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 /// Ed25519 public key (hex) that must have signed an application manifest.
 const APPLICATION_UPDATE_PUBKEY: &str = "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
 
-/// The signed application-update pointer at `dist/application.json`.
+/// The application update and matching content release at `dist/application.json`.
 #[derive(Debug, Clone, Deserialize)]
 struct ApplicationUpdate {
     version: String,
@@ -90,6 +90,9 @@ struct ApplicationUpdate {
     blobs: String,
     /// Hex ed25519 signature over the application manifest bytes.
     signature: String,
+    /// Content paired with this application release. Older pointers omit it.
+    #[serde(default)]
+    content: Option<Latest>,
 }
 
 fn default_application_blobs() -> String {
@@ -122,7 +125,7 @@ impl std::fmt::Display for AuthorizationRequired {
 }
 impl std::error::Error for AuthorizationRequired {}
 
-/// The public channel pointer at `dist/latest.json`.
+/// The content portion of the public release pointer.
 #[derive(Debug, Clone, Deserialize)]
 struct Latest {
     version: String,
@@ -447,7 +450,7 @@ fn check_application_update() -> Option<ApplicationUpdate> {
         return None;
     }
     let base = content_base()?;
-    let current = read_application_version().or_else(|| CONTENT_VERSION.filter(|version| !version.is_empty()).map(str::to_string))?;
+    let current = current_application_version()?;
     let update: ApplicationUpdate = fetch_json(&format!("{base}dist/application.json"), None).ok()?;
     version_gt(&update.version, &current).then_some(update)
 }
@@ -471,8 +474,8 @@ fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-/// Applies application changes while this launcher remains open, then resumes the
-/// normal content scan in the same window.
+/// Stages application changes, then exits so the helper can promote and relaunch
+/// the updated launcher before content scanning resumes.
 fn run_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
     show_progress_ui(handle);
     update_progress(handle, 0, "Checking application update…");
@@ -482,9 +485,9 @@ fn run_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate)
                 "[launcher] application update to {} staged ({changed} files).",
                 update.version
             ));
-            update_progress(handle, 100, "Application update complete.");
+            update_progress(handle, 100, "Application update complete. Restarting…");
             thread::sleep(Duration::from_millis(400));
-            scan_content_and_prompt(handle);
+            handle.exit(0);
         }
         Err(error) => {
             log_line(&format!("[launcher] application update failed: {error}"));
@@ -546,7 +549,9 @@ fn do_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) 
     }
     fs::write(install_dir.join(PENDING_APPLICATION_MANIFEST_FILE), manifest_bytes)?;
     fs::write(install_dir.join(PENDING_APPLICATION_VERSION_FILE), &update.version)?;
-    start_update_helper(false)?;
+    // Relaunch only after the helper promotes the staged launcher and version
+    // markers. Content scanning must never continue in the old launcher process.
+    start_update_helper(true)?;
     Ok(changed + usize::from(launcher_changed))
 }
 
@@ -632,6 +637,21 @@ fn read_application_version() -> Option<String> {
         .map(|version| version.trim().to_string())
         .filter(|version| !version.is_empty())
         .or_else(|| read_application_manifest(&install_dir).map(|manifest| manifest.version))
+}
+
+/// Returns the installed application version, falling back to the release baked
+/// into launchers that predate the application-version marker.
+fn current_application_version() -> Option<String> {
+    read_application_version().or_else(|| {
+        CONTENT_VERSION
+            .filter(|version| !version.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Content is safe to load only when it was published for this application build.
+fn content_matches_application(application_version: Option<&str>, content_version: &str) -> bool {
+    application_version == Some(content_version)
 }
 
 /// Downloads a public update-channel object.
@@ -739,6 +759,7 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
 
     match fetch_latest(&base) {
         Ok(latest) => {
+            let application_version = current_application_version();
             if matches!(*PENDING.lock().unwrap(), Some(Pending::FirstInstall { .. })) {
                 show_ready_to_install(handle, Some(&latest.version));
             } else if !installed_present {
@@ -749,6 +770,35 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
                     "Verify ownership before downloading the game.",
                     Some(("Sign in", "signin")),
                 );
+            } else if !content_matches_application(
+                application_version.as_deref(),
+                &latest.version,
+            ) {
+                let installed_matches_application = content_matches_application(
+                    application_version.as_deref(),
+                    installed_version.as_deref().unwrap_or_default(),
+                );
+                log_line(&format!(
+                    "[launcher] refusing content {} for application {}.",
+                    latest.version,
+                    application_version.as_deref().unwrap_or("unknown")
+                ));
+                if installed_matches_application {
+                    show_result(
+                        handle,
+                        "Update pending",
+                        "The next release is not fully published yet. Your installed game is safe to play.",
+                        "Launch Game",
+                        "play",
+                    );
+                } else {
+                    show_message(
+                        handle,
+                        "Repair required",
+                        "The installed application and content versions do not match. Reopen the launcher after the release channel is repaired.",
+                        None,
+                    );
+                }
             } else if installed_version.as_deref() == Some(latest.version.as_str()) {
                 log_line(&format!("[launcher] up to date ({}).", latest.version));
                 show_up_to_date(handle, &latest.version);
@@ -1051,6 +1101,16 @@ fn content_base() -> Option<String> {
 }
 
 fn fetch_latest(base: &str) -> Result<Latest, Box<dyn std::error::Error>> {
+    if let Ok(release) =
+        fetch_json::<ApplicationUpdate>(&format!("{base}dist/application.json"), None)
+    {
+        if let Some(content) = release.content {
+            return Ok(content);
+        }
+    }
+
+    // Launchers released before the atomic channel migration still depend on
+    // latest.json. It remains pinned to their last compatible content version.
     fetch_json(&format!("{base}dist/latest.json"), None)
 }
 
@@ -1275,12 +1335,14 @@ fn install_dir() -> io::Result<PathBuf> {
     Ok(directory)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_data_dir(home: &Path) -> PathBuf {
     home.join("Library")
         .join("Application Support")
         .join("Rebellion 2")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_bundle_contents_dir(executable: &Path) -> io::Result<PathBuf> {
     let macos_directory = executable.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "launcher executable has no parent directory")
@@ -1462,6 +1524,56 @@ mod tests {
     #[test]
     fn requires_ownership_gate_with_installed_content_returns_false() {
         assert!(!requires_ownership_gate(true, false));
+    }
+
+    #[test]
+    fn content_matches_application_with_same_version_returns_true() {
+        assert!(content_matches_application(Some("0.0.11"), "0.0.11"));
+    }
+
+    #[test]
+    fn content_matches_application_with_different_version_returns_false() {
+        assert!(!content_matches_application(Some("0.0.9"), "0.0.10"));
+    }
+
+    #[test]
+    fn content_matches_application_without_application_version_returns_false() {
+        assert!(!content_matches_application(None, "0.0.11"));
+    }
+
+    #[test]
+    fn application_update_with_embedded_content_keeps_versions_together() {
+        let release: ApplicationUpdate = serde_json::from_str(
+            r#"{
+                "version":"0.0.11",
+                "manifest":"dist/application-manifest-0.0.11.json",
+                "blobs":"application-blobs/",
+                "signature":"signed",
+                "content":{
+                    "version":"0.0.11",
+                    "manifest":"dist/manifest-0.0.11.json",
+                    "blobs":"blobs/"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(release.content.unwrap().version, "0.0.11");
+    }
+
+    #[test]
+    fn legacy_application_update_without_content_remains_readable() {
+        let release: ApplicationUpdate = serde_json::from_str(
+            r#"{
+                "version":"0.0.9",
+                "manifest":"dist/application-manifest-0.0.9.json",
+                "blobs":"application-blobs/",
+                "signature":"signed"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(release.content.is_none());
     }
 
     #[test]
