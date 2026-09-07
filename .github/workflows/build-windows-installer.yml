@@ -307,12 +307,13 @@ jobs:
       - name: Name Windows download
         run: mv dist/*-Setup.exe dist/Rebellion2-Windows-Setup.exe
 
-      - name: Create Release
+      - name: Stage draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
             gh release upload "$RELEASE_TAG" \
               dist/Rebellion2-Windows-Setup.exe \
               --clobber \
@@ -321,6 +322,7 @@ jobs:
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
+              --draft \
               --title "Rebellion 2 $RELEASE_TAG" \
               --notes "Automated Windows build of Rebellion 2 $RELEASE_TAG. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification. The macOS archive is published separately." \
               dist/Rebellion2-Windows-Setup.exe
@@ -335,6 +337,8 @@ jobs:
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
           MANIFEST=application-update-metadata/application-manifest.json
@@ -419,6 +423,10 @@ jobs:
             sleep 5
           done
           test "$published" = true
+
+          # The installer remains hidden until its exact application/content pair
+          # is live. If publishing the Release fails, on_exit restores the channel.
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           trap - EXIT
 
   # ---------------------------------------------------------------------------

@@ -760,17 +760,8 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
     match fetch_latest(&base) {
         Ok(latest) => {
             let application_version = current_application_version();
-            if matches!(*PENDING.lock().unwrap(), Some(Pending::FirstInstall { .. })) {
-                show_ready_to_install(handle, Some(&latest.version));
-            } else if !installed_present {
-                log_line("[launcher] first install requires ownership verification.");
-                show_message(
-                    handle,
-                    "Sign in required",
-                    "Verify ownership before downloading the game.",
-                    Some(("Sign in", "signin")),
-                );
-            } else if !content_matches_application(
+            // Fail closed before offering either first install or update.
+            if !content_matches_application(
                 application_version.as_deref(),
                 &latest.version,
             ) {
@@ -783,7 +774,7 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
                     latest.version,
                     application_version.as_deref().unwrap_or("unknown")
                 ));
-                if installed_matches_application {
+                if installed_present && installed_matches_application {
                     show_result(
                         handle,
                         "Update pending",
@@ -791,14 +782,31 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
                         "Launch Game",
                         "play",
                     );
-                } else {
+                } else if installed_present {
                     show_message(
                         handle,
                         "Repair required",
                         "The installed application and content versions do not match. Reopen the launcher after the release channel is repaired.",
                         None,
                     );
+                } else {
+                    show_message(
+                        handle,
+                        "Release unavailable",
+                        "The matching game content is not available yet. Reopen the launcher after the release finishes publishing.",
+                        None,
+                    );
                 }
+            } else if matches!(*PENDING.lock().unwrap(), Some(Pending::FirstInstall { .. })) {
+                show_ready_to_install(handle, Some(&latest.version));
+            } else if !installed_present {
+                log_line("[launcher] first install requires ownership verification.");
+                show_message(
+                    handle,
+                    "Sign in required",
+                    "Verify ownership before downloading the game.",
+                    Some(("Sign in", "signin")),
+                );
             } else if installed_version.as_deref() == Some(latest.version.as_str()) {
                 log_line(&format!("[launcher] up to date ({}).", latest.version));
                 show_up_to_date(handle, &latest.version);

@@ -74,10 +74,11 @@ The workflows have three entry points, and the difference matters:
    stamps the game `.exe` icon (`rcedit`), packages the one-time setup executable, and produces
    the manifest, blobs, and installed handoff helper used for later incremental application updates.
 5. **release** (`if: github.ref_type == 'tag'`) — waits for the Windows installer and immutable
-   content upload, creates the GitHub Release, and uploads the signed application layer. It embeds
-   the matching content pointer inside `application.json`, publishes that single release pointer,
-   verifies both versions through the direct and public channel, and restores the previous pointer
-   if publication fails. Legacy `latest.json` remains pinned for older launchers.
+   content upload, stages the installer in a draft GitHub Release, and uploads the signed application
+   layer. It embeds the matching content pointer inside `application.json`, publishes that single
+   release pointer, and verifies both versions through the direct and public channel. Only then does
+   it publish the GitHub Release. Any failure restores the previous pointer; the installer remains
+   hidden in its draft. Legacy `latest.json` remains pinned for older launchers.
 
 The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
 packaging job uses `macos-latest`; it builds the universal Tauri launcher, embeds the Unity player,
