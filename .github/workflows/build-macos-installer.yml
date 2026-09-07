@@ -115,8 +115,31 @@ jobs:
           test -n "$(find "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
           codesign --verify --deep --strict "$work/Rebellion2.app"
 
-      - name: Attach macOS download to release
+      - name: Publish versioned and latest macOS downloads
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-        run: gh release upload "$RELEASE_TAG" Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ALIAS_TAG: latest-macos
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+
+          if gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+            test "$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)" = true
+            gh release upload "$ALIAS_TAG" Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$ALIAS_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --title "Latest Rebellion 2 macOS build (v$VERSION)" \
+              --notes "Stable download alias for the latest published Rebellion 2 macOS build: v$VERSION."
+          else
+            gh release create "$ALIAS_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Latest Rebellion 2 macOS build (v$VERSION)" \
+              --notes "Stable download alias for the latest published Rebellion 2 macOS build: v$VERSION." \
+              Rebellion2-macOS.zip
+          fi

@@ -54,7 +54,8 @@ The workflows have three entry points, and the difference matters:
 
   The workflow verifies that the release and live content version match before starting either
   expensive build. It then attaches `Rebellion2-macOS.zip` to that release without changing the
-  R2 release pointer or creating another release.
+  R2 release pointer. It also updates the prerelease `latest-macos` alias used by the README's
+  stable macOS download link, so a newer Windows release never breaks that link.
 
 ## Jobs
 
@@ -82,7 +83,8 @@ The workflows have three entry points, and the difference matters:
 
 The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
 packaging job uses `macos-latest`; it builds the universal Tauri launcher, embeds the Unity player,
-verifies the archive, and attaches it to the existing release.
+verifies the archive, attaches it to the existing versioned release, and updates the stable
+`latest-macos` download alias.
 
 ## Required secrets and variables
 
