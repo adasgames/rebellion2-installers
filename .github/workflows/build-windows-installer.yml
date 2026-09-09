@@ -1,21 +1,20 @@
-name: Build Installers
+name: Build Windows Installer
 
 # Tag-driven, launcher-model installer build.
 #
-# Push a tag like `v0.0.2` to cut a release: this builds the ASSET-FREE game
-# player, builds the launcher, packages native Windows and macOS downloads, and
-# publishes them to a GitHub Release named after the tag.
+# Push a tag like `windows-0.0.2` to cut a release: this builds the ASSET-FREE
+# Windows player, packages the launcher, and publishes release `v0.0.2`.
 # Content (art) is NOT in the installer — the launcher downloads content.zip
 # from R2 after ownership verification.
 #
 # workflow_dispatch is the escape hatch for test builds (no Release is cut).
 #
-# Windows and macOS are live. Linux remains parked below.
+# macOS is built separately from a `macos-*` tag so its runner cost is opt-in.
 
 on:
   push:
     tags:
-      - "v*"
+      - "windows-*"
   workflow_dispatch:
     inputs:
       source_ref:
@@ -27,24 +26,41 @@ on:
         required: false
         default: ""
 
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
 jobs:
   prepare:
     name: Resolve version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      release_tag: ${{ steps.v.outputs.release_tag }}
     steps:
       - id: v
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            V="${GITHUB_REF_NAME#v}"
-          elif [ -n "${{ inputs.version }}" ]; then
-            V="${{ inputs.version }}"
+            [[ "$GITHUB_REF_NAME" =~ ^windows-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+              echo "Invalid Windows release tag: $GITHUB_REF_NAME" >&2
+              exit 1
+            }
+            V="${GITHUB_REF_NAME#windows-}"
+          elif [ -n "$REQUESTED_VERSION" ]; then
+            V="$REQUESTED_VERSION"
           else
             V="0.0.0-dev"
           fi
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "Invalid release version: $V" >&2
+            exit 1
+          }
           echo "Resolved version: $V"
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v$V" >> "$GITHUB_OUTPUT"
 
   player-windows:
     name: Build asset-free player (Windows)
@@ -52,35 +68,32 @@ jobs:
     uses: ./.github/workflows/build-player.yml
     with:
       artifact: player-windows
-      media_ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
-      source_ref: ${{ inputs.source_ref || github.ref_name }}
+      media_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
+      source_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || inputs.source_ref || 'master' }}
       target: StandaloneWindows64
-      version: ${{ needs.prepare.outputs.version }}
-    secrets: inherit
-
-  player-macos:
-    name: Build asset-free player (macOS)
-    needs: prepare
-    uses: ./.github/workflows/build-player.yml
-    with:
-      artifact: player-macos
-      media_ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
-      source_ref: ${{ inputs.source_ref || github.ref_name }}
-      target: StandaloneOSX
       version: ${{ needs.prepare.outputs.version }}
     secrets: inherit
 
   publish-content:
     name: Publish content + update layer to R2
     if: github.ref_type == 'tag'
-    runs-on: macos-latest  # tar is bsdtar here, which package.sh needs for zip creation
+    runs-on: ubuntu-latest
     needs: prepare
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          docker-images: true
+          large-packages: false
+
       - name: Checkout media (git only, no LFS)
         uses: actions/checkout@v4
         with:
           repository: adasgames/rebellion2-media
-          ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+          ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
           ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
           persist-credentials: false
           lfs: false
@@ -121,22 +134,32 @@ jobs:
           persist-credentials: false
           path: infra
 
-      - name: Install rclone
-        run: brew install rclone
+      - name: Install packaging tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools rclone
 
-      # Publishes dist/content-<ver>.zip (first-install), plus the incremental
-      # update layer the launcher patches from: dist/manifest-<ver>.json,
-      # blobs/<sha256>, and dist/latest.json. Derived from one file set so they
-      # can't drift.
-      - name: Publish content.zip + manifest + blobs + latest.json
+      - name: Verify staged-publication support
+        run: grep -q 'legacy latest.json unchanged' infra/content/package.sh
+
+      # Uploads dist/content-<ver>.zip (first-install), plus the incremental
+      # manifest and blobs. The generated latest.json remains staged until the
+      # final release job succeeds, so incomplete releases never become live.
+      - name: Stage content archive + manifest + blobs
         env:
           MEDIA_DIR: ${{ github.workspace }}/media
           VERSION: ${{ needs.prepare.outputs.version }}
+          OUT_DIR: ${{ runner.temp }}/content-package
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
         run: bash infra/content/package.sh
+
+      - name: Stage content pointer
+        uses: actions/upload-artifact@v4
+        with:
+          name: content-pointer
+          path: ${{ runner.temp }}/content-package/latest.json
+          if-no-files-found: error
 
   windows-installer:
     name: Package Windows installer
@@ -265,89 +288,11 @@ jobs:
           path: application-update-metadata
           if-no-files-found: error
 
-  macos-installer:
-    name: Package macOS application
-    runs-on: macos-latest
-    needs: [prepare, player-macos]
-    steps:
-      - name: Checkout installer repo (packaging)
-        uses: actions/checkout@v4
-
-      - name: Download player
-        uses: actions/download-artifact@v4
-        with:
-          name: player-macos
-          path: player-archive
-
-      - name: Extract player
-        run: |
-          mkdir player
-          tar -xzf player-archive/player-macos.tar.gz -C player
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0" --locked
-
-      - name: Verify update channel
-        env:
-          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
-        run: |
-          set -euo pipefail
-          if [ -z "${REB2_CONTENT_BASE_URL:-}" ]; then
-            echo "REB2_CONTENT_BASE_URL is not configured." >&2
-            exit 1
-          fi
-          curl --fail --location --silent --show-error "${REB2_CONTENT_BASE_URL%/}/dist/latest.json" |
-            python3 -c 'import json,sys; pointer=json.load(sys.stdin); assert pointer.get("version"), "The configured update channel did not return a content pointer."'
-
-      - name: Build universal launcher app
-        working-directory: launcher/src-tauri
-        env:
-          REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
-          REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
-        run: |
-          jq --arg version "$REB2_CONTENT_VERSION" '.version = $version' \
-            tauri.conf.json > tauri.release.conf.json
-          cargo tauri build \
-            --config tauri.release.conf.json \
-            --target universal-apple-darwin \
-            --bundles app
-
-      - name: Package application
-        run: |
-          bash packaging/macos/build-zip.sh \
-            "launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app" \
-            "$PWD/player" \
-            "${{ needs.prepare.outputs.version }}" \
-            "$PWD/dist/Rebellion2-${{ needs.prepare.outputs.version }}-macOS.zip"
-
-      - name: Verify packaged application
-        run: |
-          set -euo pipefail
-          work="$(mktemp -d)"
-          trap 'rm -rf "$work"' EXIT
-          ditto -x -k "dist/Rebellion2-${{ needs.prepare.outputs.version }}-macOS.zip" "$work"
-          test -x "$work/Rebellion2.app/Contents/MacOS/rebellion2-launcher"
-          test -d "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app"
-          test -n "$(find "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
-          codesign --verify --deep --strict "$work/Rebellion2.app"
-
-      - name: Upload application
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer-macos
-          path: dist/*-macOS.zip
-          if-no-files-found: error
-
   release:
     name: Publish Release
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    needs: [prepare, publish-content, windows-installer, macos-installer]
+    needs: [prepare, publish-content, windows-installer]
     permissions:
       contents: write
     steps:
@@ -357,35 +302,43 @@ jobs:
           name: installer-windows
           path: dist
 
-      - name: Download macOS application
-        uses: actions/download-artifact@v4
-        with:
-          name: installer-macos
-          path: dist
-
       - name: Download application update layer
         uses: actions/download-artifact@v4
         with:
           name: application-update-layer
           path: application-update-metadata
 
-      - name: Name platform downloads
-        run: |
-          mv dist/*-Setup.exe dist/Rebellion2-Windows-Setup.exe
-          mv dist/*-macOS.zip dist/Rebellion2-macOS.zip
+      - name: Download staged content pointer
+        uses: actions/download-artifact@v4
+        with:
+          name: content-pointer
+          path: content-pointer
 
-      - name: Create Release
+      - name: Name Windows download
+        run: mv dist/*-Setup.exe dist/Rebellion2-Windows-Setup.exe
+
+      - name: Stage draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Rebellion 2 ${GITHUB_REF_NAME}" \
-            --notes "Automated build of Rebellion 2 ${GITHUB_REF_NAME}. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification." \
-            dist/Rebellion2-Windows-Setup.exe \
-            dist/Rebellion2-macOS.zip
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+            gh release upload "$RELEASE_TAG" \
+              dist/Rebellion2-Windows-Setup.exe \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --draft \
+              --title "Rebellion 2 $RELEASE_TAG" \
+              --notes "Automated Windows build of Rebellion 2 $RELEASE_TAG. Unsigned; see README for install notes. The installer is asset-free — the launcher downloads game content after ownership verification. The macOS archive is published separately." \
+              dist/Rebellion2-Windows-Setup.exe
+          fi
 
-      - name: Sign and publish application update layer
+      - name: Publish verified application and content release
         env:
           LAUNCHER_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -394,9 +347,19 @@ jobs:
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
           MANIFEST=application-update-metadata/application-manifest.json
+          CONTENT_POINTER=content-pointer/latest.json
+          jq -e --arg version "$VERSION" '
+            .version == $version and
+            .zip == "dist/content-\($version).zip" and
+            .manifest == "dist/manifest-\($version).json" and
+            .blobs == "blobs/"
+          ' "$CONTENT_POINTER" >/dev/null
+          jq -e --arg version "$VERSION" '.version == $version' "$MANIFEST" >/dev/null
           # Ed25519-sign the manifest bytes so every application path and blob hash is authenticated.
           SIG=$(node -e '
             const c=require("crypto"),fs=require("fs");
@@ -405,7 +368,13 @@ jobs:
             const key=c.createPrivateKey({key:pkcs8,format:"der",type:"pkcs8"});
             process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
           ' "$MANIFEST")
-          printf '{"version":"%s","manifest":"dist/application-manifest-%s.json","blobs":"application-blobs/","signature":"%s"}' "$VERSION" "$VERSION" "$SIG" > application.json
+          jq -n \
+            --arg version "$VERSION" \
+            --arg manifest "dist/application-manifest-${VERSION}.json" \
+            --arg signature "$SIG" \
+            --slurpfile content "$CONTENT_POINTER" \
+            '{version:$version,manifest:$manifest,blobs:"application-blobs/",signature:$signature,content:$content[0]}' \
+            > application.json
           echo "application.json -> $(cat application.json)"
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
           export RCLONE_S3_PROVIDER=Cloudflare
@@ -413,9 +382,62 @@ jobs:
           export RCLONE_S3_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export RCLONE_S3_ENDPOINT="$R2_ENDPOINT"
           export RCLONE_S3_REGION=auto
+          REMOTE=":s3:${R2_BUCKET}"
+
+          # Immutable versioned content must already exist before any live pointer moves.
+          test "$(rclone cat "${REMOTE}/dist/manifest-${VERSION}.json" | jq -r .version)" = "$VERSION"
+          rclone lsf "${REMOTE}/dist" --files-only --include "content-${VERSION}.zip" |
+            grep -Fx "content-${VERSION}.zip"
+
+          # Upload and verify the immutable application layer before publication.
           rclone copyto "$MANIFEST" ":s3:${R2_BUCKET}/dist/application-manifest-${VERSION}.json"
           rclone copy application-update-metadata/application-blobs ":s3:${R2_BUCKET}/application-blobs"
-          rclone copyto application.json ":s3:${R2_BUCKET}/dist/application.json"
+          cmp "$MANIFEST" <(rclone cat "${REMOTE}/dist/application-manifest-${VERSION}.json")
+
+          # Preserve the current atomic channel before replacing it.
+          rollback=$(mktemp -d)
+          rclone copyto "${REMOTE}/dist/application.json" "$rollback/application.json"
+          restore_pointer() {
+            echo "Release publication failed; restoring the previous channel."
+            rclone copyto "$rollback/application.json" "${REMOTE}/dist/application.json"
+          }
+          on_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              restore_pointer
+            fi
+            exit "$status"
+          }
+          trap on_exit EXIT
+
+          # One pointer publishes the matching application and content together. The
+          # legacy latest.json remains pinned for launchers that predate this safeguard.
+          rclone copyto application.json "${REMOTE}/dist/application.json"
+          test "$(rclone cat "${REMOTE}/dist/application.json" | jq -r .version)" = "$VERSION"
+          test "$(rclone cat "${REMOTE}/dist/application.json" | jq -r .content.version)" = "$VERSION"
+
+          base="${REB2_CONTENT_BASE_URL%/}"
+          published=false
+          for attempt in 1 2 3 4 5 6; do
+            release=$(curl --fail --location --silent --show-error "$base/dist/application.json") || {
+              sleep 5
+              continue
+            }
+            application_version=$(jq -r .version <<<"$release")
+            content_version=$(jq -r .content.version <<<"$release")
+            if [ "$application_version" = "$VERSION" ] && [ "$content_version" = "$VERSION" ]; then
+              published=true
+              break
+            fi
+            sleep 5
+          done
+          test "$published" = true
+
+          # The installer remains hidden until its exact application/content pair
+          # is live. If publishing the Release fails, on_exit restores the channel.
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          trap - EXIT
 
   # ---------------------------------------------------------------------------
   # PARKED: Linux installer.

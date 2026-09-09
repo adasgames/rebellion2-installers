@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -38,8 +38,23 @@ impl Manifest {
         serde_json::from_slice(bytes)
     }
 
-    fn by_path(&self) -> BTreeMap<&str, &FileEntry> {
-        self.files.iter().map(|f| (f.path.as_str(), f)).collect()
+    fn by_path(&self) -> BTreeMap<String, &FileEntry> {
+        self.files
+            .iter()
+            .map(|file| (manifest_path_key(&file.path), file))
+            .collect()
+    }
+}
+
+/// Match manifest paths using the rules of the platform receiving the update.
+fn manifest_path_key(path: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        path.to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_owned()
     }
 }
 
@@ -72,16 +87,16 @@ pub fn diff(local: Option<&Manifest>, remote: &Manifest) -> Plan {
 
     let mut changed = Vec::new();
     for file in &remote.files {
-        match current.get(file.path.as_str()) {
+        match current.get(&manifest_path_key(&file.path)) {
             Some(existing) if existing.sha256 == file.sha256 => {}
             _ => changed.push(file.clone()),
         }
     }
 
     let mut removed: Vec<String> = current
-        .keys()
-        .filter(|path| !target.contains_key(**path))
-        .map(|path| path.to_string())
+        .iter()
+        .filter(|(path, _)| !target.contains_key(*path))
+        .map(|(_, entry)| entry.path.clone())
         .collect();
     removed.sort();
 
@@ -132,9 +147,17 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
         replace_file(&tmp, &dst)?;
     }
 
+    let changed_paths: BTreeSet<PathBuf> = plan
+        .changed
+        .iter()
+        .filter_map(|entry| fs::canonicalize(install_dir.join(&entry.path)).ok())
+        .collect();
     for path in &plan.removed {
         let victim = install_dir.join(path);
-        if victim.exists() {
+        let replaced_by_changed_path = fs::canonicalize(&victim)
+            .map(|path| changed_paths.contains(&path))
+            .unwrap_or(false);
+        if victim.exists() && !replaced_by_changed_path {
             fs::remove_file(&victim)?;
         }
     }
@@ -266,6 +289,37 @@ mod tests {
         assert_eq!(plan.removed, vec!["c".to_string()]); // c deleted
                                                          // only the changed bytes, not the whole set
         assert_eq!(plan.download_size(), (b"B2".len() + b"D".len()) as u64);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn diff_does_not_remove_a_windows_path_whose_case_changed() {
+        let local = manifest("1", &[("rebellion2.exe", b"old")]);
+        let remote = manifest("2", &[("Rebellion2.exe", b"new")]);
+
+        let plan = diff(Some(&local), &remote);
+
+        assert_eq!(plan.changed, vec![entry("Rebellion2.exe", b"new")]);
+        assert!(plan.removed.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn apply_does_not_delete_a_changed_path_whose_case_changed() {
+        let install = tempfile::tempdir().unwrap();
+        fs::write(install.path().join("rebellion2.exe"), b"old").unwrap();
+        let replacement = entry("Rebellion2.exe", b"new");
+        let plan = Plan {
+            changed: vec![replacement.clone()],
+            removed: vec!["rebellion2.exe".to_string()],
+        };
+
+        apply(&plan, install.path(), &store(&[("Rebellion2.exe", b"new")])).unwrap();
+
+        assert_eq!(
+            fs::read(install.path().join("Rebellion2.exe")).unwrap(),
+            b"new"
+        );
     }
 
     #[test]

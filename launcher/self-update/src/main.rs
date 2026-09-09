@@ -30,15 +30,15 @@ fn main() {
 }
 
 /// Waits for the installed launcher to exit, promotes all staged update files, and
-/// optionally reopens the launcher when recovery runs before a visible startup.
+/// optionally reopens the launcher.
 fn complete_update(relaunch: bool) -> Result<(), Box<dyn std::error::Error>> {
     let install_dir = find_install_dir()?;
     validate_install_dir(&install_dir)?;
     let launcher_path = install_dir.join(LAUNCHER_FILE_NAME);
     let staged_launcher_path = install_dir.join(STAGED_LAUNCHER_FILE_NAME);
 
+    wait_for_launcher_exit(&launcher_path);
     if staged_launcher_path.is_file() {
-        wait_for_launcher_exit(&launcher_path);
         replace_file(&staged_launcher_path, &launcher_path)?;
     }
     promote_pending_file(
