@@ -1,7 +1,7 @@
 [package]
 name = "rebellion2-launcher"
 version = "0.1.0"
-description = "Rebellion II launcher — verifies ownership via the content gate, then downloads Content and launches the game."
+description = "Rebellion II launcher — verifies ownership, downloads game content, and launches the game."
 edition = "2021"
 
 [build-dependencies]

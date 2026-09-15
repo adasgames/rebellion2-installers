@@ -2,7 +2,7 @@
 //
 // Flow:
 //   1. Ownership — reuse a cached session token if still valid; otherwise open the
-//      content gate (Steam/GOG/GitHub), which mints a signed token we cache.
+//      ownership service (Steam/GOG/GitHub), which mints a signed token we cache.
 //   2. Scan — read the public release pointer and compare its matching application
 //      and content versions to what's installed: nothing / behind / current.
 //   3. Act — first install or an incremental patch require the user to confirm;
@@ -27,8 +27,8 @@ use tauri::{
     Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
-const GATE: &str = "https://rebellion2-content-gate.pages.dev/";
-
+/// Ownership-service URL injected by release automation (REB2_AUTH_BASE_URL).
+const AUTH_BASE: Option<&str> = option_env!("REB2_AUTH_BASE_URL");
 /// The content version this launcher was built for (REB2_CONTENT_VERSION).
 const CONTENT_VERSION: Option<&str> = option_env!("REB2_CONTENT_VERSION");
 /// Public base URL of the release channel (REB2_CONTENT_BASE_URL): holds the public
@@ -202,12 +202,16 @@ fn main() {
 
 fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     let target = url.as_str();
+    let auth_base = auth_base();
 
     // GOG bounces the ?code= via its own page — capture and hand to the gate.
     if target.starts_with("https://embed.gog.com/on_login_success") {
         if let Some(code) = query(url, "code") {
             if let Some(window) = handle.get_webview_window("main") {
-                let mut callback = format!("{GATE}callback/gog?code={}", urlencoding::encode(&code));
+                let mut callback = format!(
+                    "{auth_base}callback/gog?code={}",
+                    urlencoding::encode(&code)
+                );
                 if let Some(v) = CONTENT_VERSION.filter(|v| !v.is_empty()) {
                     callback.push_str(&format!("&v={}", urlencoding::encode(v)));
                 }
@@ -220,7 +224,7 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     }
 
     // Gate result: /done?ok=1&url=<presigned>&token=<session>
-    if target.starts_with(&format!("{GATE}done")) {
+    if target.starts_with(&format!("{auth_base}done")) {
         let ok = url.query_pairs().any(|(k, v)| k == "ok" && v == "1");
         let message = query(url, "msg");
         let presigned = query(url, "url");
@@ -291,7 +295,7 @@ fn on_gate_result(
         );
         return;
     }
-    log_line("[launcher] VERIFIED via the content gate.");
+    log_line("[launcher] VERIFIED via the ownership service.");
     if let Some(token) = token {
         store_token(&token);
         *SESSION.lock().unwrap() = Some(token);
@@ -1142,6 +1146,14 @@ fn content_base() -> Option<String> {
         .map(|v| if v.ends_with('/') { v.to_string() } else { format!("{v}/") })
 }
 
+fn auth_base() -> String {
+    let base = AUTH_BASE
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("http://127.0.0.1:8787/");
+    format!("{}/", base.trim_end_matches('/'))
+}
+
 fn fetch_latest(base: &str) -> Result<Latest, Box<dyn std::error::Error>> {
     if let Ok(release) =
         fetch_json::<ApplicationUpdate>(&format!("{base}dist/application.json"), None)
@@ -1203,9 +1215,10 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn gate_landing() -> String {
+    let auth_base = auth_base();
     match CONTENT_VERSION {
-        Some(v) if !v.is_empty() => format!("{GATE}?v={}", urlencoding::encode(v)),
-        _ => GATE.to_string(),
+        Some(v) if !v.is_empty() => format!("{auth_base}?v={}", urlencoding::encode(v)),
+        _ => auth_base,
     }
 }
 
@@ -1229,7 +1242,7 @@ fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// One shared card, matching the content gate exactly: kicker + REBELLION II
+/// One shared card, matching the ownership page exactly: kicker + REBELLION II
 /// wordmark top-aligned, an optional spinner, a status line, a progress bar, and
 /// buttons pinned toward the bottom. Fixed height so the frame never resizes.
 fn render(kicker: &str, spinner: bool, status: &str, buttons: &str) -> String {
@@ -1656,7 +1669,7 @@ mod tests {
 
     #[test]
     fn is_local_app_url_with_remote_host_returns_false() {
-        let url = tauri::Url::parse("https://rebellion2-content-gate.pages.dev/done").unwrap();
+        let url = tauri::Url::parse("https://example.invalid/done").unwrap();
 
         assert!(!is_local_app_url(&url));
     }

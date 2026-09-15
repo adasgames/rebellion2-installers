@@ -6,7 +6,7 @@ on:
       artifact:
         required: true
         type: string
-      media_ref:
+      asset_ref:
         required: true
         type: string
       source_ref:
@@ -23,6 +23,10 @@ on:
         required: true
         type: string
     secrets:
+      ASSET_LFS_PROXY_URL:
+        required: true
+      ASSET_SOURCE_REPOSITORY:
+        required: true
       REBELLION2_MEDIA_SSH_KEY:
         required: true
       R2_ACCESS_KEY_ID:
@@ -30,6 +34,10 @@ on:
       R2_SECRET_ACCESS_KEY:
         required: true
       SOURCE_REPO_TOKEN:
+        required: true
+      STORAGE_BUCKET:
+        required: true
+      STORAGE_ENDPOINT:
         required: true
       UNITY_EMAIL:
         required: true
@@ -60,26 +68,29 @@ jobs:
           persist-credentials: false
           path: game
 
-      - name: Checkout media (git only, no LFS)
+      - name: Checkout build assets (git only, no LFS)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: adasgames/rebellion2-media
-          ref: ${{ inputs.media_ref }}
+          repository: ${{ secrets.ASSET_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.asset_ref }}
           ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
           persist-credentials: false
           lfs: false
-          path: game/.ci/rebellion2-media
+          path: game/.ci/assets
 
-      - name: Pull media LFS from R2
-        working-directory: game/.ci/rebellion2-media
+      - name: Fetch build assets
+        working-directory: game/.ci/assets
         env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          ASSET_LFS_PROXY_URL: ${{ secrets.ASSET_LFS_PROXY_URL }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
         run: |
-          HOST="${R2_ENDPOINT#https://}"
-          git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
+          PROXY="${ASSET_LFS_PROXY_URL%/}"
+          PROXY_HOST="${PROXY#https://}"
+          STORAGE_HOST="${STORAGE_ENDPOINT#https://}"
+          git config lfs.url "https://${STORAGE_ACCESS_KEY_ID}:${STORAGE_SECRET_ACCESS_KEY}@${PROXY_HOST}/${STORAGE_HOST}/${STORAGE_BUCKET}"
           for attempt in 1 2 3; do
             if git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""; then
               break
@@ -88,21 +99,21 @@ jobs:
               exit 1
             fi
             delay=$((attempt * 30))
-            echo "Media LFS pull failed; retrying in ${delay} seconds."
+            echo "Asset fetch failed; retrying in ${delay} seconds."
             sleep "$delay"
           done
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
-            echo "Media checkout still contains Git LFS pointers."
+            echo "Asset checkout still contains Git LFS pointers."
             exit 1
           fi
 
-      - name: Install media (editor-preview content + main-menu models)
+      - name: Install build assets
         working-directory: game
         run: |
           mkdir -p Assets/Content Assets/Art/Models/MainMenu
-          test -f .ci/rebellion2-media/Content/Application/Schemas/game-config.xsd
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Content/ Assets/Content/
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/rebellion2-media/Models/MainMenu/ Assets/Art/Models/MainMenu/
+          test -f .ci/assets/Content/Application/Schemas/game-config.xsd
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Content/ Assets/Content/
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Models/MainMenu/ Assets/Art/Models/MainMenu/
           rm -rf .ci
 
       - name: Cache Library
