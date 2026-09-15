@@ -1,7 +1,7 @@
 //! Content update engine for the Rebellion II launcher.
 //!
 //! Pure logic, no Tauri and no network: the launcher shell injects a
-//! [`BlobSource`] (HTTP against R2, a local dir, whatever) and this crate does
+//! [`BlobSource`] (remote object storage, a local dir, whatever) and this crate does
 //! the manifest diff, hash-verified apply, and integrity check. Keeping it
 //! separate makes the risky part — "did we patch the install correctly?" —
 //! unit-testable without building the whole desktop app.
@@ -115,7 +115,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Where blob bytes come from, keyed by their SHA-256. The launcher supplies an
-/// HTTP-backed impl (R2); tests supply an in-memory or local-dir impl.
+/// HTTP-backed impl; tests supply an in-memory or local-dir impl.
 pub trait BlobSource {
     fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>>;
 }
@@ -220,7 +220,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// In-memory blob store keyed by hash — stands in for R2/local blobs.
+    /// In-memory blob store keyed by hash — stands in for remote/local blobs.
     struct MemBlobs(HashMap<String, Vec<u8>>);
     impl BlobSource for MemBlobs {
         fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {

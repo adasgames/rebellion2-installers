@@ -7,7 +7,7 @@ Separate GitHub Actions workflows build **asset-free** game players from
 repository. OS-specific tags select which platform to build. The Windows workflow publishes
 the shared update channel; the macOS workflow only attaches its archive to an existing release,
 keeping the expensive macOS runner opt-in. The packages ship **no art** — the launcher downloads
-content from R2 after ownership verification.
+content from the configured distribution service after ownership verification.
 
 The **Windows** and **macOS** legs are live. Linux remains parked.
 
@@ -33,8 +33,8 @@ The workflows have three entry points, and the difference matters:
   ```
 
   This runs the Windows pipeline and publishes GitHub Release `v0.1.0`. Tag builds check out
-  `v0.1.0` from both `rebellion2` and `rebellion2-media`, so those repositories must carry the
-  ordinary matching version tag before the installer tag is pushed.
+  `v0.1.0` from both the game source and private build-asset source, so both repositories must
+  carry the ordinary matching version tag before the installer tag is pushed.
 
 - **Manual Windows dispatch — test build only.** Actions tab → **Build Windows Installer** →
   **Run workflow**. The publishing jobs are gated on `github.ref_type == 'tag'`, so dispatch runs
@@ -54,7 +54,7 @@ The workflows have three entry points, and the difference matters:
 
   The workflow verifies that the release and live content version match before starting either
   expensive build. It then attaches `Rebellion2-macOS.zip` to that release without changing the
-  R2 release pointer. It also updates the prerelease `latest-macos` alias used by the README's
+  live release pointer. It also updates the prerelease `latest-macos` alias used by the README's
   stable macOS download link, so a newer Windows release never breaks that link.
 
 ## Jobs
@@ -64,7 +64,7 @@ The workflows have three entry points, and the difference matters:
    launcher, content package, and installer so releases do not require a source-controlled
    version bump.
 2. **player-windows** (`ubuntu-latest`) — calls the shared player workflow, checks out the game
-   and `rebellion2-media`, pulls media LFS from R2, and installs it into `Assets/Content` plus
+   and private build assets, fetches their LFS objects, and installs them into `Assets/Content` plus
    `Assets/Art/Models/MainMenu` for prefab authoring. It builds `StandaloneWindows64` via
    `StandalonePlayerBuild.Build`, which strips `Assets/Content` and verifies it did not leak.
 3. **publish-content** (`ubuntu-latest`, tag builds only) — packages and uploads the immutable
@@ -86,25 +86,12 @@ packaging job uses `macos-latest`; it builds the universal Tauri launcher, embed
 verifies the archive, attaches it to the existing versioned release, and updates the stable
 `latest-macos` download alias.
 
-## Required secrets and variables
+## Private release configuration
 
-Set these under **Settings → Secrets and variables → Actions** before the first run:
-
-| Secret                                             | Purpose                                                                                       |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `SOURCE_REPO_TOKEN`                                | PAT with **read** access to `rebellion2` and `rebellion2-infrastructure` (contents).          |
-| `REBELLION2_MEDIA_SSH_KEY`                         | Deploy key with read access to `rebellion2-media` (git checkout; mirrors the game CI).        |
-| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`        | R2 credentials for pulling media LFS through the proxy.                                       |
-| `REB2_CONTENT_BASE_URL`                            | Public content Worker base URL used for content and signed application updates.               |
-| `LAUNCHER_SIGNING_KEY`                             | Ed25519 seed used to sign application manifests consumed by the launcher's automatic updater. |
-| `UNITY_EMAIL` / `UNITY_PASSWORD` / `UNITY_LICENSE` | Unity license activation (same values as the `rebellion2` CI).                                |
-
-| Variable      | Purpose                                               |
-| ------------- | ----------------------------------------------------- |
-| `R2_ENDPOINT` | R2 S3 endpoint host, used to build the LFS proxy URL. |
-| `R2_BUCKET`   | R2 bucket holding the media LFS objects.              |
-
-`GITHUB_TOKEN` is provided automatically and is what publishes the Release.
+Release jobs depend on private source locations, service endpoints, storage credentials, signing
+material, and build credentials configured in GitHub Actions. Their values and operational setup
+are intentionally maintained outside this public repository. `GITHUB_TOKEN` is provided
+automatically and publishes the Release.
 
 ## Layout
 

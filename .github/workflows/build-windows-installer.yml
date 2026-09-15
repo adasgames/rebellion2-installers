@@ -5,7 +5,7 @@ name: Build Windows Installer
 # Push a tag like `windows-0.0.2` to cut a release: this builds the ASSET-FREE
 # Windows player, packages the launcher, and publishes release `v0.0.2`.
 # Content (art) is NOT in the installer — the launcher downloads content.zip
-# from R2 after ownership verification.
+# from the configured distribution service after ownership verification.
 #
 # workflow_dispatch is the escape hatch for test builds (no Release is cut).
 #
@@ -68,14 +68,14 @@ jobs:
     uses: ./.github/workflows/build-player.yml
     with:
       artifact: player-windows
-      media_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
+      asset_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
       source_ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || inputs.source_ref || 'master' }}
       target: StandaloneWindows64
       version: ${{ needs.prepare.outputs.version }}
     secrets: inherit
 
   publish-content:
-    name: Publish content + update layer to R2
+    name: Publish content + update layer
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     needs: prepare
@@ -89,27 +89,30 @@ jobs:
           docker-images: true
           large-packages: false
 
-      - name: Checkout media (git only, no LFS)
+      - name: Checkout build assets (git only, no LFS)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: adasgames/rebellion2-media
+          repository: ${{ secrets.ASSET_SOURCE_REPOSITORY }}
           ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
           ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
           persist-credentials: false
           lfs: false
-          path: media
+          path: assets
 
-      - name: Pull media LFS from R2
-        working-directory: media
+      - name: Fetch build assets
+        working-directory: assets
         env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          ASSET_LFS_PROXY_URL: ${{ secrets.ASSET_LFS_PROXY_URL }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
         run: |
           git lfs install
-          HOST="${R2_ENDPOINT#https://}"
-          git config lfs.url "https://${R2_ACCESS_KEY_ID}:${R2_SECRET_ACCESS_KEY}@rebellion2-lfs-proxy.pages.dev/${HOST}/${R2_BUCKET}"
+          PROXY="${ASSET_LFS_PROXY_URL%/}"
+          PROXY_HOST="${PROXY#https://}"
+          STORAGE_HOST="${STORAGE_ENDPOINT#https://}"
+          git config lfs.url "https://${STORAGE_ACCESS_KEY_ID}:${STORAGE_SECRET_ACCESS_KEY}@${PROXY_HOST}/${STORAGE_HOST}/${STORAGE_BUCKET}"
           for attempt in 1 2 3; do
             if git lfs pull --include="Content/**" --exclude=""; then
               break
@@ -118,41 +121,41 @@ jobs:
               exit 1
             fi
             delay=$((attempt * 30))
-            echo "Media LFS pull failed; retrying in ${delay} seconds."
+            echo "Asset fetch failed; retrying in ${delay} seconds."
             sleep "$delay"
           done
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content; then
-            echo "Media checkout still contains Git LFS pointers."; exit 1
+            echo "Asset checkout still contains Git LFS pointers."; exit 1
           fi
 
-      - name: Checkout infrastructure (publish script)
+      - name: Checkout private build support
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: davidadas/rebellion2-infrastructure
+          repository: ${{ secrets.BUILD_SUPPORT_REPOSITORY }}
           ref: main
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          path: infra
+          path: support
 
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools rclone
 
       - name: Verify staged-publication support
-        run: grep -q 'legacy latest.json unchanged' infra/content/package.sh
+        run: grep -q 'legacy latest.json unchanged' support/content/package.sh
 
       # Uploads dist/content-<ver>.zip (first-install), plus the incremental
       # manifest and blobs. The generated latest.json remains staged until the
       # final release job succeeds, so incomplete releases never become live.
       - name: Stage content archive + manifest + blobs
         env:
-          MEDIA_DIR: ${{ github.workspace }}/media
+          MEDIA_DIR: ${{ github.workspace }}/assets
           VERSION: ${{ needs.prepare.outputs.version }}
           OUT_DIR: ${{ runner.temp }}/content-package
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
-        run: bash infra/content/package.sh
+          R2_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+        run: bash support/content/package.sh
 
       - name: Stage content pointer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -181,10 +184,14 @@ jobs:
       - name: Verify update channel
         shell: pwsh
         env:
+          AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:AUTH_BASE_URL)) {
+            throw "The ownership service is not configured."
+          }
           if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_BASE_URL)) {
-            throw "REB2_CONTENT_BASE_URL is not configured."
+            throw "The update channel is not configured."
           }
           $baseUrl = $env:REB2_CONTENT_BASE_URL.TrimEnd("/")
           $pointer = Invoke-RestMethod "$baseUrl/dist/latest.json"
@@ -196,10 +203,11 @@ jobs:
         working-directory: launcher/src-tauri
         env:
           # Baked into the launcher so it requests its own content pack (content-<ver>.zip).
-          # The version IS the release tag — game and media are checked out at that tag.
+          # The version IS the release tag — game source and build assets use that tag.
           REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
           # Content channel the launcher scans for updates and pulls token-gated
-          # patches from. Kept in a repo secret so the worker URL isn't committed.
+          # patches from. Endpoints stay in repository secrets.
+          REB2_AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
         run: cargo build --release
 
@@ -341,10 +349,11 @@ jobs:
       - name: Publish verified application and content release
         env:
           LAUNCHER_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+          STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
           VERSION: ${{ needs.prepare.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -377,12 +386,12 @@ jobs:
             > application.json
           echo "application.json -> $(cat application.json)"
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-          export RCLONE_S3_PROVIDER=Cloudflare
-          export RCLONE_S3_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-          export RCLONE_S3_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-          export RCLONE_S3_ENDPOINT="$R2_ENDPOINT"
+          export RCLONE_S3_PROVIDER="$STORAGE_PROVIDER"
+          export RCLONE_S3_ACCESS_KEY_ID="$STORAGE_ACCESS_KEY_ID"
+          export RCLONE_S3_SECRET_ACCESS_KEY="$STORAGE_SECRET_ACCESS_KEY"
+          export RCLONE_S3_ENDPOINT="$STORAGE_ENDPOINT"
           export RCLONE_S3_REGION=auto
-          REMOTE=":s3:${R2_BUCKET}"
+          REMOTE=":s3:${STORAGE_BUCKET}"
 
           # Immutable versioned content must already exist before any live pointer moves.
           test "$(rclone cat "${REMOTE}/dist/manifest-${VERSION}.json" | jq -r .version)" = "$VERSION"
@@ -390,8 +399,8 @@ jobs:
             grep -Fx "content-${VERSION}.zip"
 
           # Upload and verify the immutable application layer before publication.
-          rclone copyto "$MANIFEST" ":s3:${R2_BUCKET}/dist/application-manifest-${VERSION}.json"
-          rclone copy application-update-metadata/application-blobs ":s3:${R2_BUCKET}/application-blobs"
+          rclone copyto "$MANIFEST" ":s3:${STORAGE_BUCKET}/dist/application-manifest-${VERSION}.json"
+          rclone copy application-update-metadata/application-blobs ":s3:${STORAGE_BUCKET}/application-blobs"
           cmp "$MANIFEST" <(rclone cat "${REMOTE}/dist/application-manifest-${VERSION}.json")
 
           # Preserve the current atomic channel before replacing it.

@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Blobs read from a local `blobs/<sha256>` directory (stands in for R2).
+/// Blobs read from a local `blobs/<sha256>` directory (stands in for remote object storage).
 struct DirBlobs(PathBuf);
 impl BlobSource for DirBlobs {
     fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {

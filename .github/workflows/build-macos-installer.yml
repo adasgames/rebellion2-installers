@@ -46,7 +46,7 @@ jobs:
     uses: ./.github/workflows/build-player.yml
     with:
       artifact: player-macos
-      media_ref: ${{ needs.prepare.outputs.tag }}
+      asset_ref: ${{ needs.prepare.outputs.tag }}
       source_ref: ${{ needs.prepare.outputs.tag }}
       target: StandaloneOSX
       version: ${{ needs.prepare.outputs.version }}
@@ -86,9 +86,11 @@ jobs:
       - name: Build universal launcher app
         working-directory: launcher/src-tauri
         env:
+          REB2_AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
         run: |
+          test -n "$REB2_AUTH_BASE_URL"
           jq --arg version "$REB2_CONTENT_VERSION" '.version = $version' \
             tauri.conf.json > tauri.release.conf.json
           cargo tauri build \
