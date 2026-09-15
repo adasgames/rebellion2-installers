@@ -63,10 +63,14 @@ above — they're expected and safe to dismiss. Signing is on the roadmap.
 
 ## License
 
-Original software authored for this project is available under the
+Original source code authored by David Adams for this project is available under the
 [PolyForm Noncommercial License 1.0.0](LICENSE.md). It may be used, modified, and redistributed for
-permitted noncommercial purposes. The license does not grant rights to third-party software,
-trademarks, names, artwork, audio, game data, or other materials.
+permitted noncommercial purposes.
+
+**The license does not cover content or assets.** This includes images, icons, artwork, 3D models,
+textures, animations, audio, video, fonts, game data, other media, and any third-party software,
+names, or trademarks. The software license grants no permission to use, modify, or redistribute
+those excluded materials; they remain subject to their respective rights and licenses.
 
 ---
 
