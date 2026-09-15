@@ -61,6 +61,13 @@ verify ownership of *Empire at War: Gold Pack*.
 These builds are **not yet code-signed**, which is why Windows and macOS show the warnings
 above — they're expected and safe to dismiss. Signing is on the roadmap.
 
+## License
+
+Original software authored for this project is available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md). It may be used, modified, and redistributed for
+permitted noncommercial purposes. The license does not grant rights to third-party software,
+trademarks, names, artwork, audio, game data, or other materials.
+
 ---
 
 *Building the installers yourself or maintaining the release pipeline? See [`docs/BUILD.md`](docs/BUILD.md).*
