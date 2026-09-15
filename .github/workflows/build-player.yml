@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
           tool-cache: true
           android: true
@@ -52,7 +52,7 @@ jobs:
           large-packages: false
 
       - name: Checkout game
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: davidadas/rebellion2
           ref: ${{ inputs.source_ref }}
@@ -61,7 +61,7 @@ jobs:
           path: game
 
       - name: Checkout media (git only, no LFS)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: adasgames/rebellion2-media
           ref: ${{ inputs.media_ref }}
@@ -106,7 +106,7 @@ jobs:
           rm -rf .ci
 
       - name: Cache Library
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: game/Library
           key: Library-${{ inputs.target }}-${{ hashFiles('game/Assets/**', 'game/Packages/**', 'game/ProjectSettings/**') }}
@@ -114,7 +114,7 @@ jobs:
             Library-${{ inputs.target }}-
 
       - name: Build player
-        uses: game-ci/unity-builder@v4
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00 # v4.8.2
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
@@ -131,7 +131,7 @@ jobs:
 
       - name: Upload Windows player
         if: inputs.target == 'StandaloneWindows64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact }}
           path: build/${{ inputs.target }}
@@ -143,7 +143,7 @@ jobs:
 
       - name: Upload macOS player
         if: inputs.target == 'StandaloneOSX'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact }}
           path: player-macos.tar.gz

@@ -81,7 +81,7 @@ jobs:
     needs: prepare
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
           tool-cache: true
           android: true
@@ -90,7 +90,7 @@ jobs:
           large-packages: false
 
       - name: Checkout media (git only, no LFS)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: adasgames/rebellion2-media
           ref: ${{ github.ref_type == 'tag' && needs.prepare.outputs.release_tag || 'main' }}
@@ -126,7 +126,7 @@ jobs:
           fi
 
       - name: Checkout infrastructure (publish script)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: davidadas/rebellion2-infrastructure
           ref: main
@@ -155,7 +155,7 @@ jobs:
         run: bash infra/content/package.sh
 
       - name: Stage content pointer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: content-pointer
           path: ${{ runner.temp }}/content-package/latest.json
@@ -167,16 +167,16 @@ jobs:
     needs: [prepare, player-windows]
     steps:
       - name: Checkout installer repo (packaging)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Download player
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: player-windows
           path: player
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Verify update channel
         shell: pwsh
@@ -275,14 +275,14 @@ jobs:
             packaging\windows\rebellion2-launcher.iss
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: installer-windows
           path: dist/*-Setup.exe
           if-no-files-found: error
 
       - name: Upload application update layer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: application-update-layer
           path: application-update-metadata
@@ -297,19 +297,19 @@ jobs:
       contents: write
     steps:
       - name: Download Windows installer
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: installer-windows
           path: dist
 
       - name: Download application update layer
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: application-update-layer
           path: application-update-metadata
 
       - name: Download staged content pointer
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: content-pointer
           path: content-pointer
