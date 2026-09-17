@@ -42,11 +42,6 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
    double-click will be blocked — you only need the right-click trick once.)
 
-## Heads up
-
-These builds are **not yet code-signed**, which is why Windows and macOS show the warnings
-above — they're expected and safe to dismiss. Signing is on the roadmap.
-
 ## FAQ
 
 ### Why is Empire at War accepted?
