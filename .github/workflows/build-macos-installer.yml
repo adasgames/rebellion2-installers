@@ -34,9 +34,14 @@ jobs:
           RELEASE_TAG="v$version"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           base="${REB2_CONTENT_BASE_URL%/}"
-          release=$(curl --fail --location --silent --show-error "$base/dist/application.json")
-          test "$(jq -r .version <<<"$release")" = "$version"
-          test "$(jq -r .content.version <<<"$release")" = "$version"
+          application_manifest=$(curl --fail --location --silent --show-error \
+            "$base/dist/application-manifest-$version.json")
+          content_manifest=$(curl --fail --location --silent --show-error \
+            "$base/dist/manifest-$version.json")
+          test "$(jq -r .version <<<"$application_manifest")" = "$version"
+          test "$(jq -r .version <<<"$content_manifest")" = "$version"
+          curl --fail --location --silent --show-error --head \
+            "$base/dist/content-$version.zip" >/dev/null
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 

@@ -52,10 +52,11 @@ The workflows have three entry points, and the difference matters:
   git push origin macos-0.1.0
   ```
 
-  The workflow verifies that the release and live content version match before starting either
-  expensive build. It then attaches `Rebellion2-macOS.zip` to that release without changing the
-  live release pointer. It also updates the prerelease `latest-macos` alias used by the README's
-  stable macOS download link, so a newer Windows release never breaks that link.
+  The workflow verifies that the release and its immutable application/content artifacts exist
+  before starting either expensive build. This permits a missed macOS build to be backfilled after
+  the live channel has advanced. It then attaches `Rebellion2-macOS.zip` to that release without
+  changing the live release pointer. It also updates the prerelease `latest-macos` alias used by
+  the README's stable macOS download link.
 
 ## Jobs
 
