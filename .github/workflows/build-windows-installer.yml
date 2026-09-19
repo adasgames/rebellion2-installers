@@ -304,6 +304,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout installer repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: Download Windows installer
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -362,6 +365,8 @@ jobs:
           set -euo pipefail
           MANIFEST=application-update-metadata/application-manifest.json
           CONTENT_POINTER=content-pointer/latest.json
+          RELEASE_NOTES=release-notes-${VERSION}.json
+          RELEASE_NOTES_POINTER=release-notes-pointer.json
           jq -e --arg version "$VERSION" '
             .version == $version and
             .zip == "dist/content-\($version).zip" and
@@ -369,6 +374,19 @@ jobs:
             .blobs == "blobs/"
           ' "$CONTENT_POINTER" >/dev/null
           jq -e --arg version "$VERSION" '.version == $version' "$MANIFEST" >/dev/null
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md
+          node scripts/release-notes.mjs release-notes.md "$RELEASE_NOTES" "$VERSION"
+          echo null > "$RELEASE_NOTES_POINTER"
+          if jq -e '.sections | length > 0' "$RELEASE_NOTES" >/dev/null; then
+            NOTES_SHA=$(sha256sum "$RELEASE_NOTES" | cut -d' ' -f1)
+            jq -n \
+              --arg path "dist/${RELEASE_NOTES}" \
+              --arg sha256 "$NOTES_SHA" \
+              '{path:$path,sha256:$sha256}' \
+              > "$RELEASE_NOTES_POINTER"
+          else
+            rm "$RELEASE_NOTES"
+          fi
           # Ed25519-sign the manifest bytes so every application path and blob hash is authenticated.
           SIG=$(node -e '
             const c=require("crypto"),fs=require("fs");
@@ -382,7 +400,9 @@ jobs:
             --arg manifest "dist/application-manifest-${VERSION}.json" \
             --arg signature "$SIG" \
             --slurpfile content "$CONTENT_POINTER" \
-            '{version:$version,manifest:$manifest,blobs:"application-blobs/",signature:$signature,content:$content[0]}' \
+            --slurpfile notes "$RELEASE_NOTES_POINTER" \
+            '{version:$version,manifest:$manifest,blobs:"application-blobs/",signature:$signature,content:$content[0]}
+             | if $notes[0] == null then . else .content.releaseNotes = $notes[0] end' \
             > application.json
           echo "application.json -> $(cat application.json)"
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
@@ -402,6 +422,10 @@ jobs:
           rclone copyto "$MANIFEST" ":s3:${STORAGE_BUCKET}/dist/application-manifest-${VERSION}.json"
           rclone copy application-update-metadata/application-blobs ":s3:${STORAGE_BUCKET}/application-blobs"
           cmp "$MANIFEST" <(rclone cat "${REMOTE}/dist/application-manifest-${VERSION}.json")
+          if [ -f "$RELEASE_NOTES" ]; then
+            rclone copyto "$RELEASE_NOTES" "${REMOTE}/dist/${RELEASE_NOTES}"
+            test "$(rclone cat "${REMOTE}/dist/${RELEASE_NOTES}" | sha256sum | cut -d' ' -f1)" = "$NOTES_SHA"
+          fi
 
           # Preserve the current atomic channel before replacing it.
           rollback=$(mktemp -d)

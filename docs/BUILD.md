@@ -77,10 +77,68 @@ The workflows have three entry points, and the difference matters:
    the manifest, blobs, and installed handoff helper used for later incremental application updates.
 5. **release** (`if: github.ref_type == 'tag'`) — waits for the Windows installer and immutable
    content upload, stages the installer in a draft GitHub Release, and uploads the signed application
-   layer. It embeds the matching content pointer inside `application.json`, publishes that single
-   release pointer, and verifies both versions through the direct and public channel. Only then does
-   it publish the GitHub Release. Any failure restores the previous pointer; the installer remains
+   layer. It converts second-level headings and their bullet lists from the draft Release description
+   into a versioned release-notes JSON document when any are present. It embeds the matching content
+   and optional release-notes pointers inside `application.json`, publishes that single release
+   pointer, and verifies both versions through the direct and public channel. Only then does it
+   publish the GitHub Release. Any failure restores the previous pointer; the installer remains
    hidden in its draft. Legacy `latest.json` remains pinned for older launchers.
+
+## Release notes
+
+Write launcher patch notes in the draft GitHub Release description. Use `##` headings for sections
+and `*` or `-` bullets for individual changes. Other prose remains on GitHub but is not shown by the
+launcher. For example:
+
+```markdown
+## Highlights
+
+* Added new strategic options.
+
+## Fixes
+
+* Fixed interrupted manufacturing orders.
+```
+
+The release workflow converts that Markdown to `dist/release-notes-<version>.json`, records its path
+and SHA-256 digest in the content portion of `dist/application.json`, and publishes both atomically.
+An absent usable section omits the pointer. The launcher also ignores missing, corrupt, mismatched,
+or malformed notes so release notes can never prevent an update.
+
+The generated release-notes document has this schema:
+
+```json
+{
+  "version": "x.x.xx",
+  "sections": [
+    {
+      "title": "Highlights",
+      "items": [
+        "Added new strategic options."
+      ]
+    },
+    {
+      "title": "Fixes",
+      "items": [
+        "Fixed interrupted manufacturing orders."
+      ]
+    }
+  ]
+}
+```
+
+`version` must match the content release. `sections` must contain at least one object, and every
+section must have a non-empty `title` and at least one string in `items`. The matching content object
+in `application.json` references the document without embedding its display text:
+
+```json
+{
+  "releaseNotes": {
+    "path": "dist/release-notes-x.x.xx.json",
+    "sha256": "<SHA-256 of the release-notes document>"
+  }
+}
+```
 
 The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
 packaging job uses `macos-latest`; it builds the universal Tauri launcher, embeds the Unity player,
