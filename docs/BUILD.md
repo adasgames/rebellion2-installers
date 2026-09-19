@@ -105,6 +105,41 @@ and SHA-256 digest in the content portion of `dist/application.json`, and publis
 An absent usable section omits the pointer. The launcher also ignores missing, corrupt, mismatched,
 or malformed notes so release notes can never prevent an update.
 
+The generated release-notes document has this schema:
+
+```json
+{
+  "version": "0.0.13",
+  "sections": [
+    {
+      "title": "Highlights",
+      "items": [
+        "Added new strategic options."
+      ]
+    },
+    {
+      "title": "Fixes",
+      "items": [
+        "Fixed interrupted manufacturing orders."
+      ]
+    }
+  ]
+}
+```
+
+`version` must match the content release. `sections` must contain at least one object, and every
+section must have a non-empty `title` and at least one string in `items`. The matching content object
+in `application.json` references the document without embedding its display text:
+
+```json
+{
+  "releaseNotes": {
+    "path": "dist/release-notes-0.0.13.json",
+    "sha256": "<SHA-256 of the release-notes document>"
+  }
+}
+```
+
 The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
 packaging job uses `macos-latest`; it builds the universal Tauri launcher, embeds the Unity player,
 verifies the archive, attaches it to the existing versioned release, and updates the stable
