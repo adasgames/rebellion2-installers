@@ -109,7 +109,7 @@ The generated release-notes document has this schema:
 
 ```json
 {
-  "version": "0.0.13",
+  "version": "x.x.xx",
   "sections": [
     {
       "title": "Highlights",
@@ -134,7 +134,7 @@ in `application.json` references the document without embedding its display text
 ```json
 {
   "releaseNotes": {
-    "path": "dist/release-notes-0.0.13.json",
+    "path": "dist/release-notes-x.x.xx.json",
     "sha256": "<SHA-256 of the release-notes document>"
   }
 }
