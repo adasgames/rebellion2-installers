@@ -134,6 +134,29 @@ struct Latest {
     manifest: String,
     #[serde(default = "default_blobs")]
     blobs: String,
+    #[serde(default, rename = "releaseNotes")]
+    release_notes: Option<ReleaseNotesPointer>,
+}
+
+/// A versioned release-notes document published beside the update manifests.
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseNotesPointer {
+    path: String,
+    sha256: String,
+}
+
+/// Release notes shown on the update confirmation screen.
+#[derive(Debug, Deserialize)]
+struct ReleaseNotes {
+    version: String,
+    sections: Vec<ReleaseNoteSection>,
+}
+
+/// A titled group of release-note items.
+#[derive(Debug, Deserialize)]
+struct ReleaseNoteSection {
+    title: String,
+    items: Vec<String>,
 }
 fn default_blobs() -> String {
     "blobs/".to_string()
@@ -909,7 +932,71 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
          <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
         a = ACT,
     );
-    write_screen(handle, &render("Update available", false, &detail, &buttons));
+    let release_notes = fetch_release_notes(base, latest);
+    write_screen(
+        handle,
+        &update_available_screen(&detail, release_notes.as_ref(), &buttons),
+    );
+}
+
+/// Builds the content-update confirmation screen with optional release notes.
+fn update_available_screen(
+    detail: &str,
+    notes: Option<&ReleaseNotes>,
+    buttons: &str,
+) -> String {
+    let release_notes = notes.map(render_release_notes).unwrap_or_default();
+    render_with_content("Update available", false, detail, &release_notes, buttons)
+}
+
+/// Downloads and validates the notes referenced by a content release.
+fn fetch_release_notes(base: &str, latest: &Latest) -> Option<ReleaseNotes> {
+    let pointer = latest.release_notes.as_ref()?;
+    let bytes = fetch_channel_bytes(&format!("{base}{}", pointer.path), None).ok()?;
+    parse_release_notes(&bytes, &latest.version, &pointer.sha256)
+}
+
+/// Parses release notes only when their version and digest match the release pointer.
+fn parse_release_notes(bytes: &[u8], version: &str, sha256: &str) -> Option<ReleaseNotes> {
+    if sha256_hex(bytes) != sha256 {
+        return None;
+    }
+
+    let notes = serde_json::from_slice::<ReleaseNotes>(bytes).ok()?;
+    if notes.version != version
+        || notes.sections.is_empty()
+        || notes
+            .sections
+            .iter()
+            .any(|section| section.title.trim().is_empty() || section.items.is_empty())
+    {
+        return None;
+    }
+
+    Some(notes)
+}
+
+/// Renders structured release notes for the update confirmation screen.
+fn render_release_notes(notes: &ReleaseNotes) -> String {
+    let sections = notes
+        .sections
+        .iter()
+        .map(|section| {
+            let items = section
+                .items
+                .iter()
+                .map(|item| format!("<li>{}</li>", html_escape(item)))
+                .collect::<String>();
+            format!(
+                "<section class=\"changes\"><h2 style=\"font-size:11px;font-weight:800\">{}</h2><ul style=\"font-size:12px\">{items}</ul></section>",
+                html_escape(&section.title)
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        "<div style=\"display:flex;flex:1;min-height:0;margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);flex-direction:column;text-align:left\"><h2 class=\"patch-title\" style=\"font-size:15px\">Patch Notes</h2><div class=\"release-changes\" style=\"flex:1;overflow-y:scroll;scrollbar-gutter:stable\">{sections}</div></div>"
+    )
 }
 
 // -- update / install work ---------------------------------------------------
@@ -1169,6 +1256,12 @@ fn fetch_latest(base: &str) -> Result<Latest, Box<dyn std::error::Error>> {
 }
 
 fn fetch_json<T: serde::de::DeserializeOwned>(url: &str, token: Option<&str>) -> Result<T, Box<dyn std::error::Error>> {
+    let body = fetch_channel_bytes(url, token)?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+/// Fetches bytes from the release channel with optional ownership authorization.
+fn fetch_channel_bytes(url: &str, token: Option<&str>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut request = ureq::get(url).timeout(Duration::from_secs(20));
     if let Some(token) = token {
         request = request.set("Authorization", &format!("Bearer {token}"));
@@ -1178,9 +1271,9 @@ fn fetch_json<T: serde::de::DeserializeOwned>(url: &str, token: Option<&str>) ->
         ureq::Error::Status(401 | 403, _) => Box::new(AuthorizationRequired) as Box<dyn std::error::Error>,
         other => Box::new(other),
     })?;
-    let mut body = String::new();
-    response.into_reader().read_to_string(&mut body)?;
-    Ok(serde_json::from_str(&body)?)
+    let mut body = Vec::new();
+    response.into_reader().read_to_end(&mut body)?;
+    Ok(body)
 }
 
 fn read_installed_version(content_dir: &Path) -> Option<String> {
@@ -1246,14 +1339,28 @@ fn html_escape(text: &str) -> String {
 /// wordmark top-aligned, an optional spinner, a status line, a progress bar, and
 /// buttons pinned toward the bottom. Fixed height so the frame never resizes.
 fn render(kicker: &str, spinner: bool, status: &str, buttons: &str) -> String {
+    render_with_content(kicker, spinner, status, "", buttons)
+}
+
+/// Renders the shared launcher card with optional content above its actions.
+fn render_with_content(
+    kicker: &str,
+    spinner: bool,
+    status: &str,
+    content: &str,
+    buttons: &str,
+) -> String {
     let spin = if spinner { r#"<div class="spin"></div>"# } else { "" };
     let kicker = html_escape(kicker);
     let status = html_escape(status);
+    let card_class = if content.is_empty() { "card" } else { "card has-content" };
     format!(
-        r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:min(94vw,440px);height:min(560px,92vh);overflow:hidden;padding:40px 34px 30px;background:rgba(16,22,43,.72);border:1px solid rgba(120,160,255,.18);border-radius:18px;backdrop-filter:blur(14px);box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 24px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.btns{{margin-top:auto}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="card"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="sub" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div><div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
+        r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:min(94vw,440px);height:min(560px,92vh);overflow:hidden;padding:40px 34px 30px;background:rgba(16,22,43,.72);border:1px solid rgba(120,160,255,.18);border-radius:18px;backdrop-filter:blur(14px);box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 18px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.has-content .sub{{margin-bottom:0}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.has-content .p:empty{{margin:0}}.release-changes{{min-height:0;overflow-y:auto;padding-right:8px;text-align:left;scrollbar-color:#59637b rgba(255,255,255,.06);scrollbar-width:thin}}.release-changes::-webkit-scrollbar{{width:7px}}.release-changes::-webkit-scrollbar-track{{background:rgba(255,255,255,.06);border-radius:4px}}.release-changes::-webkit-scrollbar-thumb{{background:#59637b;border-radius:4px}}.patch-title{{margin:0 0 9px;color:#e8ecf6;font-size:13px}}.save-warning{{margin:0 0 16px;color:#ff3434;font-size:12px;font-weight:900;line-height:1.25;text-align:center;text-transform:uppercase;letter-spacing:.025em}}.changes+.changes{{margin-top:9px}}.changes h2{{margin:0 0 3px;color:#b9c2da;font-size:9px;text-transform:uppercase}}.changes ul{{margin:0;padding-left:18px;color:#cbd2e3;font-size:11px;line-height:1.45}}.changes li+li{{margin-top:5px}}.btns{{flex:none;margin-top:0}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="{card_class}"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="sub" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div>{content}<div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
         kicker = kicker,
         status = status,
         spin = spin,
+        content = content,
+        card_class = card_class,
         buttons = buttons,
     )
 }
@@ -1702,6 +1809,49 @@ mod tests {
         assert!(screen.contains("Version 1.2.3 is available. Install it now?"));
         assert!(screen.contains("choice=application-update\">Install Update"));
         assert!(screen.contains("choice=play\">Launch Game"));
+    }
+
+    #[test]
+    fn update_available_screen_with_release_notes_displays_release_content() {
+        let notes = ReleaseNotes {
+            version: "1.2.3".to_string(),
+            sections: vec![ReleaseNoteSection {
+                title: "Fixes".to_string(),
+                items: vec!["Fixed update handling.".to_string()],
+            }],
+        };
+        let screen = update_available_screen(
+            "An update is available.",
+            Some(&notes),
+            "<a href=\"https://launcher.invalid/act?choice=update\">Update</a>",
+        );
+
+        assert!(screen.contains("Fixed update handling."));
+        assert!(screen.contains("Patch Notes"));
+        assert!(screen.contains("Fixes"));
+        assert!(screen.contains("choice=update"));
+    }
+
+    #[test]
+    fn update_available_screen_without_release_notes_omits_release_content() {
+        let screen = update_available_screen("An update is available.", None, "Update");
+
+        assert!(!screen.contains("Patch Notes"));
+        assert!(screen.contains("An update is available."));
+    }
+
+    #[test]
+    fn parse_release_notes_with_malformed_json_returns_none() {
+        let bytes = br#"{"version":"1.2.3","sections":[}"#;
+
+        assert!(parse_release_notes(bytes, "1.2.3", &sha256_hex(bytes)).is_none());
+    }
+
+    #[test]
+    fn parse_release_notes_with_wrong_digest_returns_none() {
+        let bytes = br#"{"version":"1.2.3","sections":[]}"#;
+
+        assert!(parse_release_notes(bytes, "1.2.3", "incorrect").is_none());
     }
 
     #[test]
