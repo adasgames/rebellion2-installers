@@ -26,6 +26,8 @@ use tauri::{
     webview::{PageLoadEvent, PageLoadPayload},
     Manager, WebviewUrl, WebviewWindowBuilder,
 };
+#[cfg(target_os = "macos")]
+use tauri_plugin_updater::UpdaterExt;
 
 /// Ownership-service URL injected by release automation (REB2_AUTH_BASE_URL).
 const AUTH_BASE: Option<&str> = option_env!("REB2_AUTH_BASE_URL");
@@ -72,6 +74,7 @@ const ACT: &str = "https://launcher.invalid/act";
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// A newer application release waiting for the user to approve its installation.
+#[cfg(target_os = "windows")]
 static PENDING_APPLICATION_UPDATE: Mutex<Option<ApplicationUpdate>> = Mutex::new(None);
 /// Set when the user continues after an update failure so the content flow can proceed.
 static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
@@ -175,6 +178,13 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.handle().plugin(
+                tauri_plugin_updater::Builder::new()
+                    .target("macos-universal")
+                    .build(),
+            )?;
+
             let handle = app.handle().clone();
 
             // Ownership gates the DOWNLOAD, never the play. If the game is already
@@ -407,13 +417,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             }
         }
         "quit" => handle.exit(0),
-        "application-update" => {
-            let update = PENDING_APPLICATION_UPDATE.lock().unwrap().clone();
-            if let Some(update) = update {
-                let handle = handle.clone();
-                thread::spawn(move || run_application_update(&handle, &update));
-            }
-        }
+        "application-update" => start_application_update(handle),
         "skip-application-update" => {
             APPLICATION_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
             let handle = handle.clone();
@@ -474,9 +478,10 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
 
 // -- application updates -----------------------------------------------------
 
-/// Returns a newer Windows application release when the public channel publishes one.
+/// Returns the version of a newer Windows application release, retaining its
+/// manifest so the existing handoff helper can install it after approval.
 #[cfg(target_os = "windows")]
-fn check_application_update() -> Option<ApplicationUpdate> {
+fn check_application_update(_handle: &tauri::AppHandle) -> Option<String> {
     if APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed) {
         return None;
     }
@@ -490,13 +495,148 @@ fn check_application_update() -> Option<ApplicationUpdate> {
         ));
         return None;
     }
-    version_gt(&update.version, &current).then_some(update)
+    if version_gt(&update.version, &current) {
+        let version = update.version.clone();
+        *PENDING_APPLICATION_UPDATE.lock().unwrap() = Some(update);
+        Some(version)
+    } else {
+        None
+    }
 }
 
-/// Automatic application updates are currently disabled for non-Windows packages.
-#[cfg(not(target_os = "windows"))]
-fn check_application_update() -> Option<ApplicationUpdate> {
+/// Checks the independent, signed macOS application channel.
+#[cfg(target_os = "macos")]
+fn check_application_update(handle: &tauri::AppHandle) -> Option<String> {
+    if APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let result = tauri::async_runtime::block_on(async {
+        let updater = handle.updater()?;
+        updater.check().await
+    });
+    match result {
+        Ok(Some(update)) => Some(update.version),
+        Ok(None) => None,
+        Err(error) => {
+            log_line(&format!(
+                "[launcher] macOS application update check failed: {error}"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn check_application_update(_handle: &tauri::AppHandle) -> Option<String> {
     None
+}
+
+#[cfg(target_os = "windows")]
+fn start_application_update(handle: &tauri::AppHandle) {
+    let update = PENDING_APPLICATION_UPDATE.lock().unwrap().clone();
+    if let Some(update) = update {
+        let handle = handle.clone();
+        thread::spawn(move || run_windows_application_update(&handle, &update));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_application_update(handle: &tauri::AppHandle) {
+    show_progress_ui(handle);
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        run_macos_application_update(&handle).await;
+    });
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn start_application_update(_handle: &tauri::AppHandle) {}
+
+#[cfg(target_os = "macos")]
+async fn run_macos_application_update(handle: &tauri::AppHandle) {
+    update_progress(handle, 0, "Checking application update\u{2026}");
+    let updater = match handle.updater() {
+        Ok(updater) => updater,
+        Err(error) => {
+            show_macos_application_update_error(handle, &error);
+            return;
+        }
+    };
+    let update = match updater.check().await {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            log_line("[launcher] the macOS application update is no longer available.");
+            show_message(
+                handle,
+                "Already current",
+                "The application is already up to date.",
+                Some(("Continue", "skip-application-update")),
+            );
+            return;
+        }
+        Err(error) => {
+            show_macos_application_update_error(handle, &error);
+            return;
+        }
+    };
+
+    let mut downloaded = 0_u64;
+    let progress_handle = handle.clone();
+    let finish_handle = handle.clone();
+    let result = update
+        .download_and_install(
+            move |chunk_size, content_length| {
+                downloaded = downloaded.saturating_add(chunk_size as u64);
+                let percent = content_length
+                    .filter(|total| *total > 0)
+                    .map(|total| 5 + downloaded.saturating_mul(90) / total)
+                    .unwrap_or(5)
+                    .min(95);
+                update_progress(
+                    &progress_handle,
+                    percent,
+                    &format!(
+                        "Downloading application update\u{2026} {}",
+                        human_bytes(downloaded)
+                    ),
+                );
+            },
+            move || update_progress(&finish_handle, 96, "Installing application update\u{2026}"),
+        )
+        .await;
+
+    match result {
+        Ok(()) => {
+            log_line(&format!(
+                "[launcher] macOS application update to {} installed.",
+                update.version
+            ));
+            update_progress(
+                handle,
+                100,
+                "Application update complete. Restarting\u{2026}",
+            );
+            handle.restart();
+        }
+        Err(error) => show_macos_application_update_error(handle, &error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_application_update_error(
+    handle: &tauri::AppHandle,
+    error: &tauri_plugin_updater::Error,
+) {
+    log_line(&format!(
+        "[launcher] macOS application update failed: {error}"
+    ));
+    show_message(
+        handle,
+        "Update failed",
+        "The application update failed \u{2014} see launcher.log.",
+        Some(("Continue", "skip-application-update")),
+    );
 }
 
 /// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
@@ -514,7 +654,8 @@ fn version_gt(a: &str, b: &str) -> bool {
 
 /// Stages application changes, then exits so the helper can promote and relaunch
 /// the updated launcher before content scanning resumes.
-fn run_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
+#[cfg(target_os = "windows")]
+fn run_windows_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
     show_progress_ui(handle);
     update_progress(handle, 0, "Checking application update…");
     match do_application_update(handle, update) {
@@ -691,8 +832,18 @@ fn read_application_version() -> Option<String> {
         .or_else(|| read_application_manifest(&install_dir).map(|manifest| manifest.version))
 }
 
+/// A macOS update replaces the app bundle but deliberately preserves downloaded
+/// content in Application Support. The bundle's baked version is authoritative.
+#[cfg(target_os = "macos")]
+fn current_application_version() -> Option<String> {
+    CONTENT_VERSION
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+}
+
 /// Returns the installed application version, falling back to the release baked
 /// into launchers that predate the application-version marker.
+#[cfg(not(target_os = "macos"))]
 fn current_application_version() -> Option<String> {
     read_application_version().or_else(|| {
         CONTENT_VERSION
@@ -704,6 +855,21 @@ fn current_application_version() -> Option<String> {
 /// Content is safe to load only when it was published for this application build.
 fn content_matches_application(application_version: Option<&str>, content_version: &str) -> bool {
     application_version == Some(content_version)
+}
+
+/// Resolves the immutable content release that belongs to this application.
+/// A newer platform release may move the public pointer, but cannot make an older
+/// launcher consume media authored for a different application version.
+fn content_release_for_application(published: Latest, application_version: Option<&str>) -> Latest {
+    match application_version {
+        Some(version) if version != published.version => Latest {
+            version: version.to_string(),
+            manifest: format!("dist/manifest-{version}.json"),
+            blobs: default_blobs(),
+            release_notes: None,
+        },
+        _ => published,
+    }
 }
 
 /// Returns whether embedded content uses the same version as its application release.
@@ -783,13 +949,9 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
 
     // An application update supersedes content, but nothing is downloaded until
     // the user approves it. Discovery failures fall through to the content flow.
-    if let Some(update) = check_application_update() {
-        log_line(&format!(
-            "[launcher] application update available: {}",
-            update.version
-        ));
-        *PENDING_APPLICATION_UPDATE.lock().unwrap() = Some(update.clone());
-        show_application_update(handle, &update.version);
+    if let Some(version) = check_application_update(handle) {
+        log_line(&format!("[launcher] application update available: {version}"));
+        show_application_update(handle, &version);
         return;
     }
 
@@ -819,8 +981,9 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
     };
 
     match fetch_latest(&base) {
-        Ok(latest) => {
+        Ok(published) => {
             let application_version = current_application_version();
+            let latest = content_release_for_application(published, application_version.as_deref());
             // Fail closed before offering either first install or update.
             if !content_matches_application(
                 application_version.as_deref(),
@@ -1419,7 +1582,7 @@ fn show_application_update(handle: &tauri::AppHandle, version: &str) {
 fn application_update_screen(version: &str) -> String {
     let buttons = format!(
         "<a class=\"b primary\" href=\"{a}?choice=application-update\">Install Update</a>\
-         <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
+         <a class=\"b secondary\" href=\"{a}?choice=skip-application-update\">Not Now</a>",
         a = ACT,
     );
     render(
@@ -1704,6 +1867,61 @@ mod tests {
     }
 
     #[test]
+    fn content_release_for_application_with_matching_version_keeps_published_pointer() {
+        let published = Latest {
+            version: "0.0.14".to_string(),
+            manifest: "dist/custom-manifest.json".to_string(),
+            blobs: "custom-blobs/".to_string(),
+            release_notes: Some(ReleaseNotesPointer {
+                path: "dist/release-notes-0.0.14.json".to_string(),
+                sha256: "digest".to_string(),
+            }),
+        };
+
+        let resolved = content_release_for_application(published, Some("0.0.14"));
+
+        assert_eq!(resolved.version, "0.0.14");
+        assert_eq!(resolved.manifest, "dist/custom-manifest.json");
+        assert_eq!(resolved.blobs, "custom-blobs/");
+        assert!(resolved.release_notes.is_some());
+    }
+
+    #[test]
+    fn content_release_for_application_with_newer_published_version_uses_immutable_matching_content(
+    ) {
+        let published = Latest {
+            version: "0.0.15".to_string(),
+            manifest: "dist/manifest-0.0.15.json".to_string(),
+            blobs: "blobs/".to_string(),
+            release_notes: Some(ReleaseNotesPointer {
+                path: "dist/release-notes-0.0.15.json".to_string(),
+                sha256: "digest".to_string(),
+            }),
+        };
+
+        let resolved = content_release_for_application(published, Some("0.0.14"));
+
+        assert_eq!(resolved.version, "0.0.14");
+        assert_eq!(resolved.manifest, "dist/manifest-0.0.14.json");
+        assert_eq!(resolved.blobs, "blobs/");
+        assert!(resolved.release_notes.is_none());
+    }
+
+    #[test]
+    fn content_release_for_application_without_application_version_keeps_published_pointer() {
+        let published = Latest {
+            version: "0.0.14".to_string(),
+            manifest: "dist/manifest-0.0.14.json".to_string(),
+            blobs: "blobs/".to_string(),
+            release_notes: None,
+        };
+
+        let resolved = content_release_for_application(published, None);
+
+        assert_eq!(resolved.version, "0.0.14");
+    }
+
+    #[test]
     fn application_update_with_embedded_content_keeps_versions_together() {
         let release: ApplicationUpdate = serde_json::from_str(
             r#"{
@@ -1803,12 +2021,12 @@ mod tests {
     }
 
     #[test]
-    fn application_update_screen_with_available_update_offers_install_and_launch() {
+    fn application_update_screen_with_available_update_offers_install_and_skip() {
         let screen = application_update_screen("1.2.3");
 
         assert!(screen.contains("Version 1.2.3 is available. Install it now?"));
         assert!(screen.contains("choice=application-update\">Install Update"));
-        assert!(screen.contains("choice=play\">Launch Game"));
+        assert!(screen.contains("choice=skip-application-update\">Not Now"));
     }
 
     #[test]

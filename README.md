@@ -42,6 +42,10 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
    double-click will be blocked — you only need the right-click trick once.)
 
+The launcher checks for signed macOS application updates. You may install one immediately or keep
+playing the installed version; its matching game content remains available independently of the
+Windows release channel.
+
 ## FAQ
 
 ### Why is Empire at War accepted?
