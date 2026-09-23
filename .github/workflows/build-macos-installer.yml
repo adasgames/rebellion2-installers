@@ -1,16 +1,32 @@
 name: Build macOS Installer
 
 # macOS is intentionally opt-in. Push a tag like `macos-0.0.11` only after the
-# matching Windows release exists. The workflow attaches a macOS download
-# without changing live channels.
+# matching Windows release exists, or manually dispatch a historical backfill.
+# The independent latest-macos channel cannot move the Windows release channel.
 
 on:
   push:
     tags:
       - "macos-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version to build (for example, 0.0.14)
+        required: true
+        type: string
+      publish:
+        description: Publish the completed artifacts to the existing release and latest-macos channel
+        required: true
+        default: false
+        type: boolean
+      allow_rollback:
+        description: Allow latest-macos to move to an older version (emergency rollback only)
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
-  group: macos-release-${{ github.ref_name }}
+  group: macos-release
   cancel-in-progress: false
 
 jobs:
@@ -29,6 +45,7 @@ jobs:
       - id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
           STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
@@ -36,8 +53,13 @@ jobs:
           STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF_NAME" =~ ^macos-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
-          version="${GITHUB_REF_NAME#macos-}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="$INPUT_VERSION"
+          else
+            [[ "$GITHUB_REF_NAME" =~ ^macos-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+            version="${GITHUB_REF_NAME#macos-}"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           RELEASE_TAG="v$version"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           export RCLONE_S3_PROVIDER="$STORAGE_PROVIDER"
@@ -76,8 +98,6 @@ jobs:
     steps:
       - name: Checkout installer repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Download player
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -86,9 +106,19 @@ jobs:
           path: player-archive
 
       - name: Extract player
+        id: player
         run: |
+          set -euo pipefail
           mkdir player
           tar -xzf player-archive/player-macos.tar.gz -C player
+          game_app="$(find "$PWD/player" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$game_app"
+          test -d "$game_app/Contents/MacOS"
+          find "$game_app/Contents/MacOS" -maxdepth 1 -type f -exec chmod +x {} \;
+          xattr -cr "$game_app"
+          codesign --force --deep --sign - "$game_app"
+          codesign --verify --deep --strict "$game_app"
+          echo "game-app=$game_app" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -104,9 +134,28 @@ jobs:
           REB2_AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          GAME_APP: ${{ steps.player.outputs.game-app }}
         run: |
+          set -euo pipefail
           test -n "$REB2_AUTH_BASE_URL"
-          jq --arg version "$REB2_CONTENT_VERSION" '.version = $version' \
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          test -d "$GAME_APP"
+          # GitHub secrets copied from UTF-8 files can retain a leading byte-order
+          # mark, which Tauri otherwise rejects as an invalid base64 character.
+          TAURI_SIGNING_PRIVATE_KEY="${TAURI_SIGNING_PRIVATE_KEY#$'\xEF\xBB\xBF'}"
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          export TAURI_SIGNING_PRIVATE_KEY
+          jq \
+            --arg version "$REB2_CONTENT_VERSION" \
+            --arg game_app "$GAME_APP" \
+            '.version = $version
+             | .bundle.createUpdaterArtifacts = true
+             | .bundle.macOS = ((.bundle.macOS // {}) + {
+                 "files": {"Resources/Rebellion2 Game.app": $game_app},
+                 "hardenedRuntime": false,
+                 "signingIdentity": "-"
+               })' \
             tauri.conf.json > tauri.release.conf.json
           cargo tauri build \
             --config tauri.release.conf.json \
@@ -115,11 +164,48 @@ jobs:
 
       - name: Package application
         run: |
+          set -euo pipefail
+          app="launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app"
+          updater="$app.tar.gz"
+          test -f "$updater"
+          test -f "$updater.sig"
           bash packaging/macos/build-zip.sh \
-            "launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app" \
-            "$PWD/player" \
+            "$app" \
             "${{ needs.prepare.outputs.version }}" \
             "$PWD/Rebellion2-macOS.zip"
+          cp "$updater" "$PWD/Rebellion2-macOS-updater.tar.gz"
+          cp "$updater.sig" "$PWD/Rebellion2-macOS-updater.tar.gz.sig"
+
+      - name: Create macOS update manifest
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          signature="$(tr -d '\r\n' < Rebellion2-macOS-updater.tar.gz.sig)"
+          test -n "$signature"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/Rebellion2-macOS-updater.tar.gz"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "Rebellion 2 version $VERSION" \
+            --arg url "$url" \
+            --arg signature "$signature" \
+            '{
+              version: $version,
+              notes: $notes,
+              platforms: {
+                "macos-universal": {
+                  url: $url,
+                  signature: $signature
+                }
+              }
+            }' > latest-macos.json
+          jq -e \
+            --arg version "$VERSION" \
+            '.version == $version
+             and (.platforms["macos-universal"].url | length > 0)
+             and (.platforms["macos-universal"].signature | length > 0)' \
+            latest-macos.json >/dev/null
 
       - name: Verify packaged application
         run: |
@@ -127,25 +213,132 @@ jobs:
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
           ditto -x -k Rebellion2-macOS.zip "$work"
-          test -x "$work/Rebellion2.app/Contents/MacOS/rebellion2-launcher"
-          test -d "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app"
-          test -n "$(find "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
-          codesign --verify --deep --strict "$work/Rebellion2.app"
+          app="$work/Rebellion II.app"
+          test -x "$app/Contents/MacOS/rebellion2-launcher"
+          test -d "$app/Contents/Resources/Rebellion2 Game.app"
+          test -n "$(find "$app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          codesign --verify --deep --strict "$app"
+          tar -tzf Rebellion2-macOS-updater.tar.gz | grep -F 'Rebellion II.app/Contents/Resources/Rebellion2 Game.app/' >/dev/null
+
+      - name: Upload packaged applications
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rebellion2-macos-${{ needs.prepare.outputs.version }}
+          path: |
+            Rebellion2-macOS.zip
+            Rebellion2-macOS-updater.tar.gz
+            latest-macos.json
+          if-no-files-found: error
 
       - name: Publish versioned and latest macOS downloads
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           ALIAS_TAG: latest-macos
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
         run: |
           set -euo pipefail
-          gh release upload "$RELEASE_TAG" Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+          update_alias=true
+          version_is_older() {
+            local candidate="${1%%+*}"
+            local current="${2%%+*}"
+            local candidate_core="${candidate%%-*}"
+            local current_core="${current%%-*}"
+            local candidate_pre=""
+            local current_pre=""
+            local candidate_major candidate_minor candidate_patch
+            local current_major current_minor current_patch
+            local index candidate_id current_id
+            local -a candidate_ids current_ids
+
+            if [[ "$candidate" == *-* ]]; then candidate_pre="${candidate#*-}"; fi
+            if [[ "$current" == *-* ]]; then current_pre="${current#*-}"; fi
+            IFS=. read -r candidate_major candidate_minor candidate_patch <<<"$candidate_core"
+            IFS=. read -r current_major current_minor current_patch <<<"$current_core"
+
+            for index in 1 2 3; do
+              case "$index" in
+                1) candidate_id="$candidate_major"; current_id="$current_major" ;;
+                2) candidate_id="$candidate_minor"; current_id="$current_minor" ;;
+                3) candidate_id="$candidate_patch"; current_id="$current_patch" ;;
+              esac
+              if ((10#$candidate_id < 10#$current_id)); then return 0; fi
+              if ((10#$candidate_id > 10#$current_id)); then return 1; fi
+            done
+
+            if [[ -z "$candidate_pre" ]]; then return 1; fi
+            if [[ -z "$current_pre" ]]; then return 0; fi
+            IFS=. read -r -a candidate_ids <<<"$candidate_pre"
+            IFS=. read -r -a current_ids <<<"$current_pre"
+            index=0
+            while ((index < ${#candidate_ids[@]} || index < ${#current_ids[@]})); do
+              if ((index >= ${#candidate_ids[@]})); then return 0; fi
+              if ((index >= ${#current_ids[@]})); then return 1; fi
+              candidate_id="${candidate_ids[$index]}"
+              current_id="${current_ids[$index]}"
+              if [[ "$candidate_id" == "$current_id" ]]; then
+                ((index += 1))
+                continue
+              fi
+              if [[ "$candidate_id" =~ ^[0-9]+$ && "$current_id" =~ ^[0-9]+$ ]]; then
+                ((10#$candidate_id < 10#$current_id)) && return 0
+                return 1
+              fi
+              if [[ "$candidate_id" =~ ^[0-9]+$ ]]; then return 0; fi
+              if [[ "$current_id" =~ ^[0-9]+$ ]]; then return 1; fi
+              [[ "$candidate_id" < "$current_id" ]] && return 0
+              return 1
+            done
+            return 1
+          }
+
+          if gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            current_dir="$(mktemp -d)"
+            trap 'rm -rf "$current_dir"' EXIT
+            current_version=""
+            if gh release download "$ALIAS_TAG" \
+              --pattern latest-macos.json \
+              --dir "$current_dir" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              current_version="$(jq -r .version "$current_dir/latest-macos.json")"
+            else
+              alias_name="$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json name --jq .name)"
+              current_version="$(sed -nE 's/^Latest Rebellion 2 macOS build \(v([^)]*)\)$/\1/p' <<<"$alias_name")"
+            fi
+            if [[ -z "$current_version" ]]; then
+              echo "Unable to determine the current latest-macos version." >&2
+              exit 1
+            fi
+            if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "The current latest-macos version is invalid: $current_version" >&2
+              exit 1
+            fi
+            if version_is_older "$VERSION" "$current_version" && [[ "$ALLOW_ROLLBACK" != "true" ]]; then
+              echo "Publishing $VERSION without moving latest-macos backward from $current_version."
+              echo "For an intentional emergency rollback, manually dispatch with allow_rollback enabled."
+              update_alias=false
+            fi
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            Rebellion2-macOS.zip \
+            Rebellion2-macOS-updater.tar.gz \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
+          if [[ "$update_alias" != "true" ]]; then
+            exit 0
+          fi
 
           if gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             test "$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
             test "$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)" = true
             gh release upload "$ALIAS_TAG" Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+            # Publish the updater pointer last so it never references a missing artifact.
+            gh release upload "$ALIAS_TAG" latest-macos.json --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$ALIAS_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --prerelease \
@@ -158,5 +351,6 @@ jobs:
               --prerelease \
               --title "Latest Rebellion 2 macOS build (v$VERSION)" \
               --notes "Stable download alias for the latest published Rebellion 2 macOS build: v$VERSION." \
-              Rebellion2-macOS.zip
+              Rebellion2-macOS.zip \
+              latest-macos.json
           fi

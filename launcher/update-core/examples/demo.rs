@@ -7,7 +7,9 @@
 //! and proves the result is bit-identical to a clean v2 — fetching only the
 //! bytes that changed.
 
-use rebellion2_update_core::{apply, diff, sha256_hex, verify_install, BlobSource, FileEntry, Manifest};
+use rebellion2_update_core::{
+    apply, diff, sha256_hex, verify_install, BlobSource, FileEntry, Manifest,
+};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,16 +66,28 @@ fn main() {
 
     let v1: &[(&str, &[u8])] = &[
         ("catalog.xml", b"<catalog version=\"1\"/>"),
-        ("Application/Strategy/UI/Windows/welder_tab_active.png", b"WELDER-v1"),
+        (
+            "Application/Strategy/UI/Windows/welder_tab_active.png",
+            b"WELDER-v1",
+        ),
         ("Packs/Classic/Shared/Data/game.xml", &big),
-        ("Packs/Classic/Shared/Data/old-thing.xml", b"to be removed in v2"),
+        (
+            "Packs/Classic/Shared/Data/old-thing.xml",
+            b"to be removed in v2",
+        ),
     ];
     let v2: &[(&str, &[u8])] = &[
-        ("catalog.xml", b"<catalog version=\"2\"/>"),                          // changed
-        ("Application/Strategy/UI/Windows/welder_tab_active.png", b"WELDER-v2-GREEN"), // changed
-        ("Packs/Classic/Shared/Data/game.xml", &big),                          // UNCHANGED (5 MiB)
-        ("Packs/Classic/Shared/Data/new-event.xml", b"a new event added in v2"), // added
-        // old-thing.xml is gone -> removed
+        ("catalog.xml", b"<catalog version=\"2\"/>"), // changed
+        (
+            "Application/Strategy/UI/Windows/welder_tab_active.png",
+            b"WELDER-v2-GREEN",
+        ), // changed
+        ("Packs/Classic/Shared/Data/game.xml", &big), // UNCHANGED (5 MiB)
+        (
+            "Packs/Classic/Shared/Data/new-event.xml",
+            b"a new event added in v2",
+        ), // added
+                                                      // old-thing.xml is gone -> removed
     ];
 
     println!("┌─ Rebellion II patcher — live demo ─────────────────────────────");
@@ -91,7 +105,11 @@ fn main() {
     let plan = diff(Some(&m1), &m2);
     println!("│ 1. diff v1 → v2");
     for f in &plan.changed {
-        let verb = if m1.files.iter().any(|e| e.path == f.path) { "changed" } else { "added  " };
+        let verb = if m1.files.iter().any(|e| e.path == f.path) {
+            "changed"
+        } else {
+            "added  "
+        };
         println!("│      {verb}  {}  ({})", f.path, kb(f.size));
     }
     for p in &plan.removed {
@@ -111,14 +129,25 @@ fn main() {
 
     // 3) apply (hash-verified, atomic per file)
     let written = apply(&plan, &install, &DirBlobs(blobs)).unwrap();
-    println!("│ 3. apply: wrote {written} files (hash-verified), removed {}", plan.removed.len());
+    println!(
+        "│ 3. apply: wrote {written} files (hash-verified), removed {}",
+        plan.removed.len()
+    );
     println!("│");
 
     // 4) the oracle
     let ok = verify_install(&install, &m2).unwrap();
-    let ghost = install.join("Packs/Classic/Shared/Data/old-thing.xml").exists();
-    println!("│ 4. verify: patched install == clean v2 install?  {}", if ok { "YES ✓" } else { "NO ✗" });
-    println!("│           removed file actually gone?            {}", if !ghost { "YES ✓" } else { "NO ✗" });
+    let ghost = install
+        .join("Packs/Classic/Shared/Data/old-thing.xml")
+        .exists();
+    println!(
+        "│ 4. verify: patched install == clean v2 install?  {}",
+        if ok { "YES ✓" } else { "NO ✗" }
+    );
+    println!(
+        "│           removed file actually gone?            {}",
+        if !ghost { "YES ✓" } else { "NO ✗" }
+    );
     println!("└────────────────────────────────────────────────────────────────");
 
     let _ = fs::remove_dir_all(&work);

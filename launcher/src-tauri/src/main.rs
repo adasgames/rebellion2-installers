@@ -14,18 +14,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+#[cfg(any(target_os = "windows", test))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use rebellion2_update_core::{apply, diff, sha256_hex, BlobSource, FileEntry, Manifest, Plan};
+#[cfg(any(target_os = "windows", test))]
+use rebellion2_update_core::FileEntry;
+#[cfg(target_os = "windows")]
+use rebellion2_update_core::Plan;
+use rebellion2_update_core::{apply, diff, sha256_hex, BlobSource, Manifest};
 use serde::Deserialize;
 use tauri::{
     webview::{PageLoadEvent, PageLoadPayload},
     Manager, WebviewUrl, WebviewWindowBuilder,
 };
+#[cfg(target_os = "macos")]
+use tauri_plugin_updater::UpdaterExt;
 
 /// Ownership-service URL injected by release automation (REB2_AUTH_BASE_URL).
 const AUTH_BASE: Option<&str> = option_env!("REB2_AUTH_BASE_URL");
@@ -37,19 +45,21 @@ const CONTENT_BASE: Option<&str> = option_env!("REB2_CONTENT_BASE_URL");
 
 const CONTENT_VERSION_FILE: &str = ".content-version";
 const CONTENT_MANIFEST_FILE: &str = ".manifest.json";
+#[cfg(target_os = "windows")]
 const APPLICATION_MANIFEST_FILE: &str = ".application-manifest.json";
+#[cfg(target_os = "windows")]
 const APPLICATION_VERSION_FILE: &str = ".application-version";
+#[cfg(target_os = "windows")]
 const PENDING_APPLICATION_MANIFEST_FILE: &str = ".application-manifest.pending.json";
+#[cfg(target_os = "windows")]
 const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
+#[cfg(target_os = "windows")]
 const STAGED_LAUNCHER_FILE_NAME: &str = ".rebellion2-launcher.next.exe";
+#[cfg(any(target_os = "windows", test))]
 const UPDATE_HELPER_FILE_NAME: &str = "rebellion2-update-helper.exe";
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher.exe";
-#[cfg(target_os = "linux")]
-const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher";
-#[cfg(target_os = "macos")]
-const LAUNCHER_FILE_NAME: &str = "Rebellion 2 Launcher.app";
 /// Cached ownership session token, stored next to the launcher.
 const SESSION_FILE: &str = ".session";
 
@@ -72,6 +82,7 @@ const ACT: &str = "https://launcher.invalid/act";
 static SESSION: Mutex<Option<String>> = Mutex::new(None);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// A newer application release waiting for the user to approve its installation.
+#[cfg(target_os = "windows")]
 static PENDING_APPLICATION_UPDATE: Mutex<Option<ApplicationUpdate>> = Mutex::new(None);
 /// Set when the user continues after an update failure so the content flow can proceed.
 static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
@@ -81,22 +92,29 @@ static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 static INITIAL_SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Ed25519 public key (hex) that must have signed an application manifest.
-const APPLICATION_UPDATE_PUBKEY: &str = "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
+#[cfg(target_os = "windows")]
+const APPLICATION_UPDATE_PUBKEY: &str =
+    "cde4cdf1c2aa34dcf2484c213fe3ad28c63543aa7de6615aa7537fce968f370d";
 
 /// The application update and matching content release at `dist/application.json`.
 #[derive(Debug, Clone, Deserialize)]
 struct ApplicationUpdate {
+    #[cfg(any(target_os = "windows", test))]
     version: String,
+    #[cfg(any(target_os = "windows", test))]
     manifest: String,
+    #[cfg(any(target_os = "windows", test))]
     #[serde(default = "default_application_blobs")]
     blobs: String,
     /// Hex ed25519 signature over the application manifest bytes.
+    #[cfg(any(target_os = "windows", test))]
     signature: String,
     /// Content paired with this application release. Older pointers omit it.
     #[serde(default)]
     content: Option<Latest>,
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn default_application_blobs() -> String {
     "application-blobs/".to_string()
 }
@@ -113,7 +131,10 @@ enum Pending {
 struct ContentUnavailable;
 impl std::fmt::Display for ContentUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "content for this launcher version is no longer available")
+        write!(
+            f,
+            "content for this launcher version is no longer available"
+        )
     }
 }
 impl std::error::Error for ContentUnavailable {}
@@ -175,6 +196,13 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.handle().plugin(
+                tauri_plugin_updater::Builder::new()
+                    .target("macos-universal")
+                    .build(),
+            )?;
+
             let handle = app.handle().clone();
 
             // Ownership gates the DOWNLOAD, never the play. If the game is already
@@ -192,13 +220,17 @@ fn main() {
                 // Open the gate; on_nav captures the token from /done, then scans.
                 let navigation_handle = handle.clone();
                 let page_load_handle = handle.clone();
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::External(gate_landing().parse().unwrap()))
-                    .title("Rebellion 2 Launcher")
-                    .inner_size(520.0, 700.0)
-                    .resizable(true)
-                    .on_navigation(move |url| on_nav(&navigation_handle, url))
-                    .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                    .build()?;
+                WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    WebviewUrl::External(gate_landing().parse().unwrap()),
+                )
+                .title("Rebellion 2 Launcher")
+                .inner_size(520.0, 700.0)
+                .resizable(true)
+                .on_navigation(move |url| on_nav(&navigation_handle, url))
+                .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
+                .build()?;
             } else {
                 // Installed (or already signed in) — go straight to the scan. A scan
                 // failure degrades to "launch what's installed", so play never blocks.
@@ -287,7 +319,9 @@ fn is_local_app_url(url: &tauri::Url) -> bool {
 }
 
 fn query(url: &tauri::Url, key: &str) -> Option<String> {
-    url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
+    url.query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
 }
 
 /// Returns whether the launcher must obtain a fresh presigned Content archive URL.
@@ -402,18 +436,17 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 ),
                 Err(err) => {
                     log_line(&format!("[launcher] failed to start the game: {err}"));
-                    show_message(handle, "Couldn't start", "The game failed to start — see launcher.log.", None);
+                    show_message(
+                        handle,
+                        "Couldn't start",
+                        "The game failed to start — see launcher.log.",
+                        None,
+                    );
                 }
             }
         }
         "quit" => handle.exit(0),
-        "application-update" => {
-            let update = PENDING_APPLICATION_UPDATE.lock().unwrap().clone();
-            if let Some(update) = update {
-                let handle = handle.clone();
-                thread::spawn(move || run_application_update(&handle, &update));
-            }
-        }
+        "application-update" => start_application_update(handle),
         "skip-application-update" => {
             APPLICATION_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
             let handle = handle.clone();
@@ -474,15 +507,17 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
 
 // -- application updates -----------------------------------------------------
 
-/// Returns a newer Windows application release when the public channel publishes one.
+/// Returns the version of a newer Windows application release, retaining its
+/// manifest so the existing handoff helper can install it after approval.
 #[cfg(target_os = "windows")]
-fn check_application_update() -> Option<ApplicationUpdate> {
+fn check_application_update(_handle: &tauri::AppHandle) -> Option<String> {
     if APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed) {
         return None;
     }
     let base = content_base()?;
     let current = current_application_version()?;
-    let update: ApplicationUpdate = fetch_json(&format!("{base}dist/application.json"), None).ok()?;
+    let update: ApplicationUpdate =
+        fetch_json(&format!("{base}dist/application.json"), None).ok()?;
     if !application_release_is_coherent(&update) {
         log_line(&format!(
             "[launcher] refusing application {} because its content release does not match.",
@@ -490,21 +525,164 @@ fn check_application_update() -> Option<ApplicationUpdate> {
         ));
         return None;
     }
-    version_gt(&update.version, &current).then_some(update)
+    if version_gt(&update.version, &current) {
+        let version = update.version.clone();
+        *PENDING_APPLICATION_UPDATE.lock().unwrap() = Some(update);
+        Some(version)
+    } else {
+        None
+    }
 }
 
-/// Automatic application updates are currently disabled for non-Windows packages.
-#[cfg(not(target_os = "windows"))]
-fn check_application_update() -> Option<ApplicationUpdate> {
+/// Checks the independent, signed macOS application channel.
+#[cfg(target_os = "macos")]
+fn check_application_update(handle: &tauri::AppHandle) -> Option<String> {
+    if APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let result = tauri::async_runtime::block_on(async {
+        let updater = handle.updater()?;
+        updater.check().await
+    });
+    match result {
+        Ok(Some(update)) => Some(update.version),
+        Ok(None) => None,
+        Err(error) => {
+            log_line(&format!(
+                "[launcher] macOS application update check failed: {error}"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn check_application_update(_handle: &tauri::AppHandle) -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn start_application_update(handle: &tauri::AppHandle) {
+    let update = PENDING_APPLICATION_UPDATE.lock().unwrap().clone();
+    if let Some(update) = update {
+        let handle = handle.clone();
+        thread::spawn(move || run_windows_application_update(&handle, &update));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_application_update(handle: &tauri::AppHandle) {
+    show_progress_ui(handle);
+    let handle = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        run_macos_application_update(&handle).await;
+    });
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn start_application_update(_handle: &tauri::AppHandle) {}
+
+#[cfg(target_os = "macos")]
+async fn run_macos_application_update(handle: &tauri::AppHandle) {
+    update_progress(handle, 0, "Checking application update\u{2026}");
+    let updater = match handle.updater() {
+        Ok(updater) => updater,
+        Err(error) => {
+            show_macos_application_update_error(handle, &error);
+            return;
+        }
+    };
+    let update = match updater.check().await {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            log_line("[launcher] the macOS application update is no longer available.");
+            show_message(
+                handle,
+                "Already current",
+                "The application is already up to date.",
+                Some(("Continue", "skip-application-update")),
+            );
+            return;
+        }
+        Err(error) => {
+            show_macos_application_update_error(handle, &error);
+            return;
+        }
+    };
+
+    let mut downloaded = 0_u64;
+    let progress_handle = handle.clone();
+    let finish_handle = handle.clone();
+    let result = update
+        .download_and_install(
+            move |chunk_size, content_length| {
+                downloaded = downloaded.saturating_add(chunk_size as u64);
+                let percent = content_length
+                    .filter(|total| *total > 0)
+                    .map(|total| 5 + downloaded.saturating_mul(90) / total)
+                    .unwrap_or(5)
+                    .min(95);
+                update_progress(
+                    &progress_handle,
+                    percent,
+                    &format!(
+                        "Downloading application update\u{2026} {}",
+                        human_bytes(downloaded)
+                    ),
+                );
+            },
+            move || update_progress(&finish_handle, 96, "Installing application update\u{2026}"),
+        )
+        .await;
+
+    match result {
+        Ok(()) => {
+            log_line(&format!(
+                "[launcher] macOS application update to {} installed.",
+                update.version
+            ));
+            update_progress(
+                handle,
+                100,
+                "Application update complete. Restarting\u{2026}",
+            );
+            handle.restart();
+        }
+        Err(error) => show_macos_application_update_error(handle, &error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_application_update_error(
+    handle: &tauri::AppHandle,
+    error: &tauri_plugin_updater::Error,
+) {
+    log_line(&format!(
+        "[launcher] macOS application update failed: {error}"
+    ));
+    show_message(
+        handle,
+        "Update failed",
+        "The application update failed \u{2014} see launcher.log.",
+        Some(("Continue", "skip-application-update")),
+    );
+}
+
 /// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
+#[cfg(target_os = "windows")]
 fn version_gt(a: &str, b: &str) -> bool {
-    let parts = |s: &str| s.split(['.', '-', '+']).map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    let parts = |s: &str| {
+        s.split(['.', '-', '+'])
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
     let (a, b) = (parts(a), parts(b));
     for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x > y;
         }
@@ -514,7 +692,8 @@ fn version_gt(a: &str, b: &str) -> bool {
 
 /// Stages application changes, then exits so the helper can promote and relaunch
 /// the updated launcher before content scanning resumes.
-fn run_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
+#[cfg(target_os = "windows")]
+fn run_windows_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
     show_progress_ui(handle);
     update_progress(handle, 0, "Checking application update…");
     match do_application_update(handle, update) {
@@ -541,7 +720,11 @@ fn run_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate)
 
 /// Verifies and applies a published application manifest without modifying Content
 /// or overwriting the currently running launcher executable.
-fn do_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) -> Result<usize, Box<dyn std::error::Error>> {
+#[cfg(target_os = "windows")]
+fn do_application_update(
+    handle: &tauri::AppHandle,
+    update: &ApplicationUpdate,
+) -> Result<usize, Box<dyn std::error::Error>> {
     let base = content_base().ok_or("application update channel is not configured")?;
     let manifest_bytes = fetch_bytes(&format!("{base}{}", update.manifest))?;
     verify_application_manifest(&manifest_bytes, &update.signature)?;
@@ -549,18 +732,26 @@ fn do_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) 
     validate_application_manifest(&remote, &update.version)?;
 
     let install_dir = install_dir()?;
-    let local = read_application_manifest(&install_dir).unwrap_or(snapshot_application_files(&install_dir, &remote)?);
+    let local = read_application_manifest(&install_dir)
+        .unwrap_or(snapshot_application_files(&install_dir, &remote)?);
     let plan = diff(Some(&local), &remote);
     update_progress(
         handle,
         5,
-        &format!("Downloading application update… {}", human_bytes(plan.download_size())),
+        &format!(
+            "Downloading application update… {}",
+            human_bytes(plan.download_size())
+        ),
     );
 
     let blobs = PublicHttpBlobs {
         base: format!("{base}{}", update.blobs),
     };
-    let launcher_entry = plan.changed.iter().find(|entry| entry.path == LAUNCHER_FILE_NAME).cloned();
+    let launcher_entry = plan
+        .changed
+        .iter()
+        .find(|entry| entry.path == LAUNCHER_FILE_NAME)
+        .cloned();
     let immediate_plan = Plan {
         changed: plan
             .changed
@@ -585,8 +776,14 @@ fn do_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) 
         }
         fs::write(install_dir.join(STAGED_LAUNCHER_FILE_NAME), bytes)?;
     }
-    fs::write(install_dir.join(PENDING_APPLICATION_MANIFEST_FILE), manifest_bytes)?;
-    fs::write(install_dir.join(PENDING_APPLICATION_VERSION_FILE), &update.version)?;
+    fs::write(
+        install_dir.join(PENDING_APPLICATION_MANIFEST_FILE),
+        manifest_bytes,
+    )?;
+    fs::write(
+        install_dir.join(PENDING_APPLICATION_VERSION_FILE),
+        &update.version,
+    )?;
     // Relaunch only after the helper promotes the staged launcher and version
     // markers. Content scanning must never continue in the old launcher process.
     start_update_helper(true)?;
@@ -594,7 +791,11 @@ fn do_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) 
 }
 
 /// Verifies that an application manifest was signed by the release pipeline.
-fn verify_application_manifest(manifest_bytes: &[u8], signature: &str) -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(target_os = "windows")]
+fn verify_application_manifest(
+    manifest_bytes: &[u8],
+    signature: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     let key: [u8; 32] = hex::decode(APPLICATION_UPDATE_PUBKEY)?
@@ -610,6 +811,7 @@ fn verify_application_manifest(manifest_bytes: &[u8], signature: &str) -> Result
 
 /// Ensures an application manifest cannot modify content, mods, or paths outside
 /// the installation directory.
+#[cfg(any(target_os = "windows", test))]
 fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Result<()> {
     if manifest.version != version {
         return Err(io::Error::new(
@@ -617,13 +819,21 @@ fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Resu
             "application manifest version does not match its channel pointer",
         ));
     }
-    if !manifest.files.iter().any(|entry| entry.path == LAUNCHER_FILE_NAME) {
+    if !manifest
+        .files
+        .iter()
+        .any(|entry| entry.path == LAUNCHER_FILE_NAME)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "application manifest does not contain the launcher",
         ));
     }
-    if !manifest.files.iter().any(|entry| entry.path == UPDATE_HELPER_FILE_NAME) {
+    if !manifest
+        .files
+        .iter()
+        .any(|entry| entry.path == UPDATE_HELPER_FILE_NAME)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "application manifest does not contain the update helper",
@@ -632,7 +842,9 @@ fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Resu
     for entry in &manifest.files {
         let path = Path::new(&entry.path);
         if path.is_absolute()
-            || path.components().any(|component| !matches!(component, Component::Normal(_)))
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
             || is_unmanaged_application_path(path)
         {
             return Err(io::Error::new(
@@ -645,6 +857,7 @@ fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Resu
 }
 
 /// Returns whether a path belongs to player-managed content rather than the application.
+#[cfg(any(target_os = "windows", test))]
 fn is_unmanaged_application_path(path: &Path) -> bool {
     let Some(Component::Normal(component)) = path.components().next() else {
         return false;
@@ -654,6 +867,7 @@ fn is_unmanaged_application_path(path: &Path) -> bool {
 }
 
 /// Reads the application manifest installed by setup or the previous update.
+#[cfg(target_os = "windows")]
 fn read_application_manifest(install_dir: &Path) -> Option<Manifest> {
     let bytes = fs::read(install_dir.join(APPLICATION_MANIFEST_FILE)).ok()?;
     Manifest::from_json(&bytes).ok()
@@ -661,7 +875,11 @@ fn read_application_manifest(install_dir: &Path) -> Option<Manifest> {
 
 /// Builds a safe baseline for installers created before application manifests were
 /// shipped by hashing only paths named by the target manifest.
-fn snapshot_application_files(install_dir: &Path, remote_manifest: &Manifest) -> io::Result<Manifest> {
+#[cfg(target_os = "windows")]
+fn snapshot_application_files(
+    install_dir: &Path,
+    remote_manifest: &Manifest,
+) -> io::Result<Manifest> {
     let mut files = Vec::new();
     for remote_file in &remote_manifest.files {
         let path = install_dir.join(&remote_file.path);
@@ -682,6 +900,7 @@ fn snapshot_application_files(install_dir: &Path, remote_manifest: &Manifest) ->
 }
 
 /// Reads the installed application version independently from the content version.
+#[cfg(target_os = "windows")]
 fn read_application_version() -> Option<String> {
     let install_dir = install_dir().ok()?;
     fs::read_to_string(install_dir.join(APPLICATION_VERSION_FILE))
@@ -691,8 +910,18 @@ fn read_application_version() -> Option<String> {
         .or_else(|| read_application_manifest(&install_dir).map(|manifest| manifest.version))
 }
 
+/// A macOS update replaces the app bundle but deliberately preserves downloaded
+/// content in Application Support. The bundle's baked version is authoritative.
+#[cfg(target_os = "macos")]
+fn current_application_version() -> Option<String> {
+    CONTENT_VERSION
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+}
+
 /// Returns the installed application version, falling back to the release baked
 /// into launchers that predate the application-version marker.
+#[cfg(target_os = "windows")]
 fn current_application_version() -> Option<String> {
     read_application_version().or_else(|| {
         CONTENT_VERSION
@@ -701,12 +930,36 @@ fn current_application_version() -> Option<String> {
     })
 }
 
+/// Returns the release baked into platforms without an independent application updater.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn current_application_version() -> Option<String> {
+    CONTENT_VERSION
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+}
+
 /// Content is safe to load only when it was published for this application build.
 fn content_matches_application(application_version: Option<&str>, content_version: &str) -> bool {
     application_version == Some(content_version)
 }
 
+/// Resolves the immutable content release that belongs to this application.
+/// A newer platform release may move the public pointer, but cannot make an older
+/// launcher consume media authored for a different application version.
+fn content_release_for_application(published: Latest, application_version: Option<&str>) -> Latest {
+    match application_version {
+        Some(version) if version != published.version => Latest {
+            version: version.to_string(),
+            manifest: format!("dist/manifest-{version}.json"),
+            blobs: default_blobs(),
+            release_notes: None,
+        },
+        _ => published,
+    }
+}
+
 /// Returns whether embedded content uses the same version as its application release.
+#[cfg(any(target_os = "windows", test))]
 fn application_release_is_coherent(update: &ApplicationUpdate) -> bool {
     update
         .content
@@ -716,21 +969,29 @@ fn application_release_is_coherent(update: &ApplicationUpdate) -> bool {
 }
 
 /// Downloads a public update-channel object.
+#[cfg(target_os = "windows")]
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
-    ureq::get(url).call()?.into_reader().read_to_end(&mut bytes)?;
+    ureq::get(url)
+        .call()?
+        .into_reader()
+        .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
 /// Public application blob source. Manifest signatures authenticate every expected
 /// blob hash before this source is used.
+#[cfg(target_os = "windows")]
 struct PublicHttpBlobs {
     base: String,
 }
 
+#[cfg(target_os = "windows")]
 impl BlobSource for PublicHttpBlobs {
     fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
-        let response = ureq::get(&format!("{}{}", self.base, sha256)).call().map_err(io::Error::other)?;
+        let response = ureq::get(&format!("{}{}", self.base, sha256))
+            .call()
+            .map_err(io::Error::other)?;
         let mut bytes = Vec::new();
         response.into_reader().read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -739,6 +1000,7 @@ impl BlobSource for PublicHttpBlobs {
 
 /// Starts the installed helper outside the launcher's Windows job so it can wait
 /// for this process to exit and then promote the staged launcher.
+#[cfg(target_os = "windows")]
 fn start_update_helper(relaunch: bool) -> io::Result<()> {
     let install_dir = install_dir()?;
     let helper = install_dir.join(UPDATE_HELPER_FILE_NAME);
@@ -758,6 +1020,7 @@ fn start_update_helper(relaunch: bool) -> io::Result<()> {
 }
 
 /// Completes a previously interrupted launcher handoff before any window appears.
+#[cfg(target_os = "windows")]
 fn hand_off_pending_launcher_update() -> bool {
     let Ok(install_dir) = install_dir() else {
         return false;
@@ -768,7 +1031,9 @@ fn hand_off_pending_launcher_update() -> bool {
     match start_update_helper(true) {
         Ok(()) => true,
         Err(error) => {
-            log_line(&format!("[launcher] couldn't resume the staged launcher update: {error}"));
+            log_line(&format!(
+                "[launcher] couldn't resume the staged launcher update: {error}"
+            ));
             false
         }
     }
@@ -783,13 +1048,11 @@ fn scan_and_prompt(handle: &tauri::AppHandle) {
 
     // An application update supersedes content, but nothing is downloaded until
     // the user approves it. Discovery failures fall through to the content flow.
-    if let Some(update) = check_application_update() {
+    if let Some(version) = check_application_update(handle) {
         log_line(&format!(
-            "[launcher] application update available: {}",
-            update.version
+            "[launcher] application update available: {version}"
         ));
-        *PENDING_APPLICATION_UPDATE.lock().unwrap() = Some(update.clone());
-        show_application_update(handle, &update.version);
+        show_application_update(handle, &version);
         return;
     }
 
@@ -819,13 +1082,11 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
     };
 
     match fetch_latest(&base) {
-        Ok(latest) => {
+        Ok(published) => {
             let application_version = current_application_version();
+            let latest = content_release_for_application(published, application_version.as_deref());
             // Fail closed before offering either first install or update.
-            if !content_matches_application(
-                application_version.as_deref(),
-                &latest.version,
-            ) {
+            if !content_matches_application(application_version.as_deref(), &latest.version) {
                 let installed_matches_application = content_matches_application(
                     application_version.as_deref(),
                     installed_version.as_deref().unwrap_or_default(),
@@ -881,7 +1142,9 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
             }
         }
         Err(err) => {
-            log_line(&format!("[launcher] update check failed ({err}); offering to play installed."));
+            log_line(&format!(
+                "[launcher] update check failed ({err}); offering to play installed."
+            ));
             if installed_present {
                 show_up_to_date(handle, installed_version.as_deref().unwrap_or("installed"));
             }
@@ -901,20 +1164,23 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
         show_update_signin(handle);
         return;
     };
-    let remote: Option<Manifest> = match fetch_json(&format!("{base}{}", latest.manifest), Some(&token)) {
-        Ok(remote) => Some(remote),
-        Err(err) if is_authorization_required(err.as_ref()) => {
-            clear_token();
-            show_update_signin(handle);
-            return;
-        }
-        Err(_) => None,
-    };
+    let remote: Option<Manifest> =
+        match fetch_json(&format!("{base}{}", latest.manifest), Some(&token)) {
+            Ok(remote) => Some(remote),
+            Err(err) if is_authorization_required(err.as_ref()) => {
+                clear_token();
+                show_update_signin(handle);
+                return;
+            }
+            Err(_) => None,
+        };
     let bytes = match &remote {
         Some(remote) => {
             let local = read_local_manifest(content_dir).or_else(|| {
-                read_installed_version(content_dir)
-                    .and_then(|v| fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), Some(&token)).ok())
+                read_installed_version(content_dir).and_then(|v| {
+                    fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), Some(&token))
+                        .ok()
+                })
             });
             let plan = diff(local.as_ref(), remote);
             plan.download_size()
@@ -940,11 +1206,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
 }
 
 /// Builds the content-update confirmation screen with optional release notes.
-fn update_available_screen(
-    detail: &str,
-    notes: Option<&ReleaseNotes>,
-    buttons: &str,
-) -> String {
+fn update_available_screen(detail: &str, notes: Option<&ReleaseNotes>, buttons: &str) -> String {
     let release_notes = notes.map(render_release_notes).unwrap_or_default();
     render_with_content("Update available", false, detail, &release_notes, buttons)
 }
@@ -1004,7 +1266,10 @@ fn render_release_notes(notes: &ReleaseNotes) -> String {
 fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
     match do_update(handle, base, latest) {
         Ok(fetched) => {
-            log_line(&format!("[launcher] update to {} complete ({fetched} files).", latest.version));
+            log_line(&format!(
+                "[launcher] update to {} complete ({fetched} files).",
+                latest.version
+            ));
             update_progress(handle, 100, "Update complete.");
             // Let the filled bar sit a beat, then land on the up-to-date screen.
             thread::sleep(Duration::from_millis(900));
@@ -1014,7 +1279,11 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
             // A missing manifest/blob during an update means the channel is
             // unreachable or misconfigured — NOT that this version is retired.
             log_line("[launcher] update content unavailable (404 from channel).");
-            update_progress(handle, 0, "Update failed — content unavailable. Please try again later.");
+            update_progress(
+                handle,
+                0,
+                "Update failed — content unavailable. Please try again later.",
+            );
         }
         Err(err) if is_authorization_required(err.as_ref()) => {
             log_line("[launcher] update authorization expired; requesting ownership verification.");
@@ -1028,15 +1297,20 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
     }
 }
 
-fn do_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) -> Result<usize, Box<dyn std::error::Error>> {
+fn do_update(
+    handle: &tauri::AppHandle,
+    base: &str,
+    latest: &Latest,
+) -> Result<usize, Box<dyn std::error::Error>> {
     let content_dir = install_dir()?.join("Content");
     let token = SESSION.lock().unwrap().clone();
     update_progress(handle, 0, "Checking what changed…");
 
     let remote: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
     let local = read_local_manifest(&content_dir).or_else(|| {
-        read_installed_version(&content_dir)
-            .and_then(|v| fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), token.as_deref()).ok())
+        read_installed_version(&content_dir).and_then(|v| {
+            fetch_json::<Manifest>(&format!("{base}dist/manifest-{v}.json"), token.as_deref()).ok()
+        })
     });
 
     let plan = diff(local.as_ref(), &remote);
@@ -1046,7 +1320,11 @@ fn do_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) -> Result<u
     }
     let changed = plan.changed.len();
     let bytes = plan.download_size();
-    update_progress(handle, 5, &format!("Downloading {changed} files, {}", human_bytes(bytes)));
+    update_progress(
+        handle,
+        5,
+        &format!("Downloading {changed} files, {}", human_bytes(bytes)),
+    );
 
     let blobs = HttpBlobs {
         base: format!("{base}{}", latest.blobs),
@@ -1076,7 +1354,12 @@ impl BlobSource for HttpBlobs {
         }
         let response = match request.call() {
             Ok(response) => response,
-            Err(ureq::Error::Status(401 | 403, _)) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, AuthorizationRequired)),
+            Err(ureq::Error::Status(401 | 403, _)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    AuthorizationRequired,
+                ))
+            }
             Err(other) => return Err(io::Error::other(other.to_string())),
         };
         // Stream in chunks so the progress bar fills smoothly through a large
@@ -1102,7 +1385,11 @@ impl BlobSource for HttpBlobs {
                 update_progress(
                     &self.handle,
                     percent,
-                    &format!("Downloading update… {} / {}", human_bytes(done), human_bytes(self.total)),
+                    &format!(
+                        "Downloading update… {} / {}",
+                        human_bytes(done),
+                        human_bytes(self.total)
+                    ),
                 );
             }
         }
@@ -1116,21 +1403,36 @@ fn start_install(handle: tauri::AppHandle, url: String) {
     show_progress_ui(&handle);
     thread::spawn(move || match install_content(&handle, &url) {
         Ok(content_dir) => {
-            log_line(&format!("[launcher] Content installed to {}", content_dir.display()));
-            if let (Some(base), Some(version)) = (content_base(), CONTENT_VERSION.filter(|v| !v.is_empty())) {
+            log_line(&format!(
+                "[launcher] Content installed to {}",
+                content_dir.display()
+            ));
+            if let (Some(base), Some(version)) =
+                (content_base(), CONTENT_VERSION.filter(|v| !v.is_empty()))
+            {
                 let token = SESSION.lock().unwrap().clone();
-                if let Ok(manifest) = fetch_json::<Manifest>(&format!("{base}dist/manifest-{version}.json"), token.as_deref()) {
+                if let Ok(manifest) = fetch_json::<Manifest>(
+                    &format!("{base}dist/manifest-{version}.json"),
+                    token.as_deref(),
+                ) {
                     let _ = store_manifest_and_version(&content_dir, &manifest, version);
                 }
             }
             update_progress(&handle, 100, "Starting game…");
             match launch_game() {
                 Ok(true) => handle.exit(0),
-                Ok(false) => show_message(&handle, "Installed", "The game is ready to play.", Some(("Launch Game", "play"))),
+                Ok(false) => show_message(
+                    &handle,
+                    "Installed",
+                    "The game is ready to play.",
+                    Some(("Launch Game", "play")),
+                ),
                 Err(err) => log_line(&format!("[launcher] failed to start the game: {err}")),
             }
         }
-        Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => show_update_required_ui(&handle),
+        Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
+            show_update_required_ui(&handle)
+        }
         Err(err) => {
             log_line(&format!("[launcher] failed to install Content: {err}"));
             update_progress(&handle, 0, "Download failed — see launcher.log");
@@ -1164,7 +1466,9 @@ fn clear_token() {
         let path = base.join(SESSION_FILE);
         if let Err(err) = fs::remove_file(path) {
             if err.kind() != io::ErrorKind::NotFound {
-                log_line(&format!("[launcher] couldn't remove the expired session: {err}"));
+                log_line(&format!(
+                    "[launcher] couldn't remove the expired session: {err}"
+                ));
             }
         }
     }
@@ -1230,7 +1534,13 @@ fn content_base() -> Option<String> {
     CONTENT_BASE
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(|v| if v.ends_with('/') { v.to_string() } else { format!("{v}/") })
+        .map(|v| {
+            if v.ends_with('/') {
+                v.to_string()
+            } else {
+                format!("{v}/")
+            }
+        })
 }
 
 fn auth_base() -> String {
@@ -1255,20 +1565,28 @@ fn fetch_latest(base: &str) -> Result<Latest, Box<dyn std::error::Error>> {
     fetch_json(&format!("{base}dist/latest.json"), None)
 }
 
-fn fetch_json<T: serde::de::DeserializeOwned>(url: &str, token: Option<&str>) -> Result<T, Box<dyn std::error::Error>> {
+fn fetch_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    token: Option<&str>,
+) -> Result<T, Box<dyn std::error::Error>> {
     let body = fetch_channel_bytes(url, token)?;
     Ok(serde_json::from_slice(&body)?)
 }
 
 /// Fetches bytes from the release channel with optional ownership authorization.
-fn fetch_channel_bytes(url: &str, token: Option<&str>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn fetch_channel_bytes(
+    url: &str,
+    token: Option<&str>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut request = ureq::get(url).timeout(Duration::from_secs(20));
     if let Some(token) = token {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
     let response = request.call().map_err(|err| match err {
         ureq::Error::Status(404, _) => Box::new(ContentUnavailable) as Box<dyn std::error::Error>,
-        ureq::Error::Status(401 | 403, _) => Box::new(AuthorizationRequired) as Box<dyn std::error::Error>,
+        ureq::Error::Status(401 | 403, _) => {
+            Box::new(AuthorizationRequired) as Box<dyn std::error::Error>
+        }
         other => Box::new(other),
     })?;
     let mut body = Vec::new();
@@ -1287,7 +1605,11 @@ fn read_local_manifest(content_dir: &Path) -> Option<Manifest> {
     Manifest::from_json(&fs::read(content_dir.join(CONTENT_MANIFEST_FILE)).ok()?).ok()
 }
 
-fn store_manifest_and_version(content_dir: &Path, manifest: &Manifest, version: &str) -> io::Result<()> {
+fn store_manifest_and_version(
+    content_dir: &Path,
+    manifest: &Manifest,
+    version: &str,
+) -> io::Result<()> {
     let json = serde_json::to_vec(manifest).map_err(|err| io::Error::other(err.to_string()))?;
     fs::write(content_dir.join(CONTENT_MANIFEST_FILE), json)?;
     fs::write(content_dir.join(CONTENT_VERSION_FILE), version)?;
@@ -1324,7 +1646,9 @@ fn window_eval(handle: &tauri::AppHandle, js: &str) {
 }
 
 fn js_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', " ")
+    text.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', " ")
 }
 
 fn html_escape(text: &str) -> String {
@@ -1350,10 +1674,18 @@ fn render_with_content(
     content: &str,
     buttons: &str,
 ) -> String {
-    let spin = if spinner { r#"<div class="spin"></div>"# } else { "" };
+    let spin = if spinner {
+        r#"<div class="spin"></div>"#
+    } else {
+        ""
+    };
     let kicker = html_escape(kicker);
     let status = html_escape(status);
-    let card_class = if content.is_empty() { "card" } else { "card has-content" };
+    let card_class = if content.is_empty() {
+        "card"
+    } else {
+        "card has-content"
+    };
     format!(
         r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:min(94vw,440px);height:min(560px,92vh);overflow:hidden;padding:40px 34px 30px;background:rgba(16,22,43,.72);border:1px solid rgba(120,160,255,.18);border-radius:18px;backdrop-filter:blur(14px);box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 18px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.has-content .sub{{margin-bottom:0}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.has-content .p:empty{{margin:0}}.release-changes{{min-height:0;overflow-y:auto;padding-right:8px;text-align:left;scrollbar-color:#59637b rgba(255,255,255,.06);scrollbar-width:thin}}.release-changes::-webkit-scrollbar{{width:7px}}.release-changes::-webkit-scrollbar-track{{background:rgba(255,255,255,.06);border-radius:4px}}.release-changes::-webkit-scrollbar-thumb{{background:#59637b;border-radius:4px}}.patch-title{{margin:0 0 9px;color:#e8ecf6;font-size:13px}}.save-warning{{margin:0 0 16px;color:#ff3434;font-size:12px;font-weight:900;line-height:1.25;text-align:center;text-transform:uppercase;letter-spacing:.025em}}.changes+.changes{{margin-top:9px}}.changes h2{{margin:0 0 3px;color:#b9c2da;font-size:9px;text-transform:uppercase}}.changes ul{{margin:0;padding-left:18px;color:#cbd2e3;font-size:11px;line-height:1.45}}.changes li+li{{margin-top:5px}}.btns{{flex:none;margin-top:0}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="{card_class}"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="sub" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div>{content}<div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
         kicker = kicker,
@@ -1366,7 +1698,10 @@ fn render_with_content(
 }
 
 fn button(label: &str, choice: &str) -> String {
-    format!("<a class=\"b primary\" href=\"{}?choice={}\">{}</a>", ACT, choice, label)
+    format!(
+        "<a class=\"b primary\" href=\"{}?choice={}\">{}</a>",
+        ACT, choice, label
+    )
 }
 
 fn disabled_button(label: &str) -> String {
@@ -1375,7 +1710,10 @@ fn disabled_button(label: &str) -> String {
 
 fn write_screen(handle: &tauri::AppHandle, html: &str) {
     let esc = js_escape(html);
-    window_eval(handle, &format!("document.open();document.write('{esc}');document.close();"));
+    window_eval(
+        handle,
+        &format!("document.open();document.write('{esc}');document.close();"),
+    );
 }
 
 /// Initial spinner screen \u{2014} Launch Game shown but disabled until the check finishes.
@@ -1393,11 +1731,20 @@ fn show_status_page(handle: &tauri::AppHandle) {
 
 /// A result screen: kicker + status + one enabled action button.
 fn show_result(handle: &tauri::AppHandle, kicker: &str, status: &str, label: &str, choice: &str) {
-    write_screen(handle, &render(kicker, false, status, &button(label, choice)));
+    write_screen(
+        handle,
+        &render(kicker, false, status, &button(label, choice)),
+    );
 }
 
 fn show_up_to_date(handle: &tauri::AppHandle, _version: &str) {
-    show_result(handle, "Up to date", "You\u{2019}re on the latest version.", "Launch Game", "play");
+    show_result(
+        handle,
+        "Up to date",
+        "You\u{2019}re on the latest version.",
+        "Launch Game",
+        "play",
+    );
 }
 
 fn show_ready_to_install(handle: &tauri::AppHandle, _version: Option<&str>) {
@@ -1419,7 +1766,7 @@ fn show_application_update(handle: &tauri::AppHandle, version: &str) {
 fn application_update_screen(version: &str) -> String {
     let buttons = format!(
         "<a class=\"b primary\" href=\"{a}?choice=application-update\">Install Update</a>\
-         <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
+         <a class=\"b secondary\" href=\"{a}?choice=skip-application-update\">Not Now</a>",
         a = ACT,
     );
     render(
@@ -1438,23 +1785,38 @@ fn show_update_signin(handle: &tauri::AppHandle) {
     );
     write_screen(
         handle,
-        &render("Sign in required", false, "Verify ownership to download this update.", &buttons),
+        &render(
+            "Sign in required",
+            false,
+            "Verify ownership to download this update.",
+            &buttons,
+        ),
     );
 }
 
 /// A plain message screen: kicker + status + an optional single action button.
-fn show_message(handle: &tauri::AppHandle, kicker: &str, status: &str, action: Option<(&str, &str)>) {
+fn show_message(
+    handle: &tauri::AppHandle,
+    kicker: &str,
+    status: &str,
+    action: Option<(&str, &str)>,
+) {
     let btn = action.map(|(l, c)| button(l, c)).unwrap_or_default();
     write_screen(handle, &render(kicker, false, status, &btn));
 }
 
 fn show_progress_ui(handle: &tauri::AppHandle) {
-    write_screen(handle, &render("Updating", false, "Preparing update\u{2026}", ""));
+    write_screen(
+        handle,
+        &render("Updating", false, "Preparing update\u{2026}", ""),
+    );
     update_progress(handle, 0, "Preparing update\u{2026}");
 }
 
 fn show_update_required_ui(handle: &tauri::AppHandle) {
-    log_line(&format!("[launcher] update required \u{2014} see {RELEASES_URL}"));
+    log_line(&format!(
+        "[launcher] update required \u{2014} see {RELEASES_URL}"
+    ));
     show_message(
         handle,
         "Update required",
@@ -1466,14 +1828,20 @@ fn show_update_required_ui(handle: &tauri::AppHandle) {
 fn update_status(handle: &tauri::AppHandle, label: &str) {
     window_eval(
         handle,
-        &format!("window.rebSetStatus&&window.rebSetStatus('{}');", js_escape(label)),
+        &format!(
+            "window.rebSetStatus&&window.rebSetStatus('{}');",
+            js_escape(label)
+        ),
     );
 }
 
 fn update_progress(handle: &tauri::AppHandle, percent: u64, label: &str) {
     window_eval(
         handle,
-        &format!("window.rebSetProgress&&window.rebSetProgress({percent},'{}');", js_escape(label)),
+        &format!(
+            "window.rebSetProgress&&window.rebSetProgress({percent},'{}');",
+            js_escape(label)
+        ),
     );
 }
 
@@ -1507,13 +1875,22 @@ fn macos_data_dir(home: &Path) -> PathBuf {
 #[cfg(any(target_os = "macos", test))]
 fn macos_bundle_contents_dir(executable: &Path) -> io::Result<PathBuf> {
     let macos_directory = executable.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "launcher executable has no parent directory")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "launcher executable has no parent directory",
+        )
     })?;
     let contents_directory = macos_directory.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "launcher bundle has no Contents directory")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "launcher bundle has no Contents directory",
+        )
     })?;
     if macos_directory.file_name().and_then(|name| name.to_str()) != Some("MacOS")
-        || contents_directory.file_name().and_then(|name| name.to_str()) != Some("Contents")
+        || contents_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("Contents")
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1538,13 +1915,20 @@ fn game_path() -> io::Result<PathBuf> {
 fn log_line(message: &str) {
     println!("{message}");
     if let Ok(base) = install_dir() {
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(base.join("launcher.log")) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(base.join("launcher.log"))
+        {
             let _ = writeln!(file, "{message}");
         }
     }
 }
 
-fn install_content(handle: &tauri::AppHandle, url: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn install_content(
+    handle: &tauri::AppHandle,
+    url: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let base = install_dir()?;
     let archive_path = base.join("content.zip.part");
     let content_dir = base.join("Content");
@@ -1555,7 +1939,10 @@ fn install_content(handle: &tauri::AppHandle, url: &str) -> Result<PathBuf, Box<
         Err(ureq::Error::Status(404, _)) => return Err(Box::new(ContentUnavailable)),
         Err(other) => return Err(Box::new(other)),
     };
-    let total: u64 = response.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let total: u64 = response
+        .header("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let mut reader = response.into_reader();
     let mut file = fs::File::create(&archive_path)?;
@@ -1586,13 +1973,20 @@ fn install_content(handle: &tauri::AppHandle, url: &str) -> Result<PathBuf, Box<
             last_time = now;
             last_bytes = downloaded;
             let gb = downloaded as f64 / gib;
-            let pct = downloaded.saturating_mul(100).checked_div(total).unwrap_or(0);
+            let pct = downloaded
+                .saturating_mul(100)
+                .checked_div(total)
+                .unwrap_or(0);
             let amount = if total > 0 {
                 format!("{gb:.2} / {total_gb:.2} GB")
             } else {
                 format!("{gb:.2} GB")
             };
-            update_progress(handle, pct, &format!("Downloading Content… {amount} — {speed:.1} MB/s"));
+            update_progress(
+                handle,
+                pct,
+                &format!("Downloading Content… {amount} — {speed:.1} MB/s"),
+            );
         }
     }
     file.sync_all()?;
@@ -1616,7 +2010,10 @@ fn launch_game() -> io::Result<bool> {
     let base = install_dir()?;
     let exe = game_path()?;
     if !exe.exists() {
-        log_line(&format!("[launcher] game exe not found at {}", exe.display()));
+        log_line(&format!(
+            "[launcher] game exe not found at {}",
+            exe.display()
+        ));
         return Ok(false);
     }
     log_line(&format!("[launcher] launching {}", exe.display()));
@@ -1630,7 +2027,9 @@ fn launch_game() -> io::Result<bool> {
         .spawn()?;
 
     #[cfg(target_os = "linux")]
-    std::process::Command::new(&exe).current_dir(&base).spawn()?;
+    std::process::Command::new(&exe)
+        .current_dir(&base)
+        .spawn()?;
 
     // On Windows the launcher runs inside a WebView2 job object that kills child
     // processes when the launcher exits — so a plain spawn dies the moment we
@@ -1648,8 +2047,12 @@ fn launch_game() -> io::Result<bool> {
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
             .spawn();
         if let Err(err) = spawned {
-            log_line(&format!("[launcher] breakaway spawn failed ({err}); handing off to Explorer."));
-            std::process::Command::new("explorer.exe").arg(&exe).spawn()?;
+            log_line(&format!(
+                "[launcher] breakaway spawn failed ({err}); handing off to Explorer."
+            ));
+            std::process::Command::new("explorer.exe")
+                .arg(&exe)
+                .spawn()?;
         }
     }
     Ok(true)
@@ -1704,6 +2107,61 @@ mod tests {
     }
 
     #[test]
+    fn content_release_for_application_with_matching_version_keeps_published_pointer() {
+        let published = Latest {
+            version: "0.0.14".to_string(),
+            manifest: "dist/custom-manifest.json".to_string(),
+            blobs: "custom-blobs/".to_string(),
+            release_notes: Some(ReleaseNotesPointer {
+                path: "dist/release-notes-0.0.14.json".to_string(),
+                sha256: "digest".to_string(),
+            }),
+        };
+
+        let resolved = content_release_for_application(published, Some("0.0.14"));
+
+        assert_eq!(resolved.version, "0.0.14");
+        assert_eq!(resolved.manifest, "dist/custom-manifest.json");
+        assert_eq!(resolved.blobs, "custom-blobs/");
+        assert!(resolved.release_notes.is_some());
+    }
+
+    #[test]
+    fn content_release_for_application_with_newer_published_version_uses_immutable_matching_content(
+    ) {
+        let published = Latest {
+            version: "0.0.15".to_string(),
+            manifest: "dist/manifest-0.0.15.json".to_string(),
+            blobs: "blobs/".to_string(),
+            release_notes: Some(ReleaseNotesPointer {
+                path: "dist/release-notes-0.0.15.json".to_string(),
+                sha256: "digest".to_string(),
+            }),
+        };
+
+        let resolved = content_release_for_application(published, Some("0.0.14"));
+
+        assert_eq!(resolved.version, "0.0.14");
+        assert_eq!(resolved.manifest, "dist/manifest-0.0.14.json");
+        assert_eq!(resolved.blobs, "blobs/");
+        assert!(resolved.release_notes.is_none());
+    }
+
+    #[test]
+    fn content_release_for_application_without_application_version_keeps_published_pointer() {
+        let published = Latest {
+            version: "0.0.14".to_string(),
+            manifest: "dist/manifest-0.0.14.json".to_string(),
+            blobs: "blobs/".to_string(),
+            release_notes: None,
+        };
+
+        let resolved = content_release_for_application(published, None);
+
+        assert_eq!(resolved.version, "0.0.14");
+    }
+
+    #[test]
     fn application_update_with_embedded_content_keeps_versions_together() {
         let release: ApplicationUpdate = serde_json::from_str(
             r#"{
@@ -1720,6 +2178,9 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(release.manifest, "dist/application-manifest-0.0.11.json");
+        assert_eq!(release.blobs, "application-blobs/");
+        assert_eq!(release.signature, "signed");
         assert_eq!(release.content.as_ref().unwrap().version, "0.0.11");
         assert!(application_release_is_coherent(&release));
     }
@@ -1803,12 +2264,12 @@ mod tests {
     }
 
     #[test]
-    fn application_update_screen_with_available_update_offers_install_and_launch() {
+    fn application_update_screen_with_available_update_offers_install_and_skip() {
         let screen = application_update_screen("1.2.3");
 
         assert!(screen.contains("Version 1.2.3 is available. Install it now?"));
         assert!(screen.contains("choice=application-update\">Install Update"));
-        assert!(screen.contains("choice=play\">Launch Game"));
+        assert!(screen.contains("choice=skip-application-update\">Not Now"));
     }
 
     #[test]
@@ -1864,7 +2325,14 @@ mod tests {
 
     #[test]
     fn validate_application_manifest_with_managed_paths_returns_ok() {
-        let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "Rebellion2.exe"]);
+        let manifest = application_manifest(
+            "1.2.3",
+            &[
+                LAUNCHER_FILE_NAME,
+                UPDATE_HELPER_FILE_NAME,
+                "Rebellion2.exe",
+            ],
+        );
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_ok());
     }
@@ -1887,7 +2355,11 @@ mod tests {
     fn validate_application_manifest_with_content_path_returns_error() {
         let manifest = application_manifest(
             "1.2.3",
-            &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "Content/catalog.xml"],
+            &[
+                LAUNCHER_FILE_NAME,
+                UPDATE_HELPER_FILE_NAME,
+                "Content/catalog.xml",
+            ],
         );
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
@@ -1897,7 +2369,11 @@ mod tests {
     fn validate_application_manifest_with_lowercase_content_path_returns_error() {
         let manifest = application_manifest(
             "1.2.3",
-            &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "content/catalog.xml"],
+            &[
+                LAUNCHER_FILE_NAME,
+                UPDATE_HELPER_FILE_NAME,
+                "content/catalog.xml",
+            ],
         );
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
@@ -1914,7 +2390,11 @@ mod tests {
     fn validate_application_manifest_with_parent_traversal_returns_error() {
         let manifest = application_manifest(
             "1.2.3",
-            &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME, "../outside.txt"],
+            &[
+                LAUNCHER_FILE_NAME,
+                UPDATE_HELPER_FILE_NAME,
+                "../outside.txt",
+            ],
         );
 
         assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
@@ -1930,11 +2410,12 @@ mod tests {
 
     #[test]
     fn macos_bundle_contents_dir_returns_contents_directory() {
-        let executable = Path::new("/Applications/Rebellion2.app/Contents/MacOS/rebellion2-launcher");
+        let executable =
+            Path::new("/Applications/Rebellion II.app/Contents/MacOS/rebellion2-launcher");
 
         assert_eq!(
             macos_bundle_contents_dir(executable).unwrap(),
-            Path::new("/Applications/Rebellion2.app/Contents")
+            Path::new("/Applications/Rebellion II.app/Contents")
         );
     }
 

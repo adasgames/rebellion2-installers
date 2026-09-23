@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# Assemble the native launcher and Unity player into one draggable macOS app.
-# Usage: build-zip.sh <launcher.app> <player-dir> <version> <output.zip>
+# Package the complete, signed Tauri + Unity application as a draggable zip.
+# Usage: build-zip.sh <application.app> <version> <output.zip>
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-  echo "Usage: $0 <launcher.app> <player-dir> <version> <output.zip>" >&2
+if [ "$#" -ne 3 ]; then
+  echo "Usage: $0 <application.app> <version> <output.zip>" >&2
   exit 2
 fi
 
-LAUNCHER_APP="$1"
-PLAYER_DIR="$2"
-VERSION="$3"
-OUTFILE="$4"
+SOURCE_APP="$1"
+VERSION="$2"
+OUTFILE="$3"
 
-if [ ! -d "$LAUNCHER_APP/Contents/MacOS" ]; then
-  echo "Launcher app bundle not found at $LAUNCHER_APP" >&2
+if [ ! -d "$SOURCE_APP/Contents/MacOS" ]; then
+  echo "Application bundle not found at $SOURCE_APP" >&2
   exit 1
 fi
 
-GAME_APP="$(find "$PLAYER_DIR" -maxdepth 1 -type d -name '*.app' -print -quit)"
-if [ -z "$GAME_APP" ]; then
-  echo "No Unity .app bundle found in $PLAYER_DIR" >&2
-  exit 1
-fi
+GAME_APP="$SOURCE_APP/Contents/Resources/Rebellion2 Game.app"
 if [ ! -d "$GAME_APP/Contents/MacOS" ]; then
-  echo "Unity app bundle has no Contents/MacOS directory: $GAME_APP" >&2
+  echo "Complete application does not contain the Unity player: $GAME_APP" >&2
   exit 1
 fi
 
@@ -36,8 +31,7 @@ esac
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-APP="$WORK/Rebellion2.app"
-GAME_DESTINATION="$APP/Contents/Resources/Rebellion2 Game.app"
+APP="$WORK/$(basename "$SOURCE_APP")"
 
 copy_bundle() {
   local source="$1"
@@ -49,22 +43,11 @@ copy_bundle() {
   fi
 }
 
-copy_bundle "$LAUNCHER_APP" "$APP"
-mkdir -p "$(dirname "$GAME_DESTINATION")"
-copy_bundle "$GAME_APP" "$GAME_DESTINATION"
+copy_bundle "$SOURCE_APP" "$APP"
 
-# Artifact downloads do not preserve executable bits. Restore the launcher and
-# Unity entry points before creating the distributable archive.
-find "$APP/Contents/MacOS" -maxdepth 1 -type f -exec chmod +x {} \;
-find "$GAME_DESTINATION/Contents/MacOS" -maxdepth 1 -type f -exec chmod +x {} \;
-
-# The player was produced on Linux and the launcher bundle has just been changed,
-# so give both bundles valid ad-hoc signatures. Apple notarization can replace
-# these when release signing is introduced.
+# The updater archive and direct-download zip must contain the exact same signed
+# bundle. Do not modify it after Tauri creates the updater artifact.
 if command -v codesign >/dev/null 2>&1; then
-  xattr -cr "$APP"
-  codesign --force --deep --sign - "$GAME_DESTINATION"
-  codesign --force --deep --sign - "$APP"
   codesign --verify --deep --strict "$APP"
 fi
 

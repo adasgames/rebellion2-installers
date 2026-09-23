@@ -4,10 +4,12 @@ How the installers in this repo are produced. For players, see the [README](../R
 
 Separate GitHub Actions workflows build **asset-free** game players from
 [`rebellion2`](https://github.com/davidadas/rebellion2) and package the launcher in this
-repository. OS-specific tags select which platform to build. The Windows workflow publishes
-the shared update channel; the macOS workflow only attaches its archive to an existing release,
-keeping the expensive macOS runner opt-in. The packages ship **no art** — the launcher downloads
-content from the configured distribution service after ownership verification.
+repository. OS-specific tags select which platform to build. Windows and macOS publish separate
+application-update channels, so publishing one platform cannot strand the other. Both launchers
+resolve immutable media for their own application version rather than blindly following another
+platform's latest release. The expensive macOS runner remains opt-in. The packages ship **no art**
+— the launcher downloads content from the configured distribution service after ownership
+verification.
 
 The **Windows** and **macOS** legs are live. Linux remains parked.
 
@@ -17,9 +19,10 @@ The **Windows** and **macOS** legs are live. Linux remains parked.
 | macOS    | `Rebellion2-macOS.zip`                 | universal `.app` archive | live   |
 | Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`           | parked |
 
-The packages do not have platform signatures yet, which is why Windows and macOS warn on first
-launch. The release workflow does apply an Ed25519 signature used only by the launcher to verify
-automatic updates. Authenticode on Windows and notarization on macOS remain on the roadmap.
+The packages do not have trusted platform signatures yet, which is why Windows and macOS warn on
+first launch. Windows application manifests and macOS updater archives do have independent
+cryptographic signatures that the launchers verify before installing automatic updates.
+Authenticode on Windows and Apple Developer ID signing/notarization on macOS remain on the roadmap.
 
 ## Triggering a build
 
@@ -55,8 +58,18 @@ The workflows have three entry points, and the difference matters:
   The workflow verifies that the release and its immutable application/content artifacts exist
   before starting either expensive build. This permits a missed macOS build to be backfilled after
   the live channel has advanced. It then attaches `Rebellion2-macOS.zip` to that release without
-  changing the live release pointer. It also updates the prerelease `latest-macos` alias used by
-  the README's stable macOS download link.
+  changing the main release pointer. It updates the prerelease `latest-macos` alias used by the
+  README's stable macOS download link and the launcher's signed macOS update pointer only when the
+  build is not older than the current macOS release.
+
+- **Manual macOS dispatch — historical release/backfill.** Actions tab →
+  **Build macOS Installer** → **Run workflow**, then enter an existing version such as `0.0.14`.
+  The workflow verifies the immutable application and content artifacts for that version before it
+  builds anything. Manual runs upload workflow artifacts but do not alter a Release unless the
+  **publish** input is explicitly enabled. Publishing an older backfill attaches its versioned
+  assets without moving `latest-macos`; enable **allow_rollback** as well only for an intentional
+  emergency rollback. This is the supported way to publish the first auto-updating Mac build
+  without recreating an old source tag.
 
 ## Jobs
 
@@ -141,16 +154,21 @@ in `application.json` references the document without embedding its display text
 ```
 
 The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
-packaging job uses `macos-latest`; it builds the universal Tauri launcher, embeds the Unity player,
-verifies the archive, attaches it to the existing versioned release, and updates the stable
-`latest-macos` download alias.
+packaging job uses `macos-latest`; it embeds the Unity player before Tauri signs and packages the
+complete universal application, verifies both direct-download and updater archives, attaches them
+to the existing versioned release, and updates the stable `latest-macos` download alias. The alias
+contains `latest-macos.json`, while its signed updater URL points at the immutable versioned
+release. Existing Mac users may decline an application update and continue using media matching
+their installed application version.
 
 ## Private release configuration
 
 Release jobs depend on private source locations, service endpoints, storage credentials, signing
 material, and build credentials configured in GitHub Actions. Their values and operational setup
 are intentionally maintained outside this public repository. `GITHUB_TOKEN` is provided
-automatically and publishes the Release.
+automatically and publishes the Release. macOS updater builds require the
+`TAURI_SIGNING_PRIVATE_KEY` repository secret; its matching public key is committed in the Tauri
+configuration so installed launchers can reject forged updater archives.
 
 ## Layout
 
@@ -164,5 +182,5 @@ packaging/windows/rebellion2-launcher.iss  # Windows (Inno Setup) installer — 
 packaging/windows/rebellion2.nsi           # legacy NSIS script, unused by the current pipeline
 packaging/linux/build-appimage.sh          # AppDir assembly + appimagetool (parked)
 packaging/linux/rebellion2.desktop         # AppImage desktop entry (parked)
-packaging/macos/build-zip.sh               # launcher + Unity player -> one macOS app archive
+packaging/macos/build-zip.sh               # complete signed macOS app -> direct-download archive
 ```
