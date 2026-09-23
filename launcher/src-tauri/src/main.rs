@@ -2411,11 +2411,11 @@ mod tests {
     #[test]
     fn macos_bundle_contents_dir_returns_contents_directory() {
         let executable =
-            Path::new("/Applications/Rebellion2.app/Contents/MacOS/rebellion2-launcher");
+            Path::new("/Applications/Rebellion II.app/Contents/MacOS/rebellion2-launcher");
 
         assert_eq!(
             macos_bundle_contents_dir(executable).unwrap(),
-            Path::new("/Applications/Rebellion2.app/Contents")
+            Path::new("/Applications/Rebellion II.app/Contents")
         );
     }
 

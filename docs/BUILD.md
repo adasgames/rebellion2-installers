@@ -58,15 +58,18 @@ The workflows have three entry points, and the difference matters:
   The workflow verifies that the release and its immutable application/content artifacts exist
   before starting either expensive build. This permits a missed macOS build to be backfilled after
   the live channel has advanced. It then attaches `Rebellion2-macOS.zip` to that release without
-  changing the live release pointer. It also updates the prerelease `latest-macos` alias used by
-  the README's stable macOS download link and the launcher's signed macOS update pointer.
+  changing the main release pointer. It updates the prerelease `latest-macos` alias used by the
+  README's stable macOS download link and the launcher's signed macOS update pointer only when the
+  build is not older than the current macOS release.
 
 - **Manual macOS dispatch — historical release/backfill.** Actions tab →
   **Build macOS Installer** → **Run workflow**, then enter an existing version such as `0.0.14`.
   The workflow verifies the immutable application and content artifacts for that version before it
   builds anything. Manual runs upload workflow artifacts but do not alter a Release unless the
-  **publish** input is explicitly enabled. This is the supported way to publish the first
-  auto-updating Mac build without recreating an old source tag.
+  **publish** input is explicitly enabled. Publishing an older backfill attaches its versioned
+  assets without moving `latest-macos`; enable **allow_rollback** as well only for an intentional
+  emergency rollback. This is the supported way to publish the first auto-updating Mac build
+  without recreating an old source tag.
 
 ## Jobs
 

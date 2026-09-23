@@ -37,7 +37,7 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 
 ### macOS
 1. Unzip **`Rebellion2-macOS.zip`**.
-2. Drag **`Rebellion2.app`** into your **Applications** folder. The launcher and game are both
+2. Drag **`Rebellion II.app`** into your **Applications** folder. The launcher and game are both
    contained in that single app.
 3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
    double-click will be blocked — you only need the right-click trick once.)

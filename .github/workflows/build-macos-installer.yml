@@ -19,9 +19,14 @@ on:
         required: true
         default: false
         type: boolean
+      allow_rollback:
+        description: Allow latest-macos to move to an older version (emergency rollback only)
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
-  group: macos-release-${{ inputs.version || github.ref_name }}
+  group: macos-release
   cancel-in-progress: false
 
 jobs:
@@ -208,11 +213,12 @@ jobs:
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
           ditto -x -k Rebellion2-macOS.zip "$work"
-          test -x "$work/Rebellion2.app/Contents/MacOS/rebellion2-launcher"
-          test -d "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app"
-          test -n "$(find "$work/Rebellion2.app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
-          codesign --verify --deep --strict "$work/Rebellion2.app"
-          tar -tzf Rebellion2-macOS-updater.tar.gz | grep -Fq 'Rebellion II.app/Contents/Resources/Rebellion2 Game.app/'
+          app="$work/Rebellion II.app"
+          test -x "$app/Contents/MacOS/rebellion2-launcher"
+          test -d "$app/Contents/Resources/Rebellion2 Game.app"
+          test -n "$(find "$app/Contents/Resources/Rebellion2 Game.app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          codesign --verify --deep --strict "$app"
+          tar -tzf Rebellion2-macOS-updater.tar.gz | grep -F 'Rebellion II.app/Contents/Resources/Rebellion2 Game.app/' >/dev/null
 
       - name: Upload packaged applications
         if: github.event_name == 'workflow_dispatch' && !inputs.publish
@@ -232,13 +238,100 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           ALIAS_TAG: latest-macos
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
         run: |
           set -euo pipefail
+          update_alias=true
+          version_is_older() {
+            local candidate="${1%%+*}"
+            local current="${2%%+*}"
+            local candidate_core="${candidate%%-*}"
+            local current_core="${current%%-*}"
+            local candidate_pre=""
+            local current_pre=""
+            local candidate_major candidate_minor candidate_patch
+            local current_major current_minor current_patch
+            local index candidate_id current_id
+            local -a candidate_ids current_ids
+
+            if [[ "$candidate" == *-* ]]; then candidate_pre="${candidate#*-}"; fi
+            if [[ "$current" == *-* ]]; then current_pre="${current#*-}"; fi
+            IFS=. read -r candidate_major candidate_minor candidate_patch <<<"$candidate_core"
+            IFS=. read -r current_major current_minor current_patch <<<"$current_core"
+
+            for index in 1 2 3; do
+              case "$index" in
+                1) candidate_id="$candidate_major"; current_id="$current_major" ;;
+                2) candidate_id="$candidate_minor"; current_id="$current_minor" ;;
+                3) candidate_id="$candidate_patch"; current_id="$current_patch" ;;
+              esac
+              if ((10#$candidate_id < 10#$current_id)); then return 0; fi
+              if ((10#$candidate_id > 10#$current_id)); then return 1; fi
+            done
+
+            if [[ -z "$candidate_pre" ]]; then return 1; fi
+            if [[ -z "$current_pre" ]]; then return 0; fi
+            IFS=. read -r -a candidate_ids <<<"$candidate_pre"
+            IFS=. read -r -a current_ids <<<"$current_pre"
+            index=0
+            while ((index < ${#candidate_ids[@]} || index < ${#current_ids[@]})); do
+              if ((index >= ${#candidate_ids[@]})); then return 0; fi
+              if ((index >= ${#current_ids[@]})); then return 1; fi
+              candidate_id="${candidate_ids[$index]}"
+              current_id="${current_ids[$index]}"
+              if [[ "$candidate_id" == "$current_id" ]]; then
+                ((index += 1))
+                continue
+              fi
+              if [[ "$candidate_id" =~ ^[0-9]+$ && "$current_id" =~ ^[0-9]+$ ]]; then
+                ((10#$candidate_id < 10#$current_id)) && return 0
+                return 1
+              fi
+              if [[ "$candidate_id" =~ ^[0-9]+$ ]]; then return 0; fi
+              if [[ "$current_id" =~ ^[0-9]+$ ]]; then return 1; fi
+              [[ "$candidate_id" < "$current_id" ]] && return 0
+              return 1
+            done
+            return 1
+          }
+
+          if gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            current_dir="$(mktemp -d)"
+            trap 'rm -rf "$current_dir"' EXIT
+            current_version=""
+            if gh release download "$ALIAS_TAG" \
+              --pattern latest-macos.json \
+              --dir "$current_dir" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              current_version="$(jq -r .version "$current_dir/latest-macos.json")"
+            else
+              alias_name="$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json name --jq .name)"
+              current_version="$(sed -nE 's/^Latest Rebellion 2 macOS build \(v([^)]*)\)$/\1/p' <<<"$alias_name")"
+            fi
+            if [[ -z "$current_version" ]]; then
+              echo "Unable to determine the current latest-macos version." >&2
+              exit 1
+            fi
+            if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "The current latest-macos version is invalid: $current_version" >&2
+              exit 1
+            fi
+            if version_is_older "$VERSION" "$current_version" && [[ "$ALLOW_ROLLBACK" != "true" ]]; then
+              echo "Publishing $VERSION without moving latest-macos backward from $current_version."
+              echo "For an intentional emergency rollback, manually dispatch with allow_rollback enabled."
+              update_alias=false
+            fi
+          fi
+
           gh release upload "$RELEASE_TAG" \
             Rebellion2-macOS.zip \
             Rebellion2-macOS-updater.tar.gz \
             --clobber \
             --repo "$GITHUB_REPOSITORY"
+
+          if [[ "$update_alias" != "true" ]]; then
+            exit 0
+          fi
 
           if gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             test "$(gh release view "$ALIAS_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false

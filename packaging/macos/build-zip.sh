@@ -31,7 +31,7 @@ esac
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-APP="$WORK/Rebellion2.app"
+APP="$WORK/$(basename "$SOURCE_APP")"
 
 copy_bundle() {
   local source="$1"
