@@ -1155,13 +1155,14 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
 /// Requests authorization when necessary, then computes the update size and prompts.
 fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content_dir: &Path) {
     let token = SESSION.lock().unwrap().clone();
+    let release_notes = fetch_release_notes(base, latest);
     *PENDING.lock().unwrap() = Some(Pending::Update {
         base: base.to_string(),
         latest: latest.clone(),
     });
 
     let Some(token) = token else {
-        show_update_signin(handle);
+        show_update_signin(handle, release_notes.as_ref());
         return;
     };
     let remote: Option<Manifest> =
@@ -1169,7 +1170,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
             Ok(remote) => Some(remote),
             Err(err) if is_authorization_required(err.as_ref()) => {
                 clear_token();
-                show_update_signin(handle);
+                show_update_signin(handle, release_notes.as_ref());
                 return;
             }
             Err(_) => None,
@@ -1198,7 +1199,6 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
          <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
         a = ACT,
     );
-    let release_notes = fetch_release_notes(base, latest);
     write_screen(
         handle,
         &update_available_screen(&detail, release_notes.as_ref(), &buttons),
@@ -1288,7 +1288,8 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest) {
         Err(err) if is_authorization_required(err.as_ref()) => {
             log_line("[launcher] update authorization expired; requesting ownership verification.");
             clear_token();
-            show_update_signin(handle);
+            let release_notes = fetch_release_notes(base, latest);
+            show_update_signin(handle, release_notes.as_ref());
         }
         Err(err) => {
             log_line(&format!("[launcher] update failed: {err}"));
@@ -1759,39 +1760,60 @@ fn show_ready_to_install(handle: &tauri::AppHandle, _version: Option<&str>) {
 
 /// Offers an available application update without beginning its download.
 fn show_application_update(handle: &tauri::AppHandle, version: &str) {
-    write_screen(handle, &application_update_screen(version));
+    let release_notes = fetch_current_release_notes(version);
+    write_screen(
+        handle,
+        &application_update_screen(version, release_notes.as_ref()),
+    );
 }
 
 /// Builds the confirmation screen shown before an application update downloads.
-fn application_update_screen(version: &str) -> String {
+fn application_update_screen(version: &str, notes: Option<&ReleaseNotes>) -> String {
     let buttons = format!(
         "<a class=\"b primary\" href=\"{a}?choice=application-update\">Install Update</a>\
          <a class=\"b secondary\" href=\"{a}?choice=skip-application-update\">Not Now</a>",
         a = ACT,
     );
-    render(
+    let release_notes = notes.map(render_release_notes).unwrap_or_default();
+    render_with_content(
         "Update available",
         false,
         &format!("Version {version} is available. Install it now?"),
+        &release_notes,
         &buttons,
     )
 }
 
-fn show_update_signin(handle: &tauri::AppHandle) {
+/// Fetches notes for the currently published release when it matches an update prompt.
+fn fetch_current_release_notes(version: &str) -> Option<ReleaseNotes> {
+    let base = content_base()?;
+    let latest = fetch_latest(&base).ok()?;
+    if latest.version != version {
+        return None;
+    }
+    fetch_release_notes(&base, &latest)
+}
+
+/// Shows the ownership prompt without hiding the update's release notes.
+fn show_update_signin(handle: &tauri::AppHandle, notes: Option<&ReleaseNotes>) {
+    write_screen(handle, &update_signin_screen(notes));
+}
+
+/// Builds the ownership prompt shown before protected update content downloads.
+fn update_signin_screen(notes: Option<&ReleaseNotes>) -> String {
     let buttons = format!(
         "<a class=\"b primary\" href=\"{a}?choice=signin\">Sign in &amp; Update</a>\
          <a class=\"b secondary\" href=\"{a}?choice=play\">Launch Game</a>",
         a = ACT,
     );
-    write_screen(
-        handle,
-        &render(
-            "Sign in required",
-            false,
-            "Verify ownership to download this update.",
-            &buttons,
-        ),
-    );
+    let release_notes = notes.map(render_release_notes).unwrap_or_default();
+    render_with_content(
+        "Sign in required",
+        false,
+        "Verify ownership to download this update.",
+        &release_notes,
+        &buttons,
+    )
 }
 
 /// A plain message screen: kicker + status + an optional single action button.
@@ -2265,7 +2287,7 @@ mod tests {
 
     #[test]
     fn application_update_screen_with_available_update_offers_install_and_skip() {
-        let screen = application_update_screen("1.2.3");
+        let screen = application_update_screen("1.2.3", None);
 
         assert!(screen.contains("Version 1.2.3 is available. Install it now?"));
         assert!(screen.contains("choice=application-update\">Install Update"));
@@ -2273,14 +2295,31 @@ mod tests {
     }
 
     #[test]
+    fn application_update_screen_with_release_notes_displays_release_content() {
+        let notes = release_notes();
+
+        let screen = application_update_screen("1.2.3", Some(&notes));
+
+        assert!(screen.contains("Patch Notes"));
+        assert!(screen.contains("Fixes"));
+        assert!(screen.contains("Fixed update handling."));
+    }
+
+    #[test]
+    fn update_signin_screen_with_release_notes_displays_release_content() {
+        let notes = release_notes();
+
+        let screen = update_signin_screen(Some(&notes));
+
+        assert!(screen.contains("Verify ownership to download this update."));
+        assert!(screen.contains("Patch Notes"));
+        assert!(screen.contains("Fixed update handling."));
+        assert!(screen.contains("choice=signin\">Sign in &amp; Update"));
+    }
+
+    #[test]
     fn update_available_screen_with_release_notes_displays_release_content() {
-        let notes = ReleaseNotes {
-            version: "1.2.3".to_string(),
-            sections: vec![ReleaseNoteSection {
-                title: "Fixes".to_string(),
-                items: vec!["Fixed update handling.".to_string()],
-            }],
-        };
+        let notes = release_notes();
         let screen = update_available_screen(
             "An update is available.",
             Some(&notes),
@@ -2422,5 +2461,15 @@ mod tests {
     #[test]
     fn macos_bundle_contents_dir_rejects_unbundled_executable() {
         assert!(macos_bundle_contents_dir(Path::new("/tmp/rebellion2-launcher")).is_err());
+    }
+
+    fn release_notes() -> ReleaseNotes {
+        ReleaseNotes {
+            version: "1.2.3".to_string(),
+            sections: vec![ReleaseNoteSection {
+                title: "Fixes".to_string(),
+                items: vec!["Fixed update handling.".to_string()],
+            }],
+        }
     }
 }
