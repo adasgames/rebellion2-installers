@@ -91,15 +91,22 @@ jobs:
           PROXY_HOST="${PROXY#https://}"
           STORAGE_HOST="${STORAGE_ENDPOINT#https://}"
           git config lfs.url "https://${STORAGE_ACCESS_KEY_ID}:${STORAGE_SECRET_ACCESS_KEY}@${PROXY_HOST}/${STORAGE_HOST}/${STORAGE_BUCKET}"
-          for attempt in 1 2 3; do
+          # Keep concurrent release jobs from overwhelming the shared LFS proxy.
+          git config lfs.concurrenttransfers 4
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
             if git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""; then
               break
             fi
-            if [ "$attempt" -eq 3 ]; then
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "Asset fetch failed after ${max_attempts} attempts." >&2
               exit 1
             fi
-            delay=$((attempt * 30))
-            echo "Asset fetch failed; retrying in ${delay} seconds."
+            delay=$((30 * (2 ** (attempt - 1))))
+            if [ "$delay" -gt 300 ]; then
+              delay=300
+            fi
+            echo "Asset fetch attempt ${attempt}/${max_attempts} failed; retrying in ${delay} seconds."
             sleep "$delay"
           done
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
