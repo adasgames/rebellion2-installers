@@ -2676,6 +2676,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
+ "tempfile",
  "ureq",
  "urlencoding",
  "zip 2.4.2",

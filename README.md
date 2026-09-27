@@ -44,7 +44,8 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 
 The launcher checks for signed macOS application updates. You may install one immediately or keep
 playing the installed version; its matching game content remains available independently of the
-Windows release channel.
+Windows release channel. When an application update also requires matching game content, approving
+the release once carries through the launcher restart and the content update continues automatically.
 
 ## FAQ
 

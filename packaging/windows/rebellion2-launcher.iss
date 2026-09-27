@@ -101,4 +101,5 @@ Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName}"; Flags: nowa
 Type: filesandordirs; Name: "{app}\Content"
 Type: files; Name: "{app}\launcher.log"
 Type: files; Name: "{app}\content.zip.part"
+Type: files; Name: "{app}\.approved-content-update"
 Type: dirifempty; Name: "{app}"
