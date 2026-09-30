@@ -32,19 +32,70 @@ export function parseReleaseNotes(markdown, version) {
   };
 }
 
+/**
+ * Builds one backward-compatible release-notes document with versioned history.
+ * Older launchers continue reading `sections`; newer launchers can select and
+ * merge the entries in `releases` from the installed version onward.
+ */
+export function buildReleaseNotes(markdown, version, publishedReleases = []) {
+  const current = parseReleaseNotes(markdown, version);
+  const releases = publishedReleases
+    .filter(
+      (release) =>
+        !release.draft &&
+        !release.prerelease &&
+        /^v\d+\.\d+\.\d+$/u.test(release.tag_name ?? ""),
+    )
+    .map((release) =>
+      parseReleaseNotes(release.body ?? "", release.tag_name.slice(1)),
+    )
+    .filter(
+      (release) =>
+        release.sections.length > 0 && compareVersions(release.version, version) < 0,
+    );
+
+  if (current.sections.length > 0) {
+    releases.push({
+      version: current.version,
+      sections: current.sections,
+    });
+  }
+  releases.sort((left, right) => compareVersions(left.version, right.version));
+
+  return { ...current, releases };
+}
+
+/** Compares numeric dotted release versions. */
+function compareVersions(left, right) {
+  const parse = (value) => value.split(".").map((part) => Number.parseInt(part, 10));
+  const leftParts = parse(left);
+  const rightParts = parse(right);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
+}
+
 async function main() {
-  const [inputPath, outputPath, version] = process.argv.slice(2);
+  const [inputPath, outputPath, version, releaseHistoryPath] = process.argv.slice(2);
   if (!inputPath || !outputPath || !version) {
     throw new Error(
-      "Usage: node scripts/release-notes.mjs <input.md> <output.json> <version>",
+      "Usage: node scripts/release-notes.mjs <input.md> <output.json> <version> [release-history.json]",
     );
   }
 
   const markdown = await readFile(inputPath, "utf8");
-  const notes = parseReleaseNotes(markdown, version);
+  const publishedReleases = releaseHistoryPath
+    ? JSON.parse(await readFile(releaseHistoryPath, "utf8"))
+    : [];
+  const notes = buildReleaseNotes(markdown, version, publishedReleases);
   await writeFile(outputPath, `${JSON.stringify(notes, null, 2)}\n`);
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main();
 }

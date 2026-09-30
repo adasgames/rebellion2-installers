@@ -13,6 +13,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::cmp::Ordering as VersionOrdering;
 use std::io::{Read, Write};
 #[cfg(any(target_os = "windows", test))]
 use std::path::Component;
@@ -129,6 +130,7 @@ enum Pending {
         base: String,
         latest: Latest,
         continuing_release: bool,
+        release_notes: Option<ReleaseNotes>,
     },
 }
 
@@ -172,17 +174,26 @@ struct ReleaseNotesPointer {
 }
 
 /// Release notes shown on the update confirmation screen.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ReleaseNotes {
     version: String,
     sections: Vec<ReleaseNoteSection>,
+    #[serde(default)]
+    releases: Vec<VersionedReleaseNotes>,
 }
 
 /// A titled group of release-note items.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ReleaseNoteSection {
     title: String,
     items: Vec<String>,
+}
+
+/// Release-note sections published for one historical version.
+#[derive(Debug, Clone, Deserialize)]
+struct VersionedReleaseNotes {
+    version: String,
+    sections: Vec<ReleaseNoteSection>,
 }
 fn default_blobs() -> String {
     "blobs/".to_string()
@@ -369,7 +380,13 @@ fn on_gate_result(
                 base,
                 latest,
                 continuing_release,
-            }) => Some((base.clone(), latest.clone(), *continuing_release)),
+                release_notes,
+            }) => Some((
+                base.clone(),
+                latest.clone(),
+                *continuing_release,
+                release_notes.clone(),
+            )),
             _ => None,
         }
     };
@@ -402,13 +419,19 @@ fn resume_after_gate(handle: &tauri::AppHandle) {
                 base,
                 latest,
                 continuing_release,
-            }) => Some((base.clone(), latest.clone(), *continuing_release)),
+                release_notes,
+            }) => Some((
+                base.clone(),
+                latest.clone(),
+                *continuing_release,
+                release_notes.clone(),
+            )),
             _ => None,
         }
     };
 
-    if let Some((base, latest, continuing_release)) = pending_update {
-        show_progress_ui(handle);
+    if let Some((base, latest, continuing_release, release_notes)) = pending_update {
+        show_progress_ui_with_release_notes(handle, release_notes.as_ref());
         let handle = handle.clone();
         thread::spawn(move || run_update(&handle, &base, &latest, continuing_release));
     } else {
@@ -488,9 +511,10 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 base,
                 latest,
                 continuing_release,
+                release_notes,
             }) = pending
             {
-                show_progress_ui(handle);
+                show_progress_ui_with_release_notes(handle, release_notes.as_ref());
                 let handle = handle.clone();
                 thread::spawn(move || run_update(&handle, &base, &latest, continuing_release));
             }
@@ -712,8 +736,12 @@ fn show_macos_application_update_error(
 }
 
 /// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
-#[cfg(target_os = "windows")]
 fn version_gt(a: &str, b: &str) -> bool {
+    compare_versions(a, b) == VersionOrdering::Greater
+}
+
+/// Compares dotted versions numerically per component, treating missing components as zero.
+fn compare_versions(a: &str, b: &str) -> VersionOrdering {
     let parts = |s: &str| {
         s.split(['.', '-', '+'])
             .map(|p| p.parse::<u64>().unwrap_or(0))
@@ -726,10 +754,10 @@ fn version_gt(a: &str, b: &str) -> bool {
             b.get(i).copied().unwrap_or(0),
         );
         if x != y {
-            return x > y;
+            return x.cmp(&y);
         }
     }
-    false
+    VersionOrdering::Equal
 }
 
 /// Stages application changes, then exits so the helper can promote and relaunch
@@ -1218,19 +1246,20 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
         "[launcher] continuing approved release {} after application restart.",
         latest.version
     ));
+    let release_notes = fetch_release_notes(base, latest);
     *PENDING.lock().unwrap() = Some(Pending::Update {
         base: base.to_string(),
         latest: latest.clone(),
         continuing_release: true,
+        release_notes: release_notes.clone(),
     });
 
     if SESSION.lock().unwrap().is_none() {
-        let release_notes = fetch_release_notes(base, latest);
         show_update_signin(handle, release_notes.as_ref());
         return;
     }
 
-    show_progress_ui(handle);
+    show_progress_ui_with_release_notes(handle, release_notes.as_ref());
     let handle = handle.clone();
     let base = base.to_string();
     let latest = latest.clone();
@@ -1245,6 +1274,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
         base: base.to_string(),
         latest: latest.clone(),
         continuing_release: false,
+        release_notes: release_notes.clone(),
     });
 
     let Some(token) = token else {
@@ -1301,7 +1331,11 @@ fn update_available_screen(detail: &str, notes: Option<&ReleaseNotes>, buttons: 
 fn fetch_release_notes(base: &str, latest: &Latest) -> Option<ReleaseNotes> {
     let pointer = latest.release_notes.as_ref()?;
     let bytes = fetch_channel_bytes(&format!("{base}{}", pointer.path), None).ok()?;
-    parse_release_notes(&bytes, &latest.version, &pointer.sha256)
+    let notes = parse_release_notes(&bytes, &latest.version, &pointer.sha256)?;
+    let installed_version = install_dir()
+        .ok()
+        .and_then(|directory| read_installed_version(&directory.join("Content")));
+    Some(aggregate_release_notes(notes, installed_version.as_deref()))
 }
 
 /// Parses release notes only when their version and digest match the release pointer.
@@ -1312,16 +1346,99 @@ fn parse_release_notes(bytes: &[u8], version: &str, sha256: &str) -> Option<Rele
 
     let notes = serde_json::from_slice::<ReleaseNotes>(bytes).ok()?;
     if notes.version != version
-        || notes.sections.is_empty()
-        || notes
-            .sections
-            .iter()
-            .any(|section| section.title.trim().is_empty() || section.items.is_empty())
+        || !release_note_sections_are_valid(&notes.sections)
+        || notes.releases.iter().any(|release| {
+            release.version.trim().is_empty()
+                || version_gt(&release.version, &notes.version)
+                || !release_note_sections_are_valid(&release.sections)
+        })
     {
         return None;
     }
 
     Some(notes)
+}
+
+/// Returns whether every release-note section has a title and at least one item.
+fn release_note_sections_are_valid(sections: &[ReleaseNoteSection]) -> bool {
+    !sections.is_empty()
+        && sections
+            .iter()
+            .all(|section| !section.title.trim().is_empty() && !section.items.is_empty())
+}
+
+/// Merges every published release newer than the installed content into one view.
+fn aggregate_release_notes(notes: ReleaseNotes, installed_version: Option<&str>) -> ReleaseNotes {
+    let Some(installed_version) = installed_version else {
+        return notes;
+    };
+    if notes.releases.is_empty() {
+        return notes;
+    }
+
+    let mut selected = notes
+        .releases
+        .iter()
+        .filter(|release| {
+            version_gt(&release.version, installed_version)
+                && !version_gt(&release.version, &notes.version)
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| compare_versions(&left.version, &right.version));
+    if selected.is_empty() {
+        return notes;
+    }
+
+    let mut section_titles = Vec::new();
+    for expected_title in ["Additions", "Changes", "Fixes"] {
+        if selected.iter().any(|release| {
+            release
+                .sections
+                .iter()
+                .any(|section| section.title == expected_title)
+        }) {
+            section_titles.push(expected_title.to_string());
+        }
+    }
+    for section in &notes.sections {
+        if !section_titles.contains(&section.title) {
+            section_titles.push(section.title.clone());
+        }
+    }
+    for release in &selected {
+        for release_section in &release.sections {
+            if !section_titles.contains(&release_section.title) {
+                section_titles.push(release_section.title.clone());
+            }
+        }
+    }
+    let mut sections = section_titles
+        .into_iter()
+        .map(|title| ReleaseNoteSection {
+            title,
+            items: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    for release in selected {
+        for release_section in &release.sections {
+            let section = sections
+                .iter_mut()
+                .find(|section| section.title == release_section.title)
+                .expect("release-note section was initialized");
+            for item in &release_section.items {
+                if !section.items.contains(item) {
+                    section.items.push(item.clone());
+                }
+            }
+        }
+    }
+    sections.retain(|section| !section.items.is_empty());
+
+    ReleaseNotes {
+        version: notes.version,
+        sections,
+        releases: Vec::new(),
+    }
 }
 
 /// Renders structured release notes for the update confirmation screen.
@@ -1987,11 +2104,26 @@ fn show_message(
 }
 
 fn show_progress_ui(handle: &tauri::AppHandle) {
-    write_screen(
-        handle,
-        &render("Updating", false, "Preparing update\u{2026}", ""),
-    );
+    write_screen(handle, &progress_screen(None));
     update_progress(handle, 0, "Preparing update\u{2026}");
+}
+
+/// Shows update progress while retaining cumulative release notes after an application restart.
+fn show_progress_ui_with_release_notes(handle: &tauri::AppHandle, notes: Option<&ReleaseNotes>) {
+    write_screen(handle, &progress_screen(notes));
+    update_progress(handle, 0, "Preparing update\u{2026}");
+}
+
+/// Builds the update progress screen with optional cumulative release notes.
+fn progress_screen(notes: Option<&ReleaseNotes>) -> String {
+    let release_notes = notes.map(render_release_notes).unwrap_or_default();
+    render_with_content(
+        "Updating",
+        false,
+        "Preparing update\u{2026}",
+        &release_notes,
+        "",
+    )
 }
 
 fn show_update_required_ui(handle: &tauri::AppHandle) {
@@ -2562,6 +2694,75 @@ mod tests {
     }
 
     #[test]
+    fn parse_release_notes_with_legacy_document_defaults_to_empty_history() {
+        let bytes = br#"{"version":"1.2.3","sections":[{"title":"Fixes","items":["Fixed update handling."]}]}"#;
+
+        let notes = parse_release_notes(bytes, "1.2.3", &sha256_hex(bytes))
+            .expect("legacy release notes should remain readable");
+
+        assert!(notes.releases.is_empty());
+        assert_eq!(notes.sections[0].items, vec!["Fixed update handling."]);
+    }
+
+    #[test]
+    fn aggregate_release_notes_with_lagging_install_merges_intermediate_releases() {
+        let notes = cumulative_release_notes();
+
+        let aggregated = aggregate_release_notes(notes, Some("0.0.15"));
+
+        assert_eq!(aggregated.version, "0.0.21");
+        assert_eq!(aggregated.sections.len(), 3);
+        assert_eq!(aggregated.sections[0].title, "Additions");
+        assert_eq!(
+            aggregated.sections[0].items,
+            vec!["Added 0.0.16 feature.", "Added 0.0.21 feature."]
+        );
+        assert_eq!(aggregated.sections[1].title, "Changes");
+        assert_eq!(
+            aggregated.sections[1].items,
+            vec!["Changed 0.0.17 behavior."]
+        );
+        assert_eq!(aggregated.sections[2].title, "Fixes");
+        assert_eq!(
+            aggregated.sections[2].items,
+            vec!["Fixed 0.0.16 issue.", "Fixed 0.0.21 issue."]
+        );
+        assert!(aggregated.releases.is_empty());
+    }
+
+    #[test]
+    fn aggregate_release_notes_with_previous_install_includes_only_current_release() {
+        let notes = cumulative_release_notes();
+
+        let aggregated = aggregate_release_notes(notes, Some("0.0.20"));
+
+        assert_eq!(aggregated.sections.len(), 2);
+        assert_eq!(aggregated.sections[0].items, vec!["Added 0.0.21 feature."]);
+        assert_eq!(aggregated.sections[1].items, vec!["Fixed 0.0.21 issue."]);
+    }
+
+    #[test]
+    fn aggregate_release_notes_without_history_preserves_current_release() {
+        let notes = release_notes();
+
+        let aggregated = aggregate_release_notes(notes, Some("1.2.0"));
+
+        assert_eq!(aggregated.sections.len(), 1);
+        assert_eq!(aggregated.sections[0].items, vec!["Fixed update handling."]);
+    }
+
+    #[test]
+    fn progress_screen_with_release_notes_keeps_notes_visible() {
+        let notes = release_notes();
+
+        let screen = progress_screen(Some(&notes));
+
+        assert!(screen.contains("Preparing update"));
+        assert!(screen.contains("Patch Notes"));
+        assert!(screen.contains("Fixed update handling."));
+    }
+
+    #[test]
     fn render_escapes_status_text() {
         let screen = render("Status", false, "<script>alert('gate')</script>", "");
 
@@ -2677,6 +2878,65 @@ mod tests {
                 title: "Fixes".to_string(),
                 items: vec!["Fixed update handling.".to_string()],
             }],
+            releases: Vec::new(),
+        }
+    }
+
+    fn cumulative_release_notes() -> ReleaseNotes {
+        ReleaseNotes {
+            version: "0.0.21".to_string(),
+            sections: vec![
+                ReleaseNoteSection {
+                    title: "Additions".to_string(),
+                    items: vec!["Added 0.0.21 feature.".to_string()],
+                },
+                ReleaseNoteSection {
+                    title: "Fixes".to_string(),
+                    items: vec!["Fixed 0.0.21 issue.".to_string()],
+                },
+            ],
+            releases: vec![
+                VersionedReleaseNotes {
+                    version: "0.0.15".to_string(),
+                    sections: vec![ReleaseNoteSection {
+                        title: "Fixes".to_string(),
+                        items: vec!["Fixed installed issue.".to_string()],
+                    }],
+                },
+                VersionedReleaseNotes {
+                    version: "0.0.16".to_string(),
+                    sections: vec![
+                        ReleaseNoteSection {
+                            title: "Additions".to_string(),
+                            items: vec!["Added 0.0.16 feature.".to_string()],
+                        },
+                        ReleaseNoteSection {
+                            title: "Fixes".to_string(),
+                            items: vec!["Fixed 0.0.16 issue.".to_string()],
+                        },
+                    ],
+                },
+                VersionedReleaseNotes {
+                    version: "0.0.17".to_string(),
+                    sections: vec![ReleaseNoteSection {
+                        title: "Changes".to_string(),
+                        items: vec!["Changed 0.0.17 behavior.".to_string()],
+                    }],
+                },
+                VersionedReleaseNotes {
+                    version: "0.0.21".to_string(),
+                    sections: vec![
+                        ReleaseNoteSection {
+                            title: "Additions".to_string(),
+                            items: vec!["Added 0.0.21 feature.".to_string()],
+                        },
+                        ReleaseNoteSection {
+                            title: "Fixes".to_string(),
+                            items: vec!["Fixed 0.0.21 issue.".to_string()],
+                        },
+                    ],
+                },
+            ],
         }
     }
 }
