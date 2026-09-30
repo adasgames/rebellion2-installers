@@ -373,6 +373,7 @@ jobs:
           MANIFEST=application-update-metadata/application-manifest.json
           CONTENT_POINTER=content-pointer/latest.json
           RELEASE_NOTES=release-notes-${VERSION}.json
+          RELEASE_NOTES_HISTORY=release-notes-history.json
           RELEASE_NOTES_POINTER=release-notes-pointer.json
           jq -e --arg version "$VERSION" '
             .version == $version and
@@ -382,7 +383,13 @@ jobs:
           ' "$CONTENT_POINTER" >/dev/null
           jq -e --arg version "$VERSION" '.version == $version' "$MANIFEST" >/dev/null
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md
-          node scripts/release-notes.mjs release-notes.md "$RELEASE_NOTES" "$VERSION"
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq --slurp 'add' > "$RELEASE_NOTES_HISTORY"
+          node scripts/release-notes.mjs \
+            release-notes.md \
+            "$RELEASE_NOTES" \
+            "$VERSION" \
+            "$RELEASE_NOTES_HISTORY"
           echo null > "$RELEASE_NOTES_POINTER"
           if jq -e '.sections | length > 0' "$RELEASE_NOTES" >/dev/null; then
             NOTES_SHA=$(sha256sum "$RELEASE_NOTES" | cut -d' ' -f1)

@@ -113,16 +113,17 @@ launcher. For example:
 * Fixed interrupted manufacturing orders.
 ```
 
-The release workflow converts that Markdown to `dist/release-notes-<version>.json`, records its path
-and SHA-256 digest in the content portion of `dist/application.json`, and publishes both atomically.
-An absent usable section omits the pointer. The launcher also ignores missing, corrupt, mismatched,
-or malformed notes so release notes can never prevent an update.
+The release workflow converts that Markdown to `dist/release-notes-<version>.json`, adds the usable
+notes from earlier published releases, records the document's path and SHA-256 digest in the content
+portion of `dist/application.json`, and publishes both atomically. An absent usable section for the
+current release omits the pointer. The launcher also ignores missing, corrupt, mismatched, or
+malformed notes so release notes can never prevent an update.
 
 The generated release-notes document has this schema:
 
 ```json
 {
-  "version": "x.x.xx",
+  "version": "0.0.21",
   "sections": [
     {
       "title": "Highlights",
@@ -136,13 +137,54 @@ The generated release-notes document has this schema:
         "Fixed interrupted manufacturing orders."
       ]
     }
+  ],
+  "releases": [
+    {
+      "version": "0.0.20",
+      "sections": [
+        {
+          "title": "Fixes",
+          "items": [
+            "Fixed an earlier issue."
+          ]
+        }
+      ]
+    },
+    {
+      "version": "0.0.21",
+      "sections": [
+        {
+          "title": "Highlights",
+          "items": [
+            "Added new strategic options."
+          ]
+        },
+        {
+          "title": "Fixes",
+          "items": [
+            "Fixed interrupted manufacturing orders."
+          ]
+        }
+      ]
+    }
   ]
 }
 ```
 
 `version` must match the content release. `sections` must contain at least one object, and every
-section must have a non-empty `title` and at least one string in `items`. The matching content object
-in `application.json` references the document without embedding its display text:
+section must have a non-empty `title` and at least one string in `items`. `releases` contains each
+published version with usable notes through the current release. The top-level `sections` remain the
+current release's notes so launchers that predate cumulative notes remain compatible.
+
+The launcher compares `releases` with the installed content version and combines only newer entries
+through the target version. It groups their items by section, removes exact duplicates, and retains
+the Additions, Changes, Fixes order when those sections are present. A Mac several releases behind
+therefore sees all skipped notes in one view, while an installation only one release behind sees only
+the current notes. The combined notes remain visible while the content update continues after an
+application-update restart.
+
+The matching content object in `application.json` references the document without embedding its
+display text:
 
 ```json
 {
