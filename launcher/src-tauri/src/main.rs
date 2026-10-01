@@ -490,6 +490,11 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             let handle = handle.clone();
             thread::spawn(move || scan_content_and_prompt(&handle));
         }
+        "retry-update-check" => {
+            show_status_page(handle);
+            let handle = handle.clone();
+            thread::spawn(move || scan_and_prompt(&handle));
+        }
         "install" => {
             let pending = PENDING.lock().unwrap().clone();
             match pending {
@@ -1113,8 +1118,7 @@ fn hand_off_pending_launcher_update() -> bool {
 
 // -- scan --------------------------------------------------------------------
 
-/// Reads the channel pointer and decides what to show. Any network failure
-/// degrades to "launch what's installed" rather than forcing a re-download.
+/// Reads the channel pointer and decides what to show.
 fn scan_and_prompt(handle: &tauri::AppHandle) {
     update_status(handle, "Checking for updates…");
 
@@ -1231,12 +1235,12 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
             }
         }
         Err(err) => {
-            log_line(&format!(
-                "[launcher] update check failed ({err}); offering to play installed."
-            ));
-            if installed_present {
-                show_up_to_date(handle, installed_version.as_deref().unwrap_or("installed"));
-            }
+            log_line(&format!("[launcher] update check failed ({err})."));
+            show_update_check_failed(
+                handle,
+                installed_present.then_some(installed_version.as_deref().unwrap_or("unknown")),
+                &err.to_string(),
+            );
         }
     }
 }
@@ -1949,6 +1953,17 @@ fn render_with_content(
     content: &str,
     buttons: &str,
 ) -> String {
+    render_card(kicker, spinner, status, "sub", content, buttons)
+}
+
+fn render_card(
+    kicker: &str,
+    spinner: bool,
+    status: &str,
+    status_class: &str,
+    content: &str,
+    buttons: &str,
+) -> String {
     let spin = if spinner {
         r#"<div class="spin"></div>"#
     } else {
@@ -1962,12 +1977,13 @@ fn render_with_content(
         "card has-content"
     };
     format!(
-        r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:min(94vw,440px);height:min(560px,92vh);overflow:hidden;padding:40px 34px 30px;background:rgba(16,22,43,.72);border:1px solid rgba(120,160,255,.18);border-radius:18px;backdrop-filter:blur(14px);box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 18px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.has-content .sub{{margin-bottom:0}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.has-content .p:empty{{margin:0}}.release-changes{{min-height:0;overflow-y:auto;padding-right:8px;text-align:left;scrollbar-color:#59637b rgba(255,255,255,.06);scrollbar-width:thin}}.release-changes::-webkit-scrollbar{{width:7px}}.release-changes::-webkit-scrollbar-track{{background:rgba(255,255,255,.06);border-radius:4px}}.release-changes::-webkit-scrollbar-thumb{{background:#59637b;border-radius:4px}}.patch-title{{margin:0 0 9px;color:#e8ecf6;font-size:13px}}.save-warning{{margin:0 0 16px;color:#ff3434;font-size:12px;font-weight:900;line-height:1.25;text-align:center;text-transform:uppercase;letter-spacing:.025em}}.changes+.changes{{margin-top:9px}}.changes h2{{margin:0 0 3px;color:#b9c2da;font-size:9px;text-transform:uppercase}}.changes ul{{margin:0;padding-left:18px;color:#cbd2e3;font-size:11px;line-height:1.45}}.changes li+li{{margin-top:5px}}.btns{{flex:none;margin-top:0}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="{card_class}"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="sub" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div>{content}<div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
+        r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:min(94vw,440px);height:min(560px,92vh);overflow:hidden;padding:40px 34px 30px;background:rgba(16,22,43,.72);border:1px solid rgba(120,160,255,.18);border-radius:18px;backdrop-filter:blur(14px);box-shadow:0 30px 80px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.05);display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 18px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.has-content .sub{{margin-bottom:0}}.failure-error{{margin:10px auto 0;max-width:34ch;color:#ff6b73;font-size:14.5px;font-weight:700;line-height:1.6}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.has-content .p:empty{{margin:0}}.release-changes{{min-height:0;overflow-y:auto;padding-right:8px;text-align:left;scrollbar-color:#59637b rgba(255,255,255,.06);scrollbar-width:thin}}.release-changes::-webkit-scrollbar{{width:7px}}.release-changes::-webkit-scrollbar-track{{background:rgba(255,255,255,.06);border-radius:4px}}.release-changes::-webkit-scrollbar-thumb{{background:#59637b;border-radius:4px}}.patch-title{{margin:0 0 9px;color:#e8ecf6;font-size:13px}}.save-warning{{margin:0 0 16px;color:#ff3434;font-size:12px;font-weight:900;line-height:1.25;text-align:center;text-transform:uppercase;letter-spacing:.025em}}.changes+.changes{{margin-top:9px}}.changes h2{{margin:0 0 3px;color:#b9c2da;font-size:9px;text-transform:uppercase}}.changes ul{{margin:0;padding-left:18px;color:#cbd2e3;font-size:11px;line-height:1.45}}.changes li+li{{margin-top:5px}}.btns{{flex:none;margin-top:0}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="{card_class}"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="{status_class}" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div>{content}<div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
         kicker = kicker,
         status = status,
         spin = spin,
         content = content,
         card_class = card_class,
+        status_class = status_class,
         buttons = buttons,
     )
 }
@@ -1975,6 +1991,13 @@ fn render_with_content(
 fn button(label: &str, choice: &str) -> String {
     format!(
         "<a class=\"b primary\" href=\"{}?choice={}\">{}</a>",
+        ACT, choice, label
+    )
+}
+
+fn secondary_button(label: &str, choice: &str) -> String {
+    format!(
+        "<a class=\"b secondary\" href=\"{}?choice={}\">{}</a>",
         ACT, choice, label
     )
 }
@@ -2012,14 +2035,64 @@ fn show_result(handle: &tauri::AppHandle, kicker: &str, status: &str, label: &st
     );
 }
 
-fn show_up_to_date(handle: &tauri::AppHandle, _version: &str) {
-    show_result(
-        handle,
+fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
+    write_screen(handle, &up_to_date_screen(version));
+}
+
+fn up_to_date_screen(version: &str) -> String {
+    render(
         "Up to date",
-        "You\u{2019}re on the latest version.",
-        "Launch Game",
-        "play",
+        false,
+        &format!("Version {version} is up to date."),
+        &button("Launch game", "play"),
+    )
+}
+
+fn show_update_check_failed(
+    handle: &tauri::AppHandle,
+    installed_version: Option<&str>,
+    error: &str,
+) {
+    write_screen(
+        handle,
+        &update_check_failed_screen(installed_version, error),
     );
+}
+
+fn update_check_failed_screen(installed_version: Option<&str>, error: &str) -> String {
+    let note = installed_version.map_or_else(
+        || "Check your connection, then retry.".to_string(),
+        |version| {
+            format!("Version {version} is still available to play. You can retry or launch it now.")
+        },
+    );
+    let reason = update_check_failure_reason(error);
+    let content = format!(
+        "<p class=\"failure-error\">Error: {}</p>",
+        html_escape(reason)
+    );
+    let mut buttons = button("Retry", "retry-update-check");
+    if installed_version.is_some() {
+        buttons.push_str(&secondary_button("Launch game", "play"));
+    }
+    render_with_content("Launcher", false, &note, &content, &buttons)
+}
+
+fn update_check_failure_reason(error: &str) -> &str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("timeout") {
+        "The update server did not respond in time."
+    } else if normalized.contains("connection failed")
+        || normalized.contains("connect error")
+        || normalized.contains("connection refused")
+        || normalized.contains("dns")
+    {
+        "The launcher could not reach the update server."
+    } else if normalized.contains("no longer available") {
+        "Update information for this launcher version is no longer available."
+    } else {
+        "The update server returned invalid update information."
+    }
 }
 
 fn show_ready_to_install(handle: &tauri::AppHandle, _version: Option<&str>) {
@@ -2584,6 +2657,47 @@ mod tests {
         assert!(screen.contains("restart once and finish the update automatically"));
         assert!(screen.contains("choice=application-update\">Update"));
         assert!(screen.contains("choice=skip-application-update\">Not Now"));
+    }
+
+    #[test]
+    fn up_to_date_screen_with_confirmed_version_displays_version() {
+        let screen = up_to_date_screen("1.2.3");
+
+        assert!(screen.contains("Version 1.2.3 is up to date."));
+        assert!(screen.contains("choice=play\">Launch game"));
+    }
+
+    #[test]
+    fn update_check_failed_screen_with_installed_game_offers_retry_and_launch() {
+        let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed");
+
+        assert!(screen.contains(">Launcher</p>"));
+        assert!(screen.contains("Version 1.2.3 is still available to play."));
+        assert!(screen.contains("failure-error"));
+        assert!(screen.contains("Error: The launcher could not reach the update server."));
+        assert!(screen.find("Version 1.2.3").unwrap() < screen.find("Error:").unwrap());
+        assert!(screen.find("Error:").unwrap() < screen.find(">Retry</a>").unwrap());
+        assert!(screen.contains("choice=retry-update-check\">Retry"));
+        assert!(screen.contains("choice=play\">Launch game"));
+    }
+
+    #[test]
+    fn update_check_failed_screen_without_installed_game_offers_only_retry() {
+        let screen = update_check_failed_screen(None, "operation timed out");
+
+        assert!(screen.contains(">Launcher</p>"));
+        assert!(screen.contains("Check your connection, then retry."));
+        assert!(screen.contains("did not respond in time"));
+        assert!(screen.contains("choice=retry-update-check\">Retry"));
+        assert!(!screen.contains("choice=play"));
+    }
+
+    #[test]
+    fn update_check_failure_reason_with_invalid_response_explains_response_failure() {
+        assert_eq!(
+            update_check_failure_reason("expected value at line 1"),
+            "The update server returned invalid update information."
+        );
     }
 
     #[test]
