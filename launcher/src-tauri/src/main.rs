@@ -86,8 +86,13 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// A newer application release waiting for the user to approve its installation.
 #[cfg(target_os = "windows")]
 static PENDING_APPLICATION_UPDATE: Mutex<Option<ApplicationUpdate>> = Mutex::new(None);
+/// The macOS application release waiting for the user to approve its installation.
+#[cfg(target_os = "macos")]
+static PENDING_APPLICATION_VERSION: Mutex<Option<String>> = Mutex::new(None);
 /// Set when the user continues after an update failure so the content flow can proceed.
 static APPLICATION_UPDATE_DISMISSED: AtomicBool = AtomicBool::new(false);
+/// Set while an approved application update waits for renewed ownership verification.
+static APPLICATION_UPDATE_AUTH_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set while ownership verification returns the remote webview to bundled launcher content.
 static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set until the bundled launcher page is ready for its first channel scan.
@@ -129,7 +134,7 @@ enum Pending {
     Update {
         base: String,
         latest: Latest,
-        continuing_release: bool,
+        finishes_application_update: bool,
         release_notes: Option<ReleaseNotes>,
     },
 }
@@ -379,12 +384,12 @@ fn on_gate_result(
             Some(Pending::Update {
                 base,
                 latest,
-                continuing_release,
+                finishes_application_update,
                 release_notes,
             }) => Some((
                 base.clone(),
                 latest.clone(),
-                *continuing_release,
+                *finishes_application_update,
                 release_notes.clone(),
             )),
             _ => None,
@@ -392,7 +397,7 @@ fn on_gate_result(
     };
     // Remember the presigned zip for a possible first install without replacing an
     // update that was waiting for renewed authorization.
-    if pending_update.is_none() {
+    if pending_update.is_none() && !APPLICATION_UPDATE_AUTH_PENDING.load(Ordering::Relaxed) {
         if let Some(url) = presigned {
             *PENDING.lock().unwrap() = Some(Pending::FirstInstall { url });
         }
@@ -412,28 +417,33 @@ fn on_gate_result(
 
 /// Continues the first install or content update that requested ownership verification.
 fn resume_after_gate(handle: &tauri::AppHandle) {
+    if APPLICATION_UPDATE_AUTH_PENDING.swap(false, Ordering::Relaxed) {
+        start_application_update(handle);
+        return;
+    }
+
     let pending_update = {
         let pending = PENDING.lock().unwrap();
         match pending.as_ref() {
             Some(Pending::Update {
                 base,
                 latest,
-                continuing_release,
+                finishes_application_update,
                 release_notes,
             }) => Some((
                 base.clone(),
                 latest.clone(),
-                *continuing_release,
+                *finishes_application_update,
                 release_notes.clone(),
             )),
             _ => None,
         }
     };
 
-    if let Some((base, latest, continuing_release, release_notes)) = pending_update {
+    if let Some((base, latest, finishes_application_update, release_notes)) = pending_update {
         show_progress_ui_with_release_notes(handle, release_notes.as_ref());
         let handle = handle.clone();
-        thread::spawn(move || run_update(&handle, &base, &latest, continuing_release));
+        thread::spawn(move || run_update(&handle, &base, &latest, finishes_application_update));
     } else {
         show_status_page(handle);
         let handle = handle.clone();
@@ -461,6 +471,7 @@ fn navigate_to_local_app(handle: &tauri::AppHandle) -> bool {
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     match choice {
         "play" => {
+            APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
             log_line("[launcher] Play clicked.");
             match launch_game() {
@@ -485,6 +496,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         "quit" => handle.exit(0),
         "application-update" => start_application_update(handle),
         "skip-application-update" => {
+            APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
             APPLICATION_UPDATE_DISMISSED.store(true, Ordering::Relaxed);
             let handle = handle.clone();
@@ -515,17 +527,20 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             if let Some(Pending::Update {
                 base,
                 latest,
-                continuing_release,
+                finishes_application_update,
                 release_notes,
             }) = pending
             {
                 show_progress_ui_with_release_notes(handle, release_notes.as_ref());
                 let handle = handle.clone();
-                thread::spawn(move || run_update(&handle, &base, &latest, continuing_release));
+                thread::spawn(move || {
+                    run_update(&handle, &base, &latest, finishes_application_update)
+                });
             }
         }
         // Return from the gate's sign-in screens to the launcher's own screen.
         "back" => {
+            APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             let installed = install_dir()
                 .map(|d| d.join("Content").join("catalog.xml").is_file())
                 .unwrap_or(false);
@@ -595,7 +610,11 @@ fn check_application_update(handle: &tauri::AppHandle) -> Option<String> {
         updater.check().await
     });
     match result {
-        Ok(Some(update)) => Some(update.version),
+        Ok(Some(update)) => {
+            let version = update.version;
+            *PENDING_APPLICATION_VERSION.lock().unwrap() = Some(version.clone());
+            Some(version)
+        }
         Ok(None) => None,
         Err(error) => {
             log_line(&format!(
@@ -615,6 +634,11 @@ fn check_application_update(_handle: &tauri::AppHandle) -> Option<String> {
 fn start_application_update(handle: &tauri::AppHandle) {
     let update = PENDING_APPLICATION_UPDATE.lock().unwrap().clone();
     if let Some(update) = update {
+        if !begin_application_update_or_request_authorization(handle, &update.version) {
+            return;
+        }
+        let release_notes = fetch_current_release_notes(&update.version);
+        show_progress_ui_with_release_notes(handle, release_notes.as_ref());
         let handle = handle.clone();
         thread::spawn(move || run_windows_application_update(&handle, &update));
     }
@@ -622,7 +646,18 @@ fn start_application_update(handle: &tauri::AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn start_application_update(handle: &tauri::AppHandle) {
-    show_progress_ui(handle);
+    let version = PENDING_APPLICATION_VERSION.lock().unwrap().clone();
+    let Some(version) = version else {
+        show_status_page(handle);
+        let handle = handle.clone();
+        thread::spawn(move || scan_and_prompt(&handle));
+        return;
+    };
+    if !begin_application_update_or_request_authorization(handle, &version) {
+        return;
+    }
+    let release_notes = fetch_current_release_notes(&version);
+    show_progress_ui_with_release_notes(handle, release_notes.as_ref());
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         run_macos_application_update(&handle).await;
@@ -632,9 +667,24 @@ fn start_application_update(handle: &tauri::AppHandle) {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn start_application_update(_handle: &tauri::AppHandle) {}
 
+/// Returns whether protected content can be downloaded, or opens ownership verification.
+fn begin_application_update_or_request_authorization(
+    handle: &tauri::AppHandle,
+    version: &str,
+) -> bool {
+    if SESSION.lock().unwrap().is_some() {
+        return true;
+    }
+
+    APPLICATION_UPDATE_AUTH_PENDING.store(true, Ordering::Relaxed);
+    let release_notes = fetch_current_release_notes(version);
+    show_update_signin(handle, release_notes.as_ref());
+    false
+}
+
 #[cfg(target_os = "macos")]
 async fn run_macos_application_update(handle: &tauri::AppHandle) {
-    update_progress(handle, 0, "Preparing update (1 of 2)\u{2026}");
+    update_progress(handle, 0, "Preparing update\u{2026}");
     let updater = match handle.updater() {
         Ok(updater) => updater,
         Err(error) => {
@@ -656,6 +706,14 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
         }
         Err(error) => {
             show_macos_application_update_error(handle, &error);
+            return;
+        }
+    };
+
+    let (base, latest) = match prepare_application_content(&update.version, None) {
+        Ok(release) => release,
+        Err(error) => {
+            show_application_update_preparation_error(handle, &update.version, error.as_ref());
             return;
         }
     };
@@ -682,25 +740,16 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
                 downloaded = downloaded.saturating_add(chunk_size as u64);
                 let percent = content_length
                     .filter(|total| *total > 0)
-                    .map(|total| 5 + downloaded.saturating_mul(90) / total)
+                    .map(|total| 5 + downloaded.saturating_mul(40) / total)
                     .unwrap_or(5)
-                    .min(95);
+                    .min(45);
                 update_progress(
                     &progress_handle,
                     percent,
-                    &format!(
-                        "Updating application (1 of 2)\u{2026} {}",
-                        human_bytes(downloaded)
-                    ),
+                    &format!("Updating application\u{2026} {}", human_bytes(downloaded)),
                 );
             },
-            move || {
-                update_progress(
-                    &finish_handle,
-                    96,
-                    "Installing application (1 of 2)\u{2026}",
-                )
-            },
+            move || update_progress(&finish_handle, 48, "Installing application\u{2026}"),
         )
         .await;
 
@@ -710,18 +759,65 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
                 "[launcher] macOS application update to {} installed.",
                 update.version
             ));
-            update_progress(
-                handle,
-                100,
-                "Application ready (1 of 2). Restarting\u{2026}",
-            );
-            handle.restart();
+            let release_notes = fetch_release_notes(&base, &latest);
+            *PENDING.lock().unwrap() = Some(Pending::Update {
+                base: base.clone(),
+                latest: latest.clone(),
+                finishes_application_update: true,
+                release_notes,
+            });
+            run_update(handle, &base, &latest, true);
         }
         Err(error) => {
             clear_approved_content_update();
             show_macos_application_update_error(handle, &error);
         }
     }
+}
+
+/// Resolves and authorizes the protected content paired with an application release.
+fn prepare_application_content(
+    version: &str,
+    embedded: Option<Latest>,
+) -> Result<(String, Latest), Box<dyn std::error::Error>> {
+    let base = content_base().ok_or("application update channel is not configured")?;
+    let latest = match embedded {
+        Some(latest) => latest,
+        None => content_release_for_application(fetch_latest(&base)?, Some(version)),
+    };
+    if latest.version != version {
+        return Err("application and content releases do not match".into());
+    }
+
+    let token = SESSION.lock().unwrap().clone();
+    let _: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
+    Ok((base, latest))
+}
+
+/// Reports a failure that occurs before any application files are changed.
+fn show_application_update_preparation_error(
+    handle: &tauri::AppHandle,
+    version: &str,
+    error: &(dyn std::error::Error + 'static),
+) {
+    if is_authorization_required(error) {
+        log_line("[launcher] update authorization expired before the application download.");
+        clear_token();
+        APPLICATION_UPDATE_AUTH_PENDING.store(true, Ordering::Relaxed);
+        let release_notes = fetch_current_release_notes(version);
+        show_update_signin(handle, release_notes.as_ref());
+        return;
+    }
+
+    log_line(&format!(
+        "[launcher] application update could not be prepared: {error}"
+    ));
+    show_message(
+        handle,
+        "Update failed",
+        "The update could not be prepared — see launcher.log.",
+        Some(("Continue", "skip-application-update")),
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -765,21 +861,33 @@ fn compare_versions(a: &str, b: &str) -> VersionOrdering {
     VersionOrdering::Equal
 }
 
-/// Stages application changes, then exits so the helper can promote and relaunch
-/// the updated launcher before content scanning resumes.
+/// Installs one application/content release and closes without reopening the launcher.
 #[cfg(target_os = "windows")]
 fn run_windows_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
-    show_progress_ui(handle);
-    update_progress(handle, 0, "Preparing update (1 of 2)…");
+    update_progress(handle, 0, "Preparing update…");
+    let (base, latest) = match prepare_application_content(&update.version, update.content.clone())
+    {
+        Ok(release) => release,
+        Err(error) => {
+            show_application_update_preparation_error(handle, &update.version, error.as_ref());
+            return;
+        }
+    };
+
     match do_application_update(handle, update) {
         Ok(changed) => {
             log_line(&format!(
                 "[launcher] application update to {} staged ({changed} files).",
                 update.version
             ));
-            update_progress(handle, 100, "Application ready (1 of 2). Restarting…");
-            thread::sleep(Duration::from_millis(400));
-            handle.exit(0);
+            let release_notes = fetch_release_notes(&base, &latest);
+            *PENDING.lock().unwrap() = Some(Pending::Update {
+                base: base.clone(),
+                latest: latest.clone(),
+                finishes_application_update: true,
+                release_notes,
+            });
+            run_update(handle, &base, &latest, true);
         }
         Err(error) => {
             clear_approved_content_update();
@@ -816,7 +924,7 @@ fn do_application_update(
         handle,
         5,
         &format!(
-            "Updating application (1 of 2)… {}",
+            "Updating application… {}",
             human_bytes(plan.download_size())
         ),
     );
@@ -861,9 +969,11 @@ fn do_application_update(
         install_dir.join(PENDING_APPLICATION_VERSION_FILE),
         &update.version,
     )?;
-    // Relaunch only after the helper promotes the staged launcher and version
-    // markers. Content scanning must never continue in the old launcher process.
-    start_update_helper(true)?;
+    update_progress(
+        handle,
+        48,
+        "Application files ready. Updating game content…",
+    );
     Ok(changed + usize::from(launcher_changed))
 }
 
@@ -1254,7 +1364,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
     *PENDING.lock().unwrap() = Some(Pending::Update {
         base: base.to_string(),
         latest: latest.clone(),
-        continuing_release: true,
+        finishes_application_update: false,
         release_notes: release_notes.clone(),
     });
 
@@ -1267,7 +1377,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
     let handle = handle.clone();
     let base = base.to_string();
     let latest = latest.clone();
-    thread::spawn(move || run_update(&handle, &base, &latest, true));
+    thread::spawn(move || run_update(&handle, &base, &latest, false));
 }
 
 /// Requests authorization when necessary, then computes the update size and prompts.
@@ -1277,7 +1387,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
     *PENDING.lock().unwrap() = Some(Pending::Update {
         base: base.to_string(),
         latest: latest.clone(),
-        continuing_release: false,
+        finishes_application_update: false,
         release_notes: release_notes.clone(),
     });
 
@@ -1470,21 +1580,42 @@ fn render_release_notes(notes: &ReleaseNotes) -> String {
 
 // -- update / install work ---------------------------------------------------
 
-fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, continuing_release: bool) {
-    match do_update(handle, base, latest, continuing_release) {
+fn run_update(
+    handle: &tauri::AppHandle,
+    base: &str,
+    latest: &Latest,
+    finishes_application_update: bool,
+) {
+    match do_update(handle, base, latest, finishes_application_update) {
         Ok(fetched) => {
-            clear_approved_content_update();
             log_line(&format!(
                 "[launcher] update to {} complete ({fetched} files).",
                 latest.version
             ));
-            update_progress(handle, 100, "Update complete.");
-            // Let the filled bar sit a beat, then land on the up-to-date screen.
-            thread::sleep(Duration::from_millis(900));
-            show_up_to_date(handle, &latest.version);
+            if finishes_application_update {
+                if let Err(error) = finish_application_update(handle) {
+                    log_line(&format!(
+                        "[launcher] couldn't finish the application update: {error}"
+                    ));
+                    show_message(
+                        handle,
+                        "Update failed",
+                        "The updated launcher could not be prepared — see launcher.log.",
+                        None,
+                    );
+                }
+            } else {
+                clear_approved_content_update();
+                update_progress(handle, 100, "Update complete.");
+                // Let the filled bar sit a beat, then land on the up-to-date screen.
+                thread::sleep(Duration::from_millis(900));
+                show_up_to_date(handle, &latest.version);
+            }
         }
         Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
-            clear_approved_content_update();
+            if !finishes_application_update {
+                clear_approved_content_update();
+            }
             // A missing manifest/blob during an update means the channel is
             // unreachable or misconfigured — NOT that this version is retired.
             log_line("[launcher] update content unavailable (404 from channel).");
@@ -1498,30 +1629,68 @@ fn run_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, continuing
             log_line("[launcher] update authorization expired; requesting ownership verification.");
             clear_token();
             let release_notes = fetch_release_notes(base, latest);
-            show_update_signin(handle, release_notes.as_ref());
+            if finishes_application_update {
+                show_required_update_signin(handle, release_notes.as_ref());
+            } else {
+                show_update_signin(handle, release_notes.as_ref());
+            }
         }
         Err(err) => {
-            clear_approved_content_update();
+            if !finishes_application_update {
+                clear_approved_content_update();
+            }
             log_line(&format!("[launcher] update failed: {err}"));
             update_progress(handle, 0, "Update failed — see launcher.log");
         }
     }
 }
 
+/// Finalizes the staged application and closes without reopening the launcher.
+#[cfg(target_os = "windows")]
+fn finish_application_update(handle: &tauri::AppHandle) -> io::Result<()> {
+    start_update_helper(false)?;
+    clear_approved_content_update();
+    update_progress(handle, 100, "Update complete. Closing…");
+    thread::sleep(Duration::from_millis(900));
+    handle.exit(0);
+    Ok(())
+}
+
+/// Closes after the macOS bundle and protected content are both installed.
+#[cfg(target_os = "macos")]
+fn finish_application_update(handle: &tauri::AppHandle) -> io::Result<()> {
+    clear_approved_content_update();
+    update_progress(handle, 100, "Update complete. Closing…");
+    thread::sleep(Duration::from_millis(900));
+    handle.exit(0);
+    Ok(())
+}
+
+/// Closes after a combined update on platforms without a native handoff helper.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn finish_application_update(handle: &tauri::AppHandle) -> io::Result<()> {
+    clear_approved_content_update();
+    update_progress(handle, 100, "Update complete. Closing…");
+    thread::sleep(Duration::from_millis(900));
+    handle.exit(0);
+    Ok(())
+}
+
 fn do_update(
     handle: &tauri::AppHandle,
     base: &str,
     latest: &Latest,
-    continuing_release: bool,
+    finishes_application_update: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let content_dir = install_dir()?.join("Content");
     let token = SESSION.lock().unwrap().clone();
-    let checking_label = if continuing_release {
-        "Preparing game content (2 of 2)…"
+    let checking_label = if finishes_application_update {
+        "Updating game content…"
     } else {
         "Checking what changed…"
     };
-    update_progress(handle, 0, checking_label);
+    let progress_start = if finishes_application_update { 50 } else { 5 };
+    update_progress(handle, progress_start, checking_label);
 
     let remote: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
     let local = read_local_manifest(&content_dir).or_else(|| {
@@ -1537,9 +1706,9 @@ fn do_update(
     }
     let changed = plan.changed.len();
     let bytes = plan.download_size();
-    let download_label = if continuing_release {
+    let download_label = if finishes_application_update {
         format!(
-            "Updating game content (2 of 2): {changed} files, {}",
+            "Updating game content: {changed} files, {}",
             human_bytes(bytes)
         )
     } else {
@@ -1553,7 +1722,9 @@ fn do_update(
         handle: handle.clone(),
         total: bytes,
         done: AtomicU64::new(0),
-        continuing_release,
+        progress_start,
+        progress_end: 95,
+        application_update: finishes_application_update,
     };
     apply(&plan, &content_dir, &blobs)?;
     store_manifest_and_version(&content_dir, &remote, &latest.version)?;
@@ -1567,7 +1738,9 @@ struct HttpBlobs {
     handle: tauri::AppHandle,
     total: u64,
     done: AtomicU64,
-    continuing_release: bool,
+    progress_start: u64,
+    progress_end: u64,
+    application_update: bool,
 }
 impl BlobSource for HttpBlobs {
     fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
@@ -1599,15 +1772,15 @@ impl BlobSource for HttpBlobs {
             bytes.extend_from_slice(&buf[..n]);
             let done = self.done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
             let percent = done
-                .saturating_mul(90)
+                .saturating_mul(self.progress_end.saturating_sub(self.progress_start))
                 .checked_div(self.total)
-                .map(|percent| (5 + percent).min(95))
-                .unwrap_or(50);
+                .map(|percent| (self.progress_start + percent).min(self.progress_end))
+                .unwrap_or(self.progress_start);
             if percent != last_percent {
                 last_percent = percent;
-                let label = if self.continuing_release {
+                let label = if self.application_update {
                     format!(
-                        "Updating game content (2 of 2)… {} / {}",
+                        "Updating game content… {} / {}",
                         human_bytes(done),
                         human_bytes(self.total)
                     )
@@ -2126,7 +2299,7 @@ fn application_update_screen(version: &str, notes: Option<&ReleaseNotes>) -> Str
         "Update available",
         false,
         &format!(
-            "Version {version} is available. The launcher will restart once and finish the update automatically."
+            "Version {version} is available. The launcher will close when the update is complete."
         ),
         &release_notes,
         &buttons,
@@ -2165,6 +2338,28 @@ fn update_signin_screen(notes: Option<&ReleaseNotes>) -> String {
     )
 }
 
+/// Shows ownership verification when a partially installed application update must finish.
+fn show_required_update_signin(handle: &tauri::AppHandle, notes: Option<&ReleaseNotes>) {
+    write_screen(handle, &required_update_signin_screen(notes));
+}
+
+/// Builds the ownership prompt used after application files have been staged.
+fn required_update_signin_screen(notes: Option<&ReleaseNotes>) -> String {
+    let buttons = format!(
+        "<a class=\"b primary\" href=\"{a}?choice=signin\">Sign in &amp; Continue</a>\
+         <a class=\"b secondary\" href=\"{a}?choice=quit\">Close launcher</a>",
+        a = ACT,
+    );
+    let release_notes = notes.map(render_release_notes).unwrap_or_default();
+    render_with_content(
+        "Sign in required",
+        false,
+        "Verify ownership to finish this update.",
+        &release_notes,
+        &buttons,
+    )
+}
+
 /// A plain message screen: kicker + status + an optional single action button.
 fn show_message(
     handle: &tauri::AppHandle,
@@ -2181,7 +2376,7 @@ fn show_progress_ui(handle: &tauri::AppHandle) {
     update_progress(handle, 0, "Preparing update\u{2026}");
 }
 
-/// Shows update progress while retaining cumulative release notes after an application restart.
+/// Shows update progress while retaining cumulative release notes.
 fn show_progress_ui_with_release_notes(handle: &tauri::AppHandle, notes: Option<&ReleaseNotes>) {
     write_screen(handle, &progress_screen(notes));
     update_progress(handle, 0, "Preparing update\u{2026}");
@@ -2654,7 +2849,8 @@ mod tests {
         let screen = application_update_screen("1.2.3", None);
 
         assert!(screen.contains("Version 1.2.3 is available."));
-        assert!(screen.contains("restart once and finish the update automatically"));
+        assert!(screen.contains("launcher will close when the update is complete"));
+        assert!(!screen.contains("restart"));
         assert!(screen.contains("choice=application-update\">Update"));
         assert!(screen.contains("choice=skip-application-update\">Not Now"));
     }
@@ -2768,6 +2964,16 @@ mod tests {
         assert!(screen.contains("Patch Notes"));
         assert!(screen.contains("Fixed update handling."));
         assert!(screen.contains("choice=signin\">Sign in &amp; Update"));
+    }
+
+    #[test]
+    fn required_update_signin_screen_with_staged_application_prevents_launching_game() {
+        let screen = required_update_signin_screen(None);
+
+        assert!(screen.contains("Verify ownership to finish this update."));
+        assert!(screen.contains("choice=signin\">Sign in &amp; Continue"));
+        assert!(screen.contains("choice=quit\">Close launcher"));
+        assert!(!screen.contains("choice=play"));
     }
 
     #[test]
