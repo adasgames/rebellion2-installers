@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Report an Issue
+  - name: Report a Bug
     url: https://github.com/davidadas/rebellion2/issues/new?template=bug_report.yml
-    about: Open the Rebellion 2 issue form.
+    about: Open the Rebellion 2 bug report form.
   - name: Request a Feature
     url: https://github.com/davidadas/rebellion2/issues/new?template=feature_request.yml
     about: Open the Rebellion 2 feature request form.
