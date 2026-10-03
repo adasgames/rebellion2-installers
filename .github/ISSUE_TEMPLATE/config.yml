@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Report a Rebellion 2 issue
-    url: https://github.com/davidadas/rebellion2/issues/new/choose
-    about: Please report game and installer issues in the main Rebellion 2 issue tracker. Issues filed in this repository are not monitored.
+  - name: Report an Issue
+    url: https://github.com/davidadas/rebellion2/issues/new?template=bug_report.yml
+    about: Open the Rebellion 2 issue form.
+  - name: Request a Feature
+    url: https://github.com/davidadas/rebellion2/issues/new?template=feature_request.yml
+    about: Open the Rebellion 2 feature request form.
