@@ -37,18 +37,29 @@ export function parseReleaseNotes(markdown, version) {
  * Older launchers continue reading `sections`; newer launchers can select and
  * merge the entries in `releases` from the installed version onward.
  */
-export function buildReleaseNotes(markdown, version, publishedReleases = []) {
+export function buildReleaseNotes(
+  markdown,
+  version,
+  publishedReleases = [],
+  tagPrefix = "v",
+) {
   const current = parseReleaseNotes(markdown, version);
+  const escapedPrefix = tagPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const tagPattern = new RegExp(
+    `^${escapedPrefix}(\\d+\\.\\d+\\.\\d+)$`,
+    "u",
+  );
   const releases = publishedReleases
     .filter(
       (release) =>
         !release.draft &&
         !release.prerelease &&
-        /^v\d+\.\d+\.\d+$/u.test(release.tag_name ?? ""),
+        tagPattern.test(release.tag_name ?? ""),
     )
-    .map((release) =>
-      parseReleaseNotes(release.body ?? "", release.tag_name.slice(1)),
-    )
+    .map((release) => {
+      const match = tagPattern.exec(release.tag_name);
+      return parseReleaseNotes(release.body ?? "", match[1]);
+    })
     .filter(
       (release) =>
         release.sections.length > 0 && compareVersions(release.version, version) < 0,
@@ -81,10 +92,11 @@ function compareVersions(left, right) {
 }
 
 async function main() {
-  const [inputPath, outputPath, version, releaseHistoryPath] = process.argv.slice(2);
+  const [inputPath, outputPath, version, releaseHistoryPath, tagPrefix] =
+    process.argv.slice(2);
   if (!inputPath || !outputPath || !version) {
     throw new Error(
-      "Usage: node scripts/release-notes.mjs <input.md> <output.json> <version> [release-history.json]",
+      "Usage: node scripts/release-notes.mjs <input.md> <output.json> <version> [release-history.json] [tag-prefix]",
     );
   }
 
@@ -92,7 +104,12 @@ async function main() {
   const publishedReleases = releaseHistoryPath
     ? JSON.parse(await readFile(releaseHistoryPath, "utf8"))
     : [];
-  const notes = buildReleaseNotes(markdown, version, publishedReleases);
+  const notes = buildReleaseNotes(
+    markdown,
+    version,
+    publishedReleases,
+    tagPrefix ?? "v",
+  );
   await writeFile(outputPath, `${JSON.stringify(notes, null, 2)}\n`);
 }
 

@@ -111,3 +111,30 @@ test("buildReleaseNotes excludes drafts and releases without usable notes", () =
     },
   ]);
 });
+
+test("buildReleaseNotes keeps launcher history separate from game history", () => {
+  const notes = buildReleaseNotes(
+    "## Fixes\n\n* Fixed the current launcher.",
+    "1.0.2",
+    [
+      {
+        tag_name: "launcher-v1.0.1",
+        body: "## Fixes\n\n* Fixed the previous launcher.",
+        draft: false,
+        prerelease: false,
+      },
+      {
+        tag_name: "v0.0.25",
+        body: "## Fixes\n\n* Fixed the game.",
+        draft: false,
+        prerelease: false,
+      },
+    ],
+    "launcher-v",
+  );
+
+  assert.deepEqual(
+    notes.releases.map((release) => release.version),
+    ["1.0.1", "1.0.2"],
+  );
+});

@@ -14,7 +14,7 @@ Download and install **Rebellion 2** for Windows or macOS.
       <sub>64-bit Windows installer</sub>
     </td>
     <td align="center" width="50%">
-      <a href="https://github.com/adasgames/rebellion2-installers/releases/download/latest-macos/Rebellion2-macOS.zip">
+      <a href="https://github.com/adasgames/rebellion2-installers/releases/latest/download/Rebellion2-macOS.zip">
         <img src="docs/assets/apple.svg" width="64" alt="macOS"><br>
         <strong>Download latest for macOS</strong>
       </a><br>
@@ -42,10 +42,9 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
    double-click will be blocked — you only need the right-click trick once.)
 
-The launcher checks for signed macOS application updates. You may install one immediately or keep
-playing the installed version; its matching game content remains available independently of the
-Windows release channel. When an application update also requires matching game content, approving
-the release once carries through the launcher restart and the content update continues automatically.
+The launcher checks separate signed channels for launcher updates and game updates. A launcher
+update downloads in the background, applies the next time the launcher starts, and does not replace
+the game. Game releases update the Windows or macOS player together with its matching game content.
 
 ## FAQ
 

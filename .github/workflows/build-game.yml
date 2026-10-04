@@ -1,0 +1,442 @@
+name: Build game
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: rebellion2 ref to build
+        required: true
+        default: master
+        type: string
+      asset_ref:
+        description: rebellion2-media ref to build
+        required: true
+        default: main
+        type: string
+      version:
+        description: Game version
+        required: true
+        type: string
+      release_notes:
+        description: Game patch notes in Markdown
+        required: true
+        type: string
+      publish:
+        description: Publish Windows, macOS, content, and the game update channel
+        required: true
+        default: false
+        type: boolean
+      allow_rollback:
+        description: Allow the game channel to move to an older version
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: game-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate game release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - id: release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  player-windows:
+    name: Build Windows game
+    needs: prepare
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-windows
+      asset_ref: ${{ inputs.asset_ref }}
+      source_ref: ${{ inputs.source_ref }}
+      target: StandaloneWindows64
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
+
+  player-macos:
+    name: Build macOS game
+    needs: prepare
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-macos
+      asset_ref: ${{ inputs.asset_ref }}
+      source_ref: ${{ inputs.source_ref }}
+      target: StandaloneOSX
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
+
+  content:
+    name: Stage protected content
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          docker-images: true
+          large-packages: false
+
+      - name: Checkout media
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.ASSET_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.asset_ref }}
+          ssh-key: ${{ secrets.REBELLION2_MEDIA_SSH_KEY }}
+          persist-credentials: false
+          lfs: false
+          path: assets
+
+      - name: Fetch media
+        working-directory: assets
+        env:
+          ASSET_LFS_PROXY_URL: ${{ secrets.ASSET_LFS_PROXY_URL }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+        run: |
+          set -euo pipefail
+          git lfs install
+          proxy="${ASSET_LFS_PROXY_URL%/}"
+          proxy_host="${proxy#https://}"
+          storage_host="${STORAGE_ENDPOINT#https://}"
+          git config lfs.url "https://${STORAGE_ACCESS_KEY_ID}:${STORAGE_SECRET_ACCESS_KEY}@${proxy_host}/${storage_host}/${STORAGE_BUCKET}"
+          git config lfs.concurrenttransfers 4
+          git lfs pull --include="Content/**" --exclude=""
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content; then
+            echo "Media checkout still contains Git LFS pointers." >&2
+            exit 1
+          fi
+
+      - name: Checkout private packaging support
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.BUILD_SUPPORT_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          path: support
+
+      - name: Install content packaging tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools rclone
+
+      - name: Verify staged content publication support
+        run: grep -q 'legacy latest.json unchanged' support/content/package.sh
+
+      - name: Package immutable content
+        env:
+          MEDIA_DIR: ${{ github.workspace }}/assets
+          VERSION: ${{ needs.prepare.outputs.version }}
+          OUT_DIR: ${{ runner.temp }}/content-package
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+        run: bash support/content/package.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: content-pointer
+          path: ${{ runner.temp }}/content-package/latest.json
+          if-no-files-found: error
+
+  package-windows:
+    name: Package Windows game
+    runs-on: windows-latest
+    needs: [prepare, player-windows]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: player-windows
+          path: player
+
+      - name: Download the current Windows launcher bundle
+        shell: pwsh
+        env:
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          $base = $env:CHANNEL_BASE.TrimEnd('/')
+          $pointer = Invoke-RestMethod "$base/dist/launcher.json"
+          $version = $pointer.version
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "The launcher channel has no version." }
+          Invoke-WebRequest `
+            "https://github.com/$env:GITHUB_REPOSITORY/releases/download/launcher-v$version/Rebellion2-launcher-Windows.zip" `
+            -OutFile launcher.zip
+          Expand-Archive launcher.zip launcher-bundle
+          Invoke-WebRequest "$base/$($pointer.platforms.windows.manifest)" -OutFile launcher-manifest.json
+          Set-Content launcher-version.txt -Value $version -NoNewline
+
+      - name: Package Windows game layer
+        shell: pwsh
+        run: |
+          choco install rcedit -y --no-progress
+          rcedit "player\Rebellion2.exe" --set-icon "launcher\src-tauri\icons\icon.ico"
+          node scripts/package-update-layer.mjs `
+            player `
+            "${{ needs.prepare.outputs.version }}" `
+            game-manifest-windows.json `
+            game-blobs-windows
+          Set-Content game-version.txt -Value "${{ needs.prepare.outputs.version }}" -NoNewline
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DGameDir="$PWD\player" `
+            /DLauncherPath="$PWD\launcher-bundle\rebellion2-launcher.exe" `
+            /DUpdateHelperPath="$PWD\launcher-bundle\rebellion2-update-helper.exe" `
+            /DLauncherManifestPath="$PWD\launcher-manifest.json" `
+            /DLauncherVersionPath="$PWD\launcher-version.txt" `
+            /DGameManifestPath="$PWD\game-manifest-windows.json" `
+            /DGameVersionPath="$PWD\game-version.txt" `
+            /DAppVersion="${{ needs.prepare.outputs.version }}" `
+            /DOutputDir="$PWD\dist" `
+            /DIconFile="$PWD\launcher\src-tauri\icons\icon.ico" `
+            packaging\windows\rebellion2-launcher.iss
+          Move-Item dist\*-Setup.exe Rebellion2-Windows-Setup.exe
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: game-windows
+          path: |
+            Rebellion2-Windows-Setup.exe
+            game-manifest-windows.json
+            game-blobs-windows
+          if-no-files-found: error
+
+  package-macos:
+    name: Package macOS game
+    runs-on: macos-latest
+    needs: [prepare, player-macos]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: player-macos
+          path: player-archive
+
+      - name: Extract and package the macOS game layer
+        run: |
+          set -euo pipefail
+          mkdir player
+          tar -xzf player-archive/player-macos.tar.gz -C player
+          game_app="$(find "$PWD/player" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$game_app"
+          find "$game_app/Contents/MacOS" -maxdepth 1 -type f -exec chmod +x {} \;
+          xattr -cr "$game_app"
+          mkdir macos-game-layer
+          mkdir macos-game-archive
+          ditto "$game_app" "macos-game-archive/Rebellion2 Game.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "macos-game-archive/Rebellion2 Game.app" \
+            macos-game-layer/Rebellion2-Game-macOS.zip
+          node scripts/package-update-layer.mjs \
+            macos-game-layer \
+            "${{ needs.prepare.outputs.version }}" \
+            game-manifest-macos.json \
+            game-blobs-macos
+          printf '%s' "$game_app" > game-app-path.txt
+
+      - name: Assemble the current launcher with the game
+        env:
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          set -euo pipefail
+          base="${CHANNEL_BASE%/}"
+          curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
+          launcher_version="$(jq -r .version launcher.json)"
+          test -n "$launcher_version"
+          curl --fail --location --silent --show-error \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${launcher_version}/Rebellion2-launcher-macOS.zip" \
+            -o launcher.zip
+          ditto -x -k launcher.zip launcher-bundle
+          app="$(find "$PWD/launcher-bundle" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          game_app="$(cat game-app-path.txt)"
+          test -n "$app"
+          mkdir -p "$app/Contents/Resources/InstallerMetadata"
+          ditto "$game_app" "$app/Contents/Resources/Rebellion2 Game.app"
+          cp game-manifest-macos.json "$app/Contents/Resources/InstallerMetadata/.game-manifest.json"
+          printf '%s' "${{ needs.prepare.outputs.version }}" > "$app/Contents/Resources/InstallerMetadata/.game-version"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          bash packaging/macos/build-zip.sh \
+            "$app" \
+            "${{ needs.prepare.outputs.version }}" \
+            "$PWD/Rebellion2-macOS.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: game-macos
+          path: |
+            Rebellion2-macOS.zip
+            game-manifest-macos.json
+            game-blobs-macos
+          if-no-files-found: error
+
+  publish:
+    name: Publish cross-platform game release
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    needs: [prepare, content, package-windows, package-macos]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: game-windows
+          path: windows
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: game-macos
+          path: macos
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: content-pointer
+          path: content
+
+      - name: Stage the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+            gh release upload "$TAG" windows/Rebellion2-Windows-Setup.exe macos/Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --title "Rebellion 2 $VERSION" --notes-file game-release-notes.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --draft --title "Rebellion 2 $VERSION" --notes-file game-release-notes.md --repo "$GITHUB_REPOSITORY" windows/Rebellion2-Windows-Setup.exe macos/Rebellion2-macOS.zip
+          fi
+
+      - name: Publish the game channel
+        env:
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GAME_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+          STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          windows_manifest=windows/game-manifest-windows.json
+          macos_manifest=macos/game-manifest-macos.json
+          content_pointer=content/latest.json
+          notes="release-notes-${VERSION}.json"
+          printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq --slurp 'add' > release-history.json
+          node scripts/release-notes.mjs game-release-notes.md "$notes" "$VERSION" release-history.json
+          sign_manifest() {
+            node -e '
+              const c=require("crypto"),fs=require("fs");
+              const seed=Buffer.from(process.env.GAME_SIGNING_KEY.trim(),"hex");
+              const pkcs8=Buffer.concat([Buffer.from("302e020100300506032b657004220420","hex"),seed]);
+              const key=c.createPrivateKey({key:pkcs8,format:"der",type:"pkcs8"});
+              process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
+            ' "$1"
+          }
+          windows_signature="$(sign_manifest "$windows_manifest")"
+          macos_signature="$(sign_manifest "$macos_manifest")"
+          notes_sha="$(sha256sum "$notes" | cut -d' ' -f1)"
+          jq \
+            --arg path "dist/$notes" \
+            --arg sha256 "$notes_sha" \
+            '.releaseNotes={path:$path,sha256:$sha256}' \
+            "$content_pointer" > content-with-notes.json
+          jq -n \
+            --arg version "$VERSION" \
+            --arg windows_manifest "dist/game-manifest-windows-${VERSION}.json" \
+            --arg windows_signature "$windows_signature" \
+            --arg macos_manifest "dist/game-manifest-macos-${VERSION}.json" \
+            --arg macos_signature "$macos_signature" \
+            --slurpfile content content-with-notes.json \
+            '{
+              version:$version,
+              platforms:{
+                windows:{manifest:$windows_manifest,blobs:"game-blobs/",signature:$windows_signature},
+                macos:{manifest:$macos_manifest,blobs:"game-blobs/",signature:$macos_signature}
+              },
+              content:$content[0]
+            }' > game.json
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          export RCLONE_S3_PROVIDER="$STORAGE_PROVIDER"
+          export RCLONE_S3_ACCESS_KEY_ID="$STORAGE_ACCESS_KEY_ID"
+          export RCLONE_S3_SECRET_ACCESS_KEY="$STORAGE_SECRET_ACCESS_KEY"
+          export RCLONE_S3_ENDPOINT="$STORAGE_ENDPOINT"
+          export RCLONE_S3_REGION=auto
+          remote=":s3:${STORAGE_BUCKET}"
+          if rclone lsf "${remote}/dist" --files-only --include game.json | grep -Fxq game.json; then
+            current_version="$(rclone cat "${remote}/dist/game.json" | jq -r .version)"
+            if [ "$ALLOW_ROLLBACK" != "true" ] && [ "$(node scripts/semver.mjs "$VERSION" "$current_version")" = "-1" ]; then
+              echo "Refusing to move the game channel backward from $current_version to $VERSION." >&2
+              exit 1
+            fi
+          fi
+          rclone copy windows/game-blobs-windows "${remote}/game-blobs" --ignore-existing
+          rclone copy macos/game-blobs-macos "${remote}/game-blobs" --ignore-existing
+          rclone copyto "$windows_manifest" "${remote}/dist/game-manifest-windows-${VERSION}.json"
+          rclone copyto "$macos_manifest" "${remote}/dist/game-manifest-macos-${VERSION}.json"
+          rclone copyto "$notes" "${remote}/dist/${notes}"
+          rollback="$(mktemp -d)"
+          previous_pointer=false
+          if rclone lsf "${remote}/dist" --files-only --include game.json | grep -Fxq game.json; then
+            rclone copyto "${remote}/dist/game.json" "$rollback/game.json"
+            previous_pointer=true
+          fi
+          restore_pointer() {
+            if [ "$previous_pointer" = "true" ]; then
+              rclone copyto "$rollback/game.json" "${remote}/dist/game.json"
+            else
+              rclone deletefile "${remote}/dist/game.json" || true
+            fi
+          }
+          on_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then restore_pointer; fi
+            exit "$status"
+          }
+          trap on_exit EXIT
+          rclone copyto game.json "${remote}/dist/game.json"
+          base="${CHANNEL_BASE%/}"
+          for attempt in 1 2 3 4 5 6; do
+            published="$(curl --fail --location --silent --show-error "$base/dist/game.json" | jq -r .version || true)"
+            [ "$published" = "$VERSION" ] && break
+            sleep 5
+          done
+          test "$published" = "$VERSION"
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          trap - EXIT

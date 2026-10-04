@@ -1,13 +1,9 @@
-name: Build macOS Installer
+name: Legacy macOS transition
 
-# macOS is intentionally opt-in. Push a tag like `macos-0.0.11` only after the
-# matching Windows release exists, or manually dispatch a historical backfill.
-# The independent latest-macos channel cannot move the Windows release channel.
+# One-time bridge for macOS launchers that only understand the former combined
+# channel. Normal launcher and game releases use the split workflows.
 
 on:
-  push:
-    tags:
-      - "macos-*"
   workflow_dispatch:
     inputs:
       version:
@@ -21,6 +17,11 @@ on:
         type: boolean
       allow_rollback:
         description: Allow latest-macos to move to an older version (emergency rollback only)
+        required: true
+        default: false
+        type: boolean
+      confirm_legacy_bridge:
+        description: Confirm this is the one-time transition, not a normal release
         required: true
         default: false
         type: boolean
@@ -53,12 +54,7 @@ jobs:
           STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            version="$INPUT_VERSION"
-          else
-            [[ "$GITHUB_REF_NAME" =~ ^macos-[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
-            version="${GITHUB_REF_NAME#macos-}"
-          fi
+          version="$INPUT_VERSION"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           RELEASE_TAG="v$version"
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
@@ -221,7 +217,7 @@ jobs:
           tar -tzf Rebellion2-macOS-updater.tar.gz | grep -F 'Rebellion II.app/Contents/Resources/Rebellion2 Game.app/' >/dev/null
 
       - name: Upload packaged applications
-        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        if: ${{ !inputs.publish || !inputs.confirm_legacy_bridge }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rebellion2-macos-${{ needs.prepare.outputs.version }}
@@ -232,7 +228,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish versioned and latest macOS downloads
-        if: github.event_name == 'push' || inputs.publish
+        if: inputs.publish && inputs.confirm_legacy_bridge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
