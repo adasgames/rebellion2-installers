@@ -2376,17 +2376,7 @@ fn run_update(
                 latest.version
             ));
             if finishes_application_update {
-                if let Err(error) = finish_application_update(handle) {
-                    log_line(&format!(
-                        "[launcher] couldn't finish the application update: {error}"
-                    ));
-                    show_message(
-                        handle,
-                        "Update failed",
-                        "The updated launcher could not be prepared — see launcher.log.",
-                        None,
-                    );
-                }
+                finish_application_update(handle, &latest.version);
             } else {
                 clear_approved_content_update();
                 update_progress(handle, 100, "Update complete.");
@@ -2428,35 +2418,13 @@ fn run_update(
     }
 }
 
-/// Finalizes the staged application and closes without reopening the launcher.
-#[cfg(target_os = "windows")]
-fn finish_application_update(handle: &tauri::AppHandle) -> io::Result<()> {
-    start_update_helper(false)?;
+/// Leaves a completed application update ready to play in the current launcher.
+/// A staged Windows launcher is promoted when the user next starts the launcher.
+fn finish_application_update(handle: &tauri::AppHandle, version: &str) {
     clear_approved_content_update();
-    update_progress(handle, 100, "Update complete. Closing…");
+    update_progress(handle, 100, "Update complete.");
     thread::sleep(Duration::from_millis(900));
-    handle.exit(0);
-    Ok(())
-}
-
-/// Closes after the macOS bundle and protected content are both installed.
-#[cfg(target_os = "macos")]
-fn finish_application_update(handle: &tauri::AppHandle) -> io::Result<()> {
-    clear_approved_content_update();
-    update_progress(handle, 100, "Update complete. Closing…");
-    thread::sleep(Duration::from_millis(900));
-    handle.exit(0);
-    Ok(())
-}
-
-/// Closes after a combined update on platforms without a native handoff helper.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn finish_application_update(handle: &tauri::AppHandle) -> io::Result<()> {
-    clear_approved_content_update();
-    update_progress(handle, 100, "Update complete. Closing…");
-    thread::sleep(Duration::from_millis(900));
-    handle.exit(0);
-    Ok(())
+    show_up_to_date(handle, version);
 }
 
 fn do_update(
@@ -3208,7 +3176,7 @@ fn application_update_screen(version: &str, notes: Option<&ReleaseNotes>) -> Str
         "Update available",
         false,
         &format!(
-            "Version {version} is available. The launcher will close when the update is complete."
+            "Version {version} is available. You can launch the game when the update is complete."
         ),
         &release_notes,
         &buttons,
@@ -3896,7 +3864,8 @@ mod tests {
         let screen = application_update_screen("1.2.3", None);
 
         assert!(screen.contains("Version 1.2.3 is available."));
-        assert!(screen.contains("launcher will close when the update is complete"));
+        assert!(screen.contains("You can launch the game when the update is complete."));
+        assert!(!screen.contains("launcher will close"));
         assert!(!screen.contains("restart"));
         assert!(screen.contains("choice=application-update\">Update"));
         assert!(screen.contains("choice=skip-application-update\">Not Now"));
