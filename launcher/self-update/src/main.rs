@@ -19,6 +19,8 @@ const APPLICATION_VERSION_FILE: &str = ".application-version";
 const PENDING_APPLICATION_MANIFEST_FILE: &str = ".application-manifest.pending.json";
 const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
 const LAUNCHER_BACKUP_FILE: &str = ".rebellion2-launcher.backup";
+const LEGACY_WINDOWS_LAUNCHER_FILE: &str = "rebellion2-launcher.exe";
+const LEGACY_WINDOWS_STAGED_LAUNCHER_FILE: &str = ".rebellion2-launcher.next.exe";
 
 struct Arguments {
     launcher: PathBuf,
@@ -38,6 +40,18 @@ fn main() {
 
 /// Parses the explicit paths supplied by the launcher being replaced.
 fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Arguments> {
+    #[cfg(target_os = "windows")]
+    let legacy_executable = Some(env::current_exe()?);
+    #[cfg(not(target_os = "windows"))]
+    let legacy_executable: Option<PathBuf> = None;
+    parse_arguments_with_legacy_executable(arguments, legacy_executable.as_deref())
+}
+
+/// Parses explicit arguments or the fixed-path protocol used by legacy Windows launchers.
+fn parse_arguments_with_legacy_executable(
+    arguments: impl IntoIterator<Item = OsString>,
+    legacy_executable: Option<&Path>,
+) -> io::Result<Arguments> {
     let mut launcher = None;
     let mut staged = None;
     let mut metadata_dir = None;
@@ -63,11 +77,33 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> io::Result<
             }
         }
     }
+    if launcher.is_none() && staged.is_none() && metadata_dir.is_none() && wait_pid.is_none() {
+        if let Some(executable) = legacy_executable {
+            return legacy_windows_arguments(executable, relaunch);
+        }
+    }
     Ok(Arguments {
         launcher: launcher.ok_or_else(|| missing_argument("--launcher"))?,
         staged: staged.ok_or_else(|| missing_argument("--staged"))?,
         metadata_dir: metadata_dir.ok_or_else(|| missing_argument("--metadata-dir"))?,
         wait_pid: wait_pid.ok_or_else(|| missing_argument("--wait-pid"))?,
+        relaunch,
+    })
+}
+
+/// Derives the fixed installation paths understood by the previous Windows launcher.
+fn legacy_windows_arguments(executable: &Path, relaunch: bool) -> io::Result<Arguments> {
+    let metadata_dir = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "legacy update helper has no parent directory",
+        )
+    })?;
+    Ok(Arguments {
+        launcher: metadata_dir.join(LEGACY_WINDOWS_LAUNCHER_FILE),
+        staged: metadata_dir.join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE),
+        metadata_dir: metadata_dir.to_path_buf(),
+        wait_pid: 0,
         relaunch,
     })
 }
@@ -421,5 +457,26 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_arguments_with_legacy_windows_protocol_derives_fixed_installation_paths() {
+        let arguments = parse_arguments_with_legacy_executable(
+            ["--relaunch"].into_iter().map(OsString::from),
+            Some(Path::new("installation/rebellion2-update-helper.exe")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            arguments.launcher,
+            Path::new("installation/rebellion2-launcher.exe")
+        );
+        assert_eq!(
+            arguments.staged,
+            Path::new("installation/.rebellion2-launcher.next.exe")
+        );
+        assert_eq!(arguments.metadata_dir, Path::new("installation"));
+        assert_eq!(arguments.wait_pid, 0);
+        assert!(arguments.relaunch);
     }
 }
