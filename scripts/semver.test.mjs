@@ -17,3 +17,25 @@ test("compareSemanticVersions orders prereleases before stable releases", () => 
 test("compareSemanticVersions ignores build metadata", () => {
   assert.equal(compareSemanticVersions("1.0.0+build.2", "1.0.0+build.1"), 0);
 });
+
+test("compareSemanticVersions preserves arbitrary numeric precision", () => {
+  assert.equal(
+    compareSemanticVersions(
+      "9007199254740993.0.0",
+      "9007199254740992.0.0",
+    ),
+    1,
+  );
+  assert.equal(
+    compareSemanticVersions(
+      "1.0.0-beta.9007199254740993",
+      "1.0.0-beta.9007199254740992",
+    ),
+    1,
+  );
+});
+
+test("compareSemanticVersions rejects invalid leading zeroes", () => {
+  assert.throws(() => compareSemanticVersions("01.0.0", "1.0.0"));
+  assert.throws(() => compareSemanticVersions("1.0.0-beta.01", "1.0.0"));
+});

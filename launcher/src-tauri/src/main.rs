@@ -682,6 +682,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         // Return from the gate's sign-in screens to the launcher's own screen.
         "back" => {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
+            GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             let installed = install_dir()
                 .map(|d| d.join("Content").join("catalog.xml").is_file())
                 .unwrap_or(false);
@@ -1582,29 +1583,115 @@ fn show_macos_application_update_error(
     );
 }
 
-/// True if dotted version `a` is newer than `b` (numeric per component, missing = 0).
+/// One validated semantic version split into precedence-bearing identifiers.
+struct SemanticVersion<'a> {
+    core: [&'a str; 3],
+    prerelease: Vec<&'a str>,
+}
+
+/// True if semantic version `a` is newer than `b`.
 fn version_gt(a: &str, b: &str) -> bool {
     compare_versions(a, b) == VersionOrdering::Greater
 }
 
-/// Compares dotted versions numerically per component, treating missing components as zero.
+/// Compares semantic versions without truncating arbitrarily large numeric identifiers.
 fn compare_versions(a: &str, b: &str) -> VersionOrdering {
-    let parts = |s: &str| {
-        s.split(['.', '-', '+'])
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect::<Vec<_>>()
+    let (Some(a), Some(b)) = (parse_semantic_version(a), parse_semantic_version(b)) else {
+        return VersionOrdering::Equal;
     };
-    let (a, b) = (parts(a), parts(b));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (
-            a.get(i).copied().unwrap_or(0),
-            b.get(i).copied().unwrap_or(0),
-        );
-        if x != y {
-            return x.cmp(&y);
+    for (left, right) in a.core.iter().zip(b.core.iter()) {
+        let comparison = compare_numeric_identifier(left, right);
+        if comparison != VersionOrdering::Equal {
+            return comparison;
         }
     }
-    VersionOrdering::Equal
+
+    match (a.prerelease.is_empty(), b.prerelease.is_empty()) {
+        (true, true) => VersionOrdering::Equal,
+        (true, false) => VersionOrdering::Greater,
+        (false, true) => VersionOrdering::Less,
+        (false, false) => {
+            for index in 0..a.prerelease.len().max(b.prerelease.len()) {
+                let comparison = match (a.prerelease.get(index), b.prerelease.get(index)) {
+                    (None, Some(_)) => VersionOrdering::Less,
+                    (Some(_), None) => VersionOrdering::Greater,
+                    (Some(left), Some(right)) => compare_prerelease_identifier(left, right),
+                    (None, None) => VersionOrdering::Equal,
+                };
+                if comparison != VersionOrdering::Equal {
+                    return comparison;
+                }
+            }
+            VersionOrdering::Equal
+        }
+    }
+}
+
+/// Parses the semantic-version subset accepted by the release workflow.
+fn parse_semantic_version(version: &str) -> Option<SemanticVersion<'_>> {
+    let mut build_parts = version.split('+');
+    let version = build_parts.next()?;
+    let build = build_parts.next();
+    if build_parts.next().is_some() || build.is_some_and(|value| !valid_identifiers(value, false)) {
+        return None;
+    }
+
+    let (core, prerelease) = version
+        .split_once('-')
+        .map_or((version, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    let core = core.split('.').collect::<Vec<_>>();
+    if core.len() != 3
+        || core
+            .iter()
+            .any(|identifier| !valid_numeric_identifier(identifier))
+        || prerelease.is_some_and(|value| !valid_identifiers(value, true))
+    {
+        return None;
+    }
+
+    Some(SemanticVersion {
+        core: [core[0], core[1], core[2]],
+        prerelease: prerelease.map_or_else(Vec::new, |value| value.split('.').collect()),
+    })
+}
+
+/// Returns whether a dot-separated identifier sequence is valid SemVer text.
+fn valid_identifiers(identifiers: &str, enforce_numeric_zeroes: bool) -> bool {
+    identifiers.split('.').all(|identifier| {
+        !identifier.is_empty()
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && (!enforce_numeric_zeroes
+                || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                || valid_numeric_identifier(identifier))
+    })
+}
+
+/// Returns whether a numeric identifier is nonempty and has no leading zero.
+fn valid_numeric_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier.bytes().all(|byte| byte.is_ascii_digit())
+        && (identifier == "0" || !identifier.starts_with('0'))
+}
+
+/// Compares decimal integers by magnitude without converting them to a fixed-width type.
+fn compare_numeric_identifier(left: &str, right: &str) -> VersionOrdering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// Compares two prerelease identifiers using semantic-version precedence rules.
+fn compare_prerelease_identifier(left: &str, right: &str) -> VersionOrdering {
+    let left_numeric = left.bytes().all(|byte| byte.is_ascii_digit());
+    let right_numeric = right.bytes().all(|byte| byte.is_ascii_digit());
+    match (left_numeric, right_numeric) {
+        (true, true) => compare_numeric_identifier(left, right),
+        (true, false) => VersionOrdering::Less,
+        (false, true) => VersionOrdering::Greater,
+        (false, false) => left.cmp(right),
+    }
 }
 
 /// Installs one application/content release and closes without reopening the launcher.
@@ -3957,6 +4044,44 @@ mod tests {
             "1.2.3",
             Some("1.2.3")
         ));
+    }
+
+    #[test]
+    fn compare_versions_with_prerelease_and_stable_orders_stable_last() {
+        assert_eq!(
+            compare_versions("1.0.0-beta.2", "1.0.0-beta.1"),
+            VersionOrdering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta", "1.0.0"),
+            VersionOrdering::Less
+        );
+    }
+
+    #[test]
+    fn compare_versions_with_large_identifiers_preserves_numeric_precision() {
+        assert_eq!(
+            compare_versions("9007199254740993.0.0", "9007199254740992.0.0"),
+            VersionOrdering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta.9007199254740993", "1.0.0-beta.9007199254740992"),
+            VersionOrdering::Greater
+        );
+    }
+
+    #[test]
+    fn compare_versions_with_build_metadata_ignores_metadata() {
+        assert_eq!(
+            compare_versions("1.0.0+build.2", "1.0.0+build.1"),
+            VersionOrdering::Equal
+        );
+    }
+
+    #[test]
+    fn parse_semantic_version_with_invalid_leading_zero_returns_none() {
+        assert!(parse_semantic_version("01.0.0").is_none());
+        assert!(parse_semantic_version("1.0.0-beta.01").is_none());
     }
 
     #[test]

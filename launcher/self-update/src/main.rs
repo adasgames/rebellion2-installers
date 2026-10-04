@@ -18,6 +18,7 @@ const APPLICATION_MANIFEST_FILE: &str = ".application-manifest.json";
 const APPLICATION_VERSION_FILE: &str = ".application-version";
 const PENDING_APPLICATION_MANIFEST_FILE: &str = ".application-manifest.pending.json";
 const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
+const LAUNCHER_BACKUP_FILE: &str = ".rebellion2-launcher.backup";
 
 struct Arguments {
     launcher: PathBuf,
@@ -84,7 +85,7 @@ fn missing_argument(argument: &str) -> io::Error {
 fn complete_update(arguments: Arguments) -> io::Result<()> {
     validate_paths(&arguments)?;
     wait_for_launcher_exit(arguments.wait_pid, &arguments.launcher);
-    replace_file(&arguments.staged, &arguments.launcher)?;
+    replace_and_resign_launcher(&arguments, resign_macos_bundle)?;
     promote_pending_file(
         &arguments.metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE),
         &arguments.metadata_dir.join(LAUNCHER_MANIFEST_FILE),
@@ -105,8 +106,6 @@ fn complete_update(arguments: Arguments) -> io::Result<()> {
             .join(PENDING_APPLICATION_VERSION_FILE),
         &arguments.metadata_dir.join(APPLICATION_VERSION_FILE),
     )?;
-    resign_macos_bundle(&arguments.launcher)?;
-
     if arguments.relaunch {
         Command::new(&arguments.launcher)
             .current_dir(
@@ -118,6 +117,33 @@ fn complete_update(arguments: Arguments) -> io::Result<()> {
             .spawn()?;
     }
     Ok(())
+}
+
+/// Replaces the launcher and restores the previous executable if bundle signing fails.
+fn replace_and_resign_launcher(
+    arguments: &Arguments,
+    resign: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let backup = arguments.metadata_dir.join(LAUNCHER_BACKUP_FILE);
+    if let Err(error) = fs::remove_file(&backup) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    fs::copy(&arguments.launcher, &backup)?;
+    if let Err(error) = replace_file(&arguments.staged, &arguments.launcher) {
+        let _ = fs::remove_file(&backup);
+        return Err(error);
+    }
+    if let Err(signing_error) = resign(&arguments.launcher) {
+        if let Err(rollback_error) = replace_file(&backup, &arguments.launcher) {
+            return Err(io::Error::other(format!(
+                "{signing_error}; restoring the previous launcher also failed: {rollback_error}"
+            )));
+        }
+        return Err(signing_error);
+    }
+    fs::remove_file(backup)
 }
 
 /// Replaces a managed file when a pending version exists.
@@ -293,6 +319,50 @@ mod tests {
         promote_pending_file(&pending, &destination).unwrap();
 
         assert_eq!(fs::read(destination).unwrap(), b"current");
+    }
+
+    #[test]
+    fn replace_and_resign_launcher_with_success_keeps_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("launcher");
+        let staged = directory.path().join("staged");
+        fs::write(&launcher, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let arguments = Arguments {
+            launcher: launcher.clone(),
+            staged,
+            metadata_dir: directory.path().to_path_buf(),
+            wait_pid: 1,
+            relaunch: false,
+        };
+
+        replace_and_resign_launcher(&arguments, |_| Ok(())).unwrap();
+
+        assert_eq!(fs::read(launcher).unwrap(), b"new");
+        assert!(!directory.path().join(LAUNCHER_BACKUP_FILE).exists());
+    }
+
+    #[test]
+    fn replace_and_resign_launcher_with_signing_failure_restores_previous_launcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("launcher");
+        let staged = directory.path().join("staged");
+        fs::write(&launcher, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let arguments = Arguments {
+            launcher: launcher.clone(),
+            staged,
+            metadata_dir: directory.path().to_path_buf(),
+            wait_pid: 1,
+            relaunch: false,
+        };
+
+        let result =
+            replace_and_resign_launcher(&arguments, |_| Err(io::Error::other("signing failed")));
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(launcher).unwrap(), b"old");
+        assert!(!directory.path().join(LAUNCHER_BACKUP_FILE).exists());
     }
 
     #[test]
