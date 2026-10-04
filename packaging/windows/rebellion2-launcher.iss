@@ -4,7 +4,8 @@
 ; Per-user install (no admin/UAC). Compile:
 ;   ISCC /DGameDir=<asset-free player dir> /DLauncherPath=<rebellion2-launcher.exe>
 ;        /DUpdateHelperPath=<rebellion2-self-update.exe>
-;        /DApplicationManifestPath=<manifest.json> /DApplicationVersionPath=<version.txt>
+;        /DLauncherManifestPath=<manifest.json> /DLauncherVersionPath=<version.txt>
+;        /DGameManifestPath=<manifest.json> /DGameVersionPath=<version.txt>
 ;        /DAppVersion=<x.y.z>
 ;        /DOutputDir=<dir> /DIconFile=<.ico> rebellion2-launcher.iss
 
@@ -13,12 +14,6 @@
 #endif
 #ifndef LauncherPath
   #define LauncherPath "rebellion2-launcher.exe"
-#endif
-#ifndef ApplicationManifestPath
-  #define ApplicationManifestPath "application-manifest.json"
-#endif
-#ifndef ApplicationVersionPath
-  #define ApplicationVersionPath "application-version.txt"
 #endif
 #ifndef UpdateHelperPath
   #define UpdateHelperPath "rebellion2-self-update.exe"
@@ -76,9 +71,26 @@ Source: "{#GameDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 Source: "{#LauncherPath}"; DestDir: "{app}"; Flags: ignoreversion
 ; A tiny installed helper promotes a staged launcher only after the running launcher exits.
 Source: "{#UpdateHelperPath}"; DestDir: "{app}"; DestName: "rebellion2-update-helper.exe"; Flags: ignoreversion
-; Baseline for incremental application updates. It intentionally excludes Content.
+; Independent baselines for launcher and game updates. Both exclude Content.
+#ifdef LauncherManifestPath
+Source: "{#LauncherManifestPath}"; DestDir: "{app}"; DestName: ".launcher-manifest.json"; Flags: ignoreversion
+#endif
+#ifdef LauncherVersionPath
+Source: "{#LauncherVersionPath}"; DestDir: "{app}"; DestName: ".launcher-version"; Flags: ignoreversion
+#endif
+#ifdef GameManifestPath
+Source: "{#GameManifestPath}"; DestDir: "{app}"; DestName: ".game-manifest.json"; Flags: ignoreversion
+#endif
+#ifdef GameVersionPath
+Source: "{#GameVersionPath}"; DestDir: "{app}"; DestName: ".game-version"; Flags: ignoreversion
+#endif
+; The one-time transition installer retains the former combined baseline.
+#ifdef ApplicationManifestPath
 Source: "{#ApplicationManifestPath}"; DestDir: "{app}"; DestName: ".application-manifest.json"; Flags: ignoreversion
+#endif
+#ifdef ApplicationVersionPath
 Source: "{#ApplicationVersionPath}"; DestDir: "{app}"; DestName: ".application-version"; Flags: ignoreversion
+#endif
 
 [Icons]
 ; The "Rebellion 2" shortcuts point at the launcher: it checks for updates, then
@@ -102,4 +114,7 @@ Type: filesandordirs; Name: "{app}\Content"
 Type: files; Name: "{app}\launcher.log"
 Type: files; Name: "{app}\content.zip.part"
 Type: files; Name: "{app}\.approved-content-update"
+Type: files; Name: "{app}\.launcher-manifest.pending.json"
+Type: files; Name: "{app}\.launcher-version.pending"
+Type: files; Name: "{app}\.rebellion2-launcher.next.exe"
 Type: dirifempty; Name: "{app}"

@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::{
+    env,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -8,55 +10,176 @@ use std::{
     time::Duration,
 };
 
+const LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.json";
+const LAUNCHER_VERSION_FILE: &str = ".launcher-version";
+const PENDING_LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.pending.json";
+const PENDING_LAUNCHER_VERSION_FILE: &str = ".launcher-version.pending";
 const APPLICATION_MANIFEST_FILE: &str = ".application-manifest.json";
 const APPLICATION_VERSION_FILE: &str = ".application-version";
-const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher.exe";
 const PENDING_APPLICATION_MANIFEST_FILE: &str = ".application-manifest.pending.json";
 const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
-const STAGED_LAUNCHER_FILE_NAME: &str = ".rebellion2-launcher.next.exe";
+const LAUNCHER_BACKUP_FILE: &str = ".rebellion2-launcher.backup";
+const LEGACY_WINDOWS_LAUNCHER_FILE: &str = "rebellion2-launcher.exe";
+const LEGACY_WINDOWS_STAGED_LAUNCHER_FILE: &str = ".rebellion2-launcher.next.exe";
 
-#[cfg(target_os = "windows")]
-const UNINSTALL_REGISTRY_KEY: &str = concat!(
-    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\",
-    r"{7C3F1E92-5A4B-4D8E-9F21-3B6C8A2D4E10}_is1"
-);
+struct Arguments {
+    launcher: PathBuf,
+    staged: PathBuf,
+    metadata_dir: PathBuf,
+    wait_pid: u32,
+    relaunch: bool,
+}
 
 fn main() {
-    let relaunch = std::env::args().any(|argument| argument == "--relaunch");
-    if let Err(error) = complete_update(relaunch) {
+    let result = parse_arguments(env::args_os().skip(1)).and_then(complete_update);
+    if let Err(error) = result {
         report_error(&error.to_string());
         std::process::exit(1);
     }
 }
 
-/// Waits for the installed launcher to exit, promotes all staged update files, and
-/// optionally reopens the launcher.
-fn complete_update(relaunch: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let install_dir = find_install_dir()?;
-    validate_install_dir(&install_dir)?;
-    let launcher_path = install_dir.join(LAUNCHER_FILE_NAME);
-    let staged_launcher_path = install_dir.join(STAGED_LAUNCHER_FILE_NAME);
+/// Parses the explicit paths supplied by the launcher being replaced.
+fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> io::Result<Arguments> {
+    #[cfg(target_os = "windows")]
+    let legacy_executable = Some(env::current_exe()?);
+    #[cfg(not(target_os = "windows"))]
+    let legacy_executable: Option<PathBuf> = None;
+    parse_arguments_with_legacy_executable(arguments, legacy_executable.as_deref())
+}
 
-    wait_for_launcher_exit(&launcher_path);
-    if staged_launcher_path.is_file() {
-        replace_file(&staged_launcher_path, &launcher_path)?;
+/// Parses explicit arguments or the fixed-path protocol used by legacy Windows launchers.
+fn parse_arguments_with_legacy_executable(
+    arguments: impl IntoIterator<Item = OsString>,
+    legacy_executable: Option<&Path>,
+) -> io::Result<Arguments> {
+    let mut launcher = None;
+    let mut staged = None;
+    let mut metadata_dir = None;
+    let mut wait_pid = None;
+    let mut relaunch = false;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            Some("--launcher") => launcher = arguments.next().map(PathBuf::from),
+            Some("--staged") => staged = arguments.next().map(PathBuf::from),
+            Some("--metadata-dir") => metadata_dir = arguments.next().map(PathBuf::from),
+            Some("--wait-pid") => {
+                wait_pid = arguments
+                    .next()
+                    .and_then(|value| value.to_str().and_then(|value| value.parse().ok()))
+            }
+            Some("--relaunch") => relaunch = true,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown launcher-update argument",
+                ))
+            }
+        }
     }
-    promote_pending_file(
-        &install_dir.join(PENDING_APPLICATION_MANIFEST_FILE),
-        &install_dir.join(APPLICATION_MANIFEST_FILE),
-    )?;
-    promote_pending_file(
-        &install_dir.join(PENDING_APPLICATION_VERSION_FILE),
-        &install_dir.join(APPLICATION_VERSION_FILE),
-    )?;
-    update_installed_version(&install_dir)?;
+    if launcher.is_none() && staged.is_none() && metadata_dir.is_none() && wait_pid.is_none() {
+        if let Some(executable) = legacy_executable {
+            return legacy_windows_arguments(executable, relaunch);
+        }
+    }
+    Ok(Arguments {
+        launcher: launcher.ok_or_else(|| missing_argument("--launcher"))?,
+        staged: staged.ok_or_else(|| missing_argument("--staged"))?,
+        metadata_dir: metadata_dir.ok_or_else(|| missing_argument("--metadata-dir"))?,
+        wait_pid: wait_pid.ok_or_else(|| missing_argument("--wait-pid"))?,
+        relaunch,
+    })
+}
 
-    if relaunch {
-        Command::new(&launcher_path)
-            .current_dir(&install_dir)
+/// Derives the fixed installation paths understood by the previous Windows launcher.
+fn legacy_windows_arguments(executable: &Path, relaunch: bool) -> io::Result<Arguments> {
+    let metadata_dir = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "legacy update helper has no parent directory",
+        )
+    })?;
+    Ok(Arguments {
+        launcher: metadata_dir.join(LEGACY_WINDOWS_LAUNCHER_FILE),
+        staged: metadata_dir.join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE),
+        metadata_dir: metadata_dir.to_path_buf(),
+        wait_pid: 0,
+        relaunch,
+    })
+}
+
+/// Creates a consistent missing-argument error.
+fn missing_argument(argument: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("missing {argument} launcher-update argument"),
+    )
+}
+
+/// Waits for the launcher to exit, promotes the staged launcher metadata, and
+/// optionally reopens the launcher.
+fn complete_update(arguments: Arguments) -> io::Result<()> {
+    validate_paths(&arguments)?;
+    wait_for_launcher_exit(arguments.wait_pid, &arguments.launcher);
+    replace_and_resign_launcher(&arguments, resign_macos_bundle)?;
+    promote_pending_file(
+        &arguments.metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE),
+        &arguments.metadata_dir.join(LAUNCHER_MANIFEST_FILE),
+    )?;
+    promote_pending_file(
+        &arguments.metadata_dir.join(PENDING_LAUNCHER_VERSION_FILE),
+        &arguments.metadata_dir.join(LAUNCHER_VERSION_FILE),
+    )?;
+    promote_pending_file(
+        &arguments
+            .metadata_dir
+            .join(PENDING_APPLICATION_MANIFEST_FILE),
+        &arguments.metadata_dir.join(APPLICATION_MANIFEST_FILE),
+    )?;
+    promote_pending_file(
+        &arguments
+            .metadata_dir
+            .join(PENDING_APPLICATION_VERSION_FILE),
+        &arguments.metadata_dir.join(APPLICATION_VERSION_FILE),
+    )?;
+    if arguments.relaunch {
+        Command::new(&arguments.launcher)
+            .current_dir(
+                arguments
+                    .launcher
+                    .parent()
+                    .unwrap_or(&arguments.metadata_dir),
+            )
             .spawn()?;
     }
     Ok(())
+}
+
+/// Replaces the launcher and restores the previous executable if bundle signing fails.
+fn replace_and_resign_launcher(
+    arguments: &Arguments,
+    resign: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let backup = arguments.metadata_dir.join(LAUNCHER_BACKUP_FILE);
+    if let Err(error) = fs::remove_file(&backup) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    fs::copy(&arguments.launcher, &backup)?;
+    if let Err(error) = replace_file(&arguments.staged, &arguments.launcher) {
+        let _ = fs::remove_file(&backup);
+        return Err(error);
+    }
+    if let Err(signing_error) = resign(&arguments.launcher) {
+        if let Err(rollback_error) = replace_file(&backup, &arguments.launcher) {
+            return Err(io::Error::other(format!(
+                "{signing_error}; restoring the previous launcher also failed: {rollback_error}"
+            )));
+        }
+        return Err(signing_error);
+    }
+    fs::remove_file(backup)
 }
 
 /// Replaces a managed file when a pending version exists.
@@ -67,8 +190,11 @@ fn promote_pending_file(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Waits until Windows releases its write lock on the running launcher executable.
-fn wait_for_launcher_exit(launcher_path: &Path) {
+/// Waits until the process that started this helper has exited.
+fn wait_for_launcher_exit(process_id: u32, launcher_path: &Path) {
+    #[cfg(target_os = "windows")]
+    let _ = process_id;
+    #[cfg(target_os = "windows")]
     while fs::OpenOptions::new()
         .write(true)
         .open(launcher_path)
@@ -76,14 +202,33 @@ fn wait_for_launcher_exit(launcher_path: &Path) {
     {
         thread::sleep(Duration::from_millis(50));
     }
+    #[cfg(not(target_os = "windows"))]
+    while Command::new("/bin/kill")
+        .arg("-0")
+        .arg(process_id.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = launcher_path;
 }
 
-/// Verifies that the registry target still looks like a Rebellion 2 installation.
-fn validate_install_dir(install_dir: &Path) -> io::Result<()> {
-    if !install_dir.join(LAUNCHER_FILE_NAME).is_file() {
+/// Verifies that every caller-provided path is a concrete expected file location.
+fn validate_paths(arguments: &Arguments) -> io::Result<()> {
+    if !arguments.launcher.is_file() || !arguments.staged.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "installed launcher was not found",
+            "installed or staged launcher was not found",
+        ));
+    }
+    if !arguments.metadata_dir.is_dir()
+        || arguments.staged.parent() != Some(arguments.metadata_dir.as_path())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "launcher update paths do not share the metadata directory",
         ));
     }
     Ok(())
@@ -117,62 +262,42 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-/// Returns the installation directory containing the running update helper.
-fn find_install_dir() -> io::Result<PathBuf> {
-    let executable = std::env::current_exe()?;
-    install_dir_from_executable(&executable)
-}
-
-/// Returns the parent directory of an update-helper executable.
-fn install_dir_from_executable(executable: &Path) -> io::Result<PathBuf> {
-    executable.parent().map(Path::to_path_buf).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "update helper has no parent directory",
-        )
-    })
-}
-
-#[cfg(target_os = "windows")]
-/// Updates Add or Remove Programs after the pending application version is promoted.
-fn update_installed_version(install_dir: &Path) -> io::Result<()> {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
-
-    let current_user = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(uninstall_key) = current_user.open_subkey_with_flags(
-        UNINSTALL_REGISTRY_KEY,
-        winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
-    ) else {
-        return Ok(());
-    };
-    let Ok(registered_install_dir) = uninstall_key.get_value::<String, _>("InstallLocation") else {
-        return Ok(());
-    };
-    if !paths_refer_to_same_directory(install_dir, Path::new(&registered_install_dir)) {
-        return Ok(());
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let replacement = destination.with_extension("launcher-update-replacement");
+            if let Err(error) = fs::remove_file(&replacement) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+            fs::copy(source, &replacement)?;
+            fs::rename(&replacement, destination)?;
+            fs::remove_file(source)
+        }
     }
+}
 
-    let version = fs::read_to_string(install_dir.join(APPLICATION_VERSION_FILE))?;
-    let version = version.trim();
-    uninstall_key.set_value("DisplayVersion", &version)?;
-    uninstall_key.set_value("DisplayName", &format!("Rebellion 2 version {version}"))?;
+#[cfg(target_os = "macos")]
+/// Restores an ad-hoc signature after replacing the launcher inside its app bundle.
+fn resign_macos_bundle(launcher: &Path) -> io::Result<()> {
+    let bundle = launcher
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid app bundle path"))?;
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(bundle)
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other("could not sign the updated app bundle"));
+    }
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-/// Returns whether two paths resolve to the same directory.
-fn paths_refer_to_same_directory(first: &Path, second: &Path) -> bool {
-    match (fs::canonicalize(first), fs::canonicalize(second)) {
-        (Ok(first), Ok(second)) => first == second,
-        _ => first == second,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn update_installed_version(_install_dir: &Path) -> io::Result<()> {
+#[cfg(not(target_os = "macos"))]
+fn resign_macos_bundle(_launcher: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -233,19 +358,125 @@ mod tests {
     }
 
     #[test]
-    fn validate_install_dir_without_launcher_returns_error() {
+    fn replace_and_resign_launcher_with_success_keeps_replacement() {
         let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("launcher");
+        let staged = directory.path().join("staged");
+        fs::write(&launcher, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let arguments = Arguments {
+            launcher: launcher.clone(),
+            staged,
+            metadata_dir: directory.path().to_path_buf(),
+            wait_pid: 1,
+            relaunch: false,
+        };
 
-        assert!(validate_install_dir(directory.path()).is_err());
+        replace_and_resign_launcher(&arguments, |_| Ok(())).unwrap();
+
+        assert_eq!(fs::read(launcher).unwrap(), b"new");
+        assert!(!directory.path().join(LAUNCHER_BACKUP_FILE).exists());
     }
 
     #[test]
-    fn install_dir_from_executable_returns_executable_parent() {
-        let executable = Path::new("installation").join("rebellion2-update-helper.exe");
+    fn replace_and_resign_launcher_with_signing_failure_restores_previous_launcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("launcher");
+        let staged = directory.path().join("staged");
+        fs::write(&launcher, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let arguments = Arguments {
+            launcher: launcher.clone(),
+            staged,
+            metadata_dir: directory.path().to_path_buf(),
+            wait_pid: 1,
+            relaunch: false,
+        };
+
+        let result =
+            replace_and_resign_launcher(&arguments, |_| Err(io::Error::other("signing failed")));
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(launcher).unwrap(), b"old");
+        assert!(!directory.path().join(LAUNCHER_BACKUP_FILE).exists());
+    }
+
+    #[test]
+    fn validate_paths_without_launcher_returns_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = Arguments {
+            launcher: directory.path().join("launcher"),
+            staged: directory.path().join("staged"),
+            metadata_dir: directory.path().to_path_buf(),
+            wait_pid: 1,
+            relaunch: false,
+        };
+
+        assert!(validate_paths(&arguments).is_err());
+    }
+
+    #[test]
+    fn parse_arguments_with_required_paths_returns_arguments() {
+        let arguments = parse_arguments(
+            [
+                "--launcher",
+                "installation/launcher",
+                "--staged",
+                "metadata/staged",
+                "--metadata-dir",
+                "metadata",
+                "--wait-pid",
+                "42",
+                "--relaunch",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap();
+
+        assert_eq!(arguments.launcher, Path::new("installation/launcher"));
+        assert_eq!(arguments.staged, Path::new("metadata/staged"));
+        assert_eq!(arguments.metadata_dir, Path::new("metadata"));
+        assert_eq!(arguments.wait_pid, 42);
+        assert!(arguments.relaunch);
+    }
+
+    #[test]
+    fn parse_arguments_without_wait_pid_returns_error() {
+        let result = parse_arguments(
+            [
+                "--launcher",
+                "installation/launcher",
+                "--staged",
+                "metadata/staged",
+                "--metadata-dir",
+                "metadata",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_arguments_with_legacy_windows_protocol_derives_fixed_installation_paths() {
+        let arguments = parse_arguments_with_legacy_executable(
+            ["--relaunch"].into_iter().map(OsString::from),
+            Some(Path::new("installation/rebellion2-update-helper.exe")),
+        )
+        .unwrap();
 
         assert_eq!(
-            install_dir_from_executable(&executable).unwrap(),
-            Path::new("installation")
+            arguments.launcher,
+            Path::new("installation/rebellion2-launcher.exe")
         );
+        assert_eq!(
+            arguments.staged,
+            Path::new("installation/.rebellion2-launcher.next.exe")
+        );
+        assert_eq!(arguments.metadata_dir, Path::new("installation"));
+        assert_eq!(arguments.wait_pid, 0);
+        assert!(arguments.relaunch);
     }
 }

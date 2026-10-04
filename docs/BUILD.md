@@ -1,17 +1,20 @@
-# Build & release pipeline
+# Build and release pipeline
 
-How the installers in this repo are produced. For players, see the [README](../README.md).
+How the installers and update channels in this repository are produced. For players, see the
+[README](../README.md).
 
-Separate GitHub Actions workflows build **asset-free** game players from
-[`rebellion2`](https://github.com/davidadas/rebellion2) and package the launcher in this
-repository. OS-specific tags select which platform to build. Windows and macOS publish separate
-application-update channels, so publishing one platform cannot strand the other. Both launchers
-resolve immutable media for their own application version rather than blindly following another
-platform's latest release. The expensive macOS runner remains opt-in. The packages ship **no art**
-— the launcher downloads content from the configured distribution service after ownership
-verification.
+Launcher releases and game releases are independent:
 
-The **Windows** and **macOS** legs are live. Linux remains parked.
+- A **launcher release** has its own version, patch notes, signed Windows and macOS launcher
+  layers, and `dist/launcher.json` pointer. It never builds or publishes the Unity player or game
+  content.
+- A **game release** has its own version, patch notes, signed Windows and macOS player layers,
+  matching protected content, installers for both platforms, and `dist/game.json` pointer. It uses
+  the latest published launcher when assembling fresh installers, but it never changes the launcher
+  channel.
+
+The packages ship no licensed art. The launcher verifies ownership before downloading protected
+content. Windows and macOS are released together within each channel. Linux remains parked.
 
 | Platform | Package                                | Tool                     | Status |
 | -------- | -------------------------------------- | ------------------------ | ------ |
@@ -19,92 +22,62 @@ The **Windows** and **macOS** legs are live. Linux remains parked.
 | macOS    | `Rebellion2-macOS.zip`                 | universal `.app` archive | live   |
 | Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`           | parked |
 
-The packages do not have trusted platform signatures yet, which is why Windows and macOS warn on
-first launch. Windows application manifests and macOS updater archives do have independent
-cryptographic signatures that the launchers verify before installing automatic updates.
-Authenticode on Windows and Apple Developer ID signing/notarization on macOS remain on the roadmap.
+The packages do not have trusted platform signatures yet, so Windows and macOS warn on first
+launch. Every downloaded launcher and game file is nevertheless authenticated by a signed manifest
+and a SHA-256 digest. Authenticode and Apple Developer ID signing/notarization remain on the roadmap.
 
-## Triggering a build
+## Building a launcher release
 
-The workflows have three entry points, and the difference matters:
+Actions tab → **Build launcher** → **Run workflow**.
 
-- **Windows tag — cuts a Release.** Push a tag matching `windows-*` to _this_ repo:
+- **version** is the independent launcher version, such as `1.0.1`.
+- **release_notes** contains launcher-only Markdown notes.
+- **publish** controls whether the run moves the live launcher channel.
+- **allow_rollback** is reserved for an intentional emergency rollback.
 
-  ```bash
-  git tag windows-0.1.0
-  git push origin windows-0.1.0
-  ```
+The workflow builds the Windows and universal macOS launchers together. A non-publishing run uploads
+workflow artifacts only. A publishing run creates or updates GitHub Release `launcher-v<version>`,
+uploads signed manifests and content-addressed blobs, publishes launcher-only release notes, and
+moves `dist/launcher.json` last.
 
-  This runs the Windows pipeline and publishes GitHub Release `v0.1.0`. Tag builds check out
-  `v0.1.0` from both the game source and private build-asset source, so both repositories must
-  carry the ordinary matching version tag before the installer tag is pushed.
+Installed launchers display this as a **Launcher update**. They download and stage it without
+restarting or closing. The same session then checks for a game update and always leaves the player
+with a **Play game** action. The staged launcher applies the next time the launcher starts.
 
-- **Manual Windows dispatch — test build only.** Actions tab → **Build Windows Installer** →
-  **Run workflow**. The publishing jobs are gated on `github.ref_type == 'tag'`, so dispatch runs
-  produce downloadable **artifacts** without publishing a GitHub Release or changing the live
-  content/update channel. Inputs
-  (all optional):
-  - **version** — version string (blank = `0.0.0-dev`).
-  - **source_ref** — `rebellion2` ref to build (default `master`).
+## Building a game release
 
-- **macOS tag — release attachment.** After the Windows release succeeds, push the corresponding
-  platform tag:
+Actions tab → **Build game** → **Run workflow**.
 
-  ```bash
-  git tag macos-0.1.0
-  git push origin macos-0.1.0
-  ```
+- **source_ref** selects the `rebellion2` revision.
+- **asset_ref** selects the matching `rebellion2-media` revision.
+- **version** is the game/content version, such as `0.0.26`.
+- **release_notes** contains game-only Markdown notes.
+- **publish** controls whether the run moves the live game channel.
+- **allow_rollback** is reserved for an intentional emergency rollback.
 
-  The workflow verifies that the release and its immutable application/content artifacts exist
-  before starting either expensive build. This permits a missed macOS build to be backfilled after
-  the live channel has advanced. It then attaches `Rebellion2-macOS.zip` to that release without
-  changing the main release pointer. It updates the prerelease `latest-macos` alias used by the
-  README's stable macOS download link and the launcher's signed macOS update pointer only when the
-  build is not older than the current macOS release.
+The workflow builds Windows and macOS players in parallel, packages a signed player layer for each,
+and assembles both fresh installers with the current published launcher. When publishing, it also
+uploads the immutable protected content archive, manifest, and blobs. It creates a draft GitHub
+Release, uploads both installers, publishes `dist/game.json` only after every immutable artifact is
+available, verifies the public pointer, and then publishes the GitHub Release.
 
-- **Manual macOS dispatch — historical release/backfill.** Actions tab →
-  **Build macOS Installer** → **Run workflow**, then enter an existing version such as `0.0.14`.
-  The workflow verifies the immutable application and content artifacts for that version before it
-  builds anything. Manual runs upload workflow artifacts but do not alter a Release unless the
-  **publish** input is explicitly enabled. Publishing an older backfill attaches its versioned
-  assets without moving `latest-macos`; enable **allow_rollback** as well only for an intentional
-  emergency rollback. This is the supported way to publish the first auto-updating Mac build
-  without recreating an old source tag.
+`dist/game.json` binds one game version to all of the following:
 
-## Jobs
+- The signed Windows player manifest and public game blobs.
+- The signed macOS player manifest and public game blobs.
+- The matching protected content manifest and blobs.
+- The game release-notes document.
 
-1. **prepare** — resolves the version: the tag name minus its `windows-` prefix, else the
-   `version` input, else `0.0.0-dev`. The workflow passes this value to the Unity player,
-   launcher, content package, and installer so releases do not require a source-controlled
-   version bump.
-2. **player-windows** (`ubuntu-latest`) — calls the shared player workflow, checks out the game
-   and private build assets, fetches their LFS objects, and installs them into `Assets/Content` plus
-   `Assets/Art/Models/MainMenu` for prefab authoring. It builds `StandaloneWindows64` via
-   `StandalonePlayerBuild.Build`, which strips `Assets/Content` and verifies it did not leak.
-3. **publish-content** (`ubuntu-latest`, tag builds only) — packages and uploads the immutable
-   versioned content archive, manifest, and blobs. It stages `latest.json` as a workflow artifact
-   but does not change the live channel.
-4. **windows-installer** (`windows-latest`) — starts as soon as `player-windows` finishes, builds
-   the launcher (`cargo build --release`),
-   stamps the game `.exe` icon (`rcedit`), packages the one-time setup executable, and produces
-   the manifest, blobs, and installed handoff helper used for later incremental application updates.
-5. **release** (`if: github.ref_type == 'tag'`) — waits for the Windows installer and immutable
-   content upload, stages the installer in a draft GitHub Release, and uploads the signed application
-   layer. It converts second-level headings and their bullet lists from the draft Release description
-   into a versioned release-notes JSON document when any are present. It embeds the matching content
-   and optional release-notes pointers inside `application.json`, publishes that single release
-   pointer, and verifies both versions through the direct and public channel. Only then does it
-   publish the GitHub Release. Any failure restores the previous pointer; the installer remains
-   hidden in its draft. Legacy `latest.json` remains pinned for older launchers.
+Publishing a game release cannot move `dist/launcher.json`. Publishing a launcher release cannot
+move `dist/game.json`, publish content, or replace a game player.
 
 ## Release notes
 
-Write launcher patch notes in the draft GitHub Release description. Use `##` headings for sections
-and `*` or `-` bullets for individual changes. Other prose remains on GitHub but is not shown by the
-launcher. For example:
+Both workflows accept Markdown with `##` section headings and `*` or `-` bullets. Other prose may
+appear on GitHub but is not shown in the launcher. For example:
 
 ```markdown
-## Highlights
+## Additions
 
 * Added new strategic options.
 
@@ -113,57 +86,29 @@ launcher. For example:
 * Fixed interrupted manufacturing orders.
 ```
 
-The release workflow converts that Markdown to `dist/release-notes-<version>.json`, adds the usable
-notes from earlier published releases, records the document's path and SHA-256 digest in the content
-portion of `dist/application.json`, and publishes both atomically. An absent usable section for the
-current release omits the pointer. The launcher also ignores missing, corrupt, mismatched, or
-malformed notes so release notes can never prevent an update.
+Game notes are published as `dist/release-notes-<version>.json`. Launcher notes are published as
+`dist/release-notes-launcher-<version>.json`. Their histories are collected from separate GitHub
+tag families (`v<version>` and `launcher-v<version>`), so launcher changes never appear in game
+notes and game changes never appear in launcher notes.
 
-The generated release-notes document has this schema:
+The generated document has this schema:
 
 ```json
 {
-  "version": "0.0.21",
+  "version": "1.0.1",
   "sections": [
     {
-      "title": "Highlights",
-      "items": [
-        "Added new strategic options."
-      ]
-    },
-    {
       "title": "Fixes",
-      "items": [
-        "Fixed interrupted manufacturing orders."
-      ]
+      "items": ["Kept the launcher open after downloading an update."]
     }
   ],
   "releases": [
     {
-      "version": "0.0.20",
+      "version": "1.0.1",
       "sections": [
         {
           "title": "Fixes",
-          "items": [
-            "Fixed an earlier issue."
-          ]
-        }
-      ]
-    },
-    {
-      "version": "0.0.21",
-      "sections": [
-        {
-          "title": "Highlights",
-          "items": [
-            "Added new strategic options."
-          ]
-        },
-        {
-          "title": "Fixes",
-          "items": [
-            "Fixed interrupted manufacturing orders."
-          ]
+          "items": ["Kept the launcher open after downloading an update."]
         }
       ]
     }
@@ -171,58 +116,47 @@ The generated release-notes document has this schema:
 }
 ```
 
-`version` must match the content release. `sections` must contain at least one object, and every
-section must have a non-empty `title` and at least one string in `items`. `releases` contains each
-published version with usable notes through the current release. The top-level `sections` remain the
-current release's notes so launchers that predate cumulative notes remain compatible.
+The pointer records the document path and digest. The launcher ignores missing, corrupt,
+mismatched, or malformed notes so notes cannot prevent an update. When an installation skips game
+or launcher versions, the corresponding view combines only that channel's newer notes.
 
-The launcher compares `releases` with the installed content version and combines only newer entries
-through the target version. It groups their items by section, removes exact duplicates, and retains
-the Additions, Changes, Fixes order when those sections are present. A Mac several releases behind
-therefore sees all skipped notes in one view, while an installation only one release behind sees only
-the current notes. The combined notes remain visible while the content update continues after an
-application-update restart.
+## Local launcher walkthrough
 
-The matching content object in `application.json` references the document without embedding its
-display text:
+Run the debug launcher with `--preview-update-flow` to inspect the split flow without contacting the
+live channel or writing update files:
 
-```json
-{
-  "releaseNotes": {
-    "path": "dist/release-notes-x.x.xx.json",
-    "sha256": "<SHA-256 of the release-notes document>"
-  }
-}
+```bash
+cargo run --manifest-path launcher/src-tauri/Cargo.toml -- --preview-update-flow
 ```
 
-The opt-in macOS workflow has its own cheap preflight and Ubuntu Unity-player job. Only its final
-packaging job uses `macos-latest`; it embeds the Unity player before Tauri signs and packages the
-complete universal application, verifies both direct-download and updater archives, attaches them
-to the existing versioned release, and updates the stable `latest-macos` download alias. The alias
-contains `latest-macos.json`, while its signed updater URL points at the immutable versioned
-release. Existing Mac users may decline an application update and continue using media matching
-their installed application version.
+The walkthrough shows a launcher update and launcher notes, simulates staging it, proceeds to a game
+update with separate game notes, and finishes on the ready-to-play screen.
+
+## Legacy transition
+
+`build-windows-installer.yml` and `build-macos-installer.yml` remain temporarily available only to
+deliver the first split-aware launcher to installations that know the former combined application
+channel. After that bridge release is deployed, all normal releases use `build-launcher.yml` or
+`build-game.yml`. The legacy channel stays pinned so it cannot couple later launcher and game
+releases.
 
 ## Private release configuration
 
-Release jobs depend on private source locations, service endpoints, storage credentials, signing
-material, and build credentials configured in GitHub Actions. Their values and operational setup
-are intentionally maintained outside this public repository. `GITHUB_TOKEN` is provided
-automatically and publishes the Release. macOS updater builds require the
-`TAURI_SIGNING_PRIVATE_KEY` repository secret; its matching public key is committed in the Tauri
-configuration so installed launchers can reject forged updater archives.
+Release jobs use repository secrets for source repositories, ownership and content endpoints,
+storage, signing keys, and Unity credentials. Their values and operational setup remain outside this
+public repository. `GITHUB_TOKEN` is supplied automatically for GitHub Releases.
 
 ## Layout
 
-```
-.github/workflows/build-windows-installer.yml # windows-* release and live channel
-.github/workflows/build-macos-installer.yml   # macos-* opt-in release attachment
-.github/workflows/build-player.yml            # shared Ubuntu Unity player build
-launcher/                                  # Tauri launcher/patcher source
-launcher/self-update/                      # staged-launcher handoff helper
-packaging/windows/rebellion2-launcher.iss  # Windows (Inno Setup) installer — the live one
-packaging/windows/rebellion2.nsi           # legacy NSIS script, unused by the current pipeline
-packaging/linux/build-appimage.sh          # AppDir assembly + appimagetool (parked)
-packaging/linux/rebellion2.desktop         # AppImage desktop entry (parked)
-packaging/macos/build-zip.sh               # complete signed macOS app -> direct-download archive
+```text
+.github/workflows/build-launcher.yml          # independent cross-platform launcher release
+.github/workflows/build-game.yml              # cross-platform game, content, and installers
+.github/workflows/build-player.yml            # shared Unity player build
+.github/workflows/build-windows-installer.yml # temporary legacy transition
+.github/workflows/build-macos-installer.yml   # temporary legacy transition
+launcher/                                     # Tauri launcher source
+launcher/self-update/                         # staged-launcher handoff helper
+launcher/update-core/                         # signed manifest diff/apply engine
+packaging/windows/rebellion2-launcher.iss     # Windows installer
+packaging/macos/build-zip.sh                  # complete macOS app archive
 ```

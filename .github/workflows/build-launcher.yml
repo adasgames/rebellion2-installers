@@ -1,0 +1,325 @@
+name: Build launcher
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Launcher version (for example, 1.0.0)
+        required: true
+        type: string
+      release_notes:
+        description: Launcher patch notes in Markdown
+        required: true
+        type: string
+      publish:
+        description: Publish the Windows and macOS launcher update together
+        required: true
+        default: false
+        type: boolean
+      allow_rollback:
+        description: Allow the launcher channel to move to an older version
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: launcher-${{ github.event_name == 'workflow_dispatch' && 'release' || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate launcher release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Test release and packaging scripts
+        run: node --test scripts/*.test.mjs
+
+      - id: release
+        env:
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '0.0.0-ci' }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          node scripts/semver.mjs "$VERSION" "$VERSION" >/dev/null
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Build Windows launcher
+    runs-on: windows-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Test and lint launcher crates
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path launcher/update-core/Cargo.toml --check
+          cargo fmt --manifest-path launcher/self-update/Cargo.toml --check
+          cargo fmt --manifest-path launcher/src-tauri/Cargo.toml --check
+          cargo test --manifest-path launcher/update-core/Cargo.toml --all-features
+          cargo test --manifest-path launcher/self-update/Cargo.toml --all-features
+          cargo test --manifest-path launcher/src-tauri/Cargo.toml --all-features
+          cargo clippy --manifest-path launcher/update-core/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path launcher/self-update/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path launcher/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Build launcher and handoff helper
+        shell: pwsh
+        env:
+          REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
+          REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
+          REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:REB2_AUTH_BASE_URL)) {
+            throw "The ownership service is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_BASE_URL)) {
+            throw "The update channel is not configured."
+          }
+          cargo build --release --manifest-path launcher/src-tauri/Cargo.toml
+          cargo build --release --manifest-path launcher/self-update/Cargo.toml
+          New-Item -ItemType Directory -Force launcher-layer | Out-Null
+          Copy-Item launcher/src-tauri/target/release/rebellion2-launcher.exe launcher-layer/
+          Copy-Item launcher/self-update/target/release/rebellion2-self-update.exe launcher-layer/rebellion2-update-helper.exe
+          node scripts/package-update-layer.mjs `
+            launcher-layer `
+            "${{ needs.prepare.outputs.version }}" `
+            launcher-manifest-windows.json `
+            launcher-blobs-windows
+          Compress-Archive -Path launcher-layer\* -DestinationPath Rebellion2-launcher-Windows.zip
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: launcher-windows
+          path: |
+            launcher-manifest-windows.json
+            launcher-blobs-windows
+            Rebellion2-launcher-Windows.zip
+          if-no-files-found: error
+
+  macos:
+    name: Build macOS launcher
+    runs-on: macos-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Test and lint launcher crates
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path launcher/update-core/Cargo.toml --check
+          cargo fmt --manifest-path launcher/self-update/Cargo.toml --check
+          cargo fmt --manifest-path launcher/src-tauri/Cargo.toml --check
+          cargo test --manifest-path launcher/update-core/Cargo.toml --all-features
+          cargo test --manifest-path launcher/self-update/Cargo.toml --all-features
+          cargo test --manifest-path launcher/src-tauri/Cargo.toml --all-features
+          cargo clippy --manifest-path launcher/update-core/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path launcher/self-update/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path launcher/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build universal launcher and handoff helper
+        env:
+          REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
+          REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
+          REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$REB2_AUTH_BASE_URL"
+          test -n "$REB2_CONTENT_BASE_URL"
+          jq --arg version "$REB2_LAUNCHER_VERSION" '.version = $version' \
+            launcher/src-tauri/tauri.conf.json > launcher/src-tauri/tauri.launcher.conf.json
+          (
+            cd launcher/src-tauri
+            cargo tauri build \
+              --config tauri.launcher.conf.json \
+              --target universal-apple-darwin \
+              --bundles app
+          )
+          cargo build --release --manifest-path launcher/self-update/Cargo.toml --target aarch64-apple-darwin
+          cargo build --release --manifest-path launcher/self-update/Cargo.toml --target x86_64-apple-darwin
+          mkdir launcher-layer
+          cp "launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app/Contents/MacOS/rebellion2-launcher" \
+            launcher-layer/rebellion2-launcher
+          lipo -create \
+            launcher/self-update/target/aarch64-apple-darwin/release/rebellion2-self-update \
+            launcher/self-update/target/x86_64-apple-darwin/release/rebellion2-self-update \
+            -output launcher-layer/rebellion2-update-helper
+          chmod +x launcher-layer/rebellion2-launcher launcher-layer/rebellion2-update-helper
+          node scripts/package-update-layer.mjs \
+            launcher-layer \
+            "${{ needs.prepare.outputs.version }}" \
+            launcher-manifest-macos.json \
+            launcher-blobs-macos
+          ditto -c -k --sequesterRsrc --keepParent \
+            "launcher/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rebellion II.app" \
+            Rebellion2-launcher-macOS.zip
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: launcher-macos
+          path: |
+            launcher-manifest-macos.json
+            launcher-blobs-macos
+            Rebellion2-launcher-macOS.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish launcher release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-latest
+    needs: [prepare, windows, macos]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher-windows
+          path: windows
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher-macos
+          path: macos
+
+      - name: Sign and publish one cross-platform launcher release
+        env:
+          LAUNCHER_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+          STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          windows_manifest="windows/launcher-manifest-windows.json"
+          macos_manifest="macos/launcher-manifest-macos.json"
+          notes="release-notes-launcher-${VERSION}.json"
+          printf '%s\n' "$RELEASE_NOTES" > launcher-release-notes.md
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq --slurp 'add' > release-history.json
+          node scripts/release-notes.mjs \
+            launcher-release-notes.md \
+            "$notes" \
+            "$VERSION" \
+            release-history.json \
+            launcher-v
+          sign_manifest() {
+            node -e '
+              const c=require("crypto"),fs=require("fs");
+              const seed=Buffer.from(process.env.LAUNCHER_SIGNING_KEY.trim(),"hex");
+              const pkcs8=Buffer.concat([Buffer.from("302e020100300506032b657004220420","hex"),seed]);
+              const key=c.createPrivateKey({key:pkcs8,format:"der",type:"pkcs8"});
+              process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
+            ' "$1"
+          }
+          windows_signature=$(sign_manifest "$windows_manifest")
+          macos_signature=$(sign_manifest "$macos_manifest")
+          notes_sha=$(sha256sum "$notes" | cut -d' ' -f1)
+          jq -n \
+            --arg version "$VERSION" \
+            --arg windows_manifest "dist/launcher-manifest-windows-${VERSION}.json" \
+            --arg windows_signature "$windows_signature" \
+            --arg macos_manifest "dist/launcher-manifest-macos-${VERSION}.json" \
+            --arg macos_signature "$macos_signature" \
+            --arg notes_path "dist/${notes}" \
+            --arg notes_sha "$notes_sha" \
+            '{
+              version:$version,
+              platforms:{
+                windows:{manifest:$windows_manifest,blobs:"launcher-blobs/",signature:$windows_signature},
+                macos:{manifest:$macos_manifest,blobs:"launcher-blobs/",signature:$macos_signature}
+              },
+              releaseNotes:{path:$notes_path,sha256:$notes_sha}
+            }' > launcher.json
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          export RCLONE_S3_PROVIDER="$STORAGE_PROVIDER"
+          export RCLONE_S3_ACCESS_KEY_ID="$STORAGE_ACCESS_KEY_ID"
+          export RCLONE_S3_SECRET_ACCESS_KEY="$STORAGE_SECRET_ACCESS_KEY"
+          export RCLONE_S3_ENDPOINT="$STORAGE_ENDPOINT"
+          export RCLONE_S3_REGION=auto
+          remote=":s3:${STORAGE_BUCKET}"
+          tag="launcher-v${VERSION}"
+          printf '%s\n' "$RELEASE_NOTES" > launcher-release-body.md
+          if rclone lsf "${remote}/dist" --files-only --include launcher.json | grep -Fxq launcher.json; then
+            current_version=$(rclone cat "${remote}/dist/launcher.json" | jq -r .version)
+            if [ "$ALLOW_ROLLBACK" != "true" ] && [ "$(node scripts/semver.mjs "$VERSION" "$current_version")" = "-1" ]; then
+              echo "Refusing to move the launcher channel backward from $current_version to $VERSION." >&2
+              exit 1
+            fi
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "Refusing to overwrite published launcher release $tag." >&2
+              exit 1
+            fi
+            gh release upload "$tag" \
+              windows/Rebellion2-launcher-Windows.zip \
+              macos/Rebellion2-launcher-macOS.zip \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+            gh release edit "$tag" \
+              --title "Rebellion 2 launcher $VERSION" \
+              --notes-file launcher-release-body.md \
+              --latest=false \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --draft \
+              --latest=false \
+              --title "Rebellion 2 launcher $VERSION" \
+              --notes-file launcher-release-body.md \
+              --repo "$GITHUB_REPOSITORY" \
+              windows/Rebellion2-launcher-Windows.zip \
+              macos/Rebellion2-launcher-macOS.zip
+          fi
+          rclone copy windows/launcher-blobs-windows "${remote}/launcher-blobs" --ignore-existing
+          rclone copy macos/launcher-blobs-macos "${remote}/launcher-blobs" --ignore-existing
+          rclone copyto "$windows_manifest" "${remote}/dist/launcher-manifest-windows-${VERSION}.json"
+          rclone copyto "$macos_manifest" "${remote}/dist/launcher-manifest-macos-${VERSION}.json"
+          rclone copyto "$notes" "${remote}/dist/${notes}"
+          rollback="$(mktemp -d)"
+          previous_pointer=false
+          if rclone lsf "${remote}/dist" --files-only --include launcher.json | grep -Fxq launcher.json; then
+            rclone copyto "${remote}/dist/launcher.json" "$rollback/launcher.json"
+            previous_pointer=true
+          fi
+          restore_pointer() {
+            if [ "$previous_pointer" = "true" ]; then
+              rclone copyto "$rollback/launcher.json" "${remote}/dist/launcher.json"
+            else
+              rclone deletefile "${remote}/dist/launcher.json" || true
+            fi
+          }
+          on_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then restore_pointer; fi
+            exit "$status"
+          }
+          trap on_exit EXIT
+          rclone copyto launcher.json "${remote}/dist/launcher.json"
+          test "$(rclone cat "${remote}/dist/launcher.json" | jq -r .version)" = "$VERSION"
+          test "$(curl --fail --location --silent --show-error "${CHANNEL_BASE%/}/dist/launcher.json" | jq -r .version)" = "$VERSION"
+          gh release edit "$tag" --draft=false --latest=false --repo "$GITHUB_REPOSITORY"
+          trap - EXIT
