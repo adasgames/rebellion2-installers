@@ -354,7 +354,7 @@ fn main() {
                 )
                 .title("Rebellion 2 Launcher")
                 .inner_size(520.0, 700.0)
-                .resizable(true)
+                .resizable(false)
                 .on_navigation(move |url| on_nav(&navigation_handle, url))
                 .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
                 .build()?;
@@ -366,7 +366,7 @@ fn main() {
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
-                    .resizable(true)
+                    .resizable(false)
                     .on_navigation({
                         let h = handle.clone();
                         move |url| on_nav(&h, url)
