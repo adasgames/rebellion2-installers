@@ -1694,7 +1694,7 @@ fn compare_prerelease_identifier(left: &str, right: &str) -> VersionOrdering {
     }
 }
 
-/// Installs one application/content release and closes without reopening the launcher.
+/// Installs one application/content release and leaves the launcher ready to play.
 #[cfg(target_os = "windows")]
 fn run_windows_application_update(handle: &tauri::AppHandle, update: &ApplicationUpdate) {
     update_progress(handle, 0, "Preparing update…");
