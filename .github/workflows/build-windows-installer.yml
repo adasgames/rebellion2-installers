@@ -362,8 +362,8 @@ jobs:
           MANIFEST=application-update-metadata/application-manifest.json
           CONTENT_POINTER=content-pointer/latest.json
           RELEASE_NOTES=release-notes-${VERSION}.json
-          RELEASE_NOTES_HISTORY=release-notes-history.json
-          RELEASE_NOTES_POINTER=release-notes-pointer.json
+          RELEASE_NOTES_HISTORY="release-notes-history.json"
+          RELEASE_NOTES_POINTER="release-notes-pointer.json"
           jq -e --arg version "$VERSION" '
             .version == $version and
             .zip == "dist/content-\($version).zip" and
@@ -455,7 +455,7 @@ jobs:
 
           base="${REB2_CONTENT_BASE_URL%/}"
           published=false
-          for attempt in 1 2 3 4 5 6; do
+          for _ in 1 2 3 4 5 6; do
             release=$(curl --fail --location --silent --show-error "$base/dist/application.json") || {
               sleep 5
               continue
