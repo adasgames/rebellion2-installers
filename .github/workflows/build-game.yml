@@ -432,7 +432,7 @@ jobs:
           trap on_exit EXIT
           rclone copyto game.json "${remote}/dist/game.json"
           base="${CHANNEL_BASE%/}"
-          for attempt in 1 2 3 4 5 6; do
+          for _ in 1 2 3 4 5 6; do
             published="$(curl --fail --location --silent --show-error "$base/dist/game.json" | jq -r .version || true)"
             [ "$published" = "$VERSION" ] && break
             sleep 5
