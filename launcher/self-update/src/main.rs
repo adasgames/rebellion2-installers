@@ -18,6 +18,7 @@ const APPLICATION_MANIFEST_FILE: &str = ".application-manifest.json";
 const APPLICATION_VERSION_FILE: &str = ".application-version";
 const PENDING_APPLICATION_MANIFEST_FILE: &str = ".application-manifest.pending.json";
 const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
+#[cfg(any(target_os = "macos", test))]
 const LAUNCHER_BACKUP_FILE: &str = ".rebellion2-launcher.backup";
 const LEGACY_WINDOWS_LAUNCHER_FILE: &str = "rebellion2-launcher.exe";
 const LEGACY_WINDOWS_STAGED_LAUNCHER_FILE: &str = ".rebellion2-launcher.next.exe";
@@ -121,7 +122,7 @@ fn missing_argument(argument: &str) -> io::Error {
 fn complete_update(arguments: Arguments) -> io::Result<()> {
     validate_paths(&arguments)?;
     wait_for_launcher_exit(arguments.wait_pid, &arguments.launcher);
-    replace_and_resign_launcher(&arguments, resign_macos_bundle)?;
+    replace_launcher(&arguments)?;
     promote_pending_file(
         &arguments.metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE),
         &arguments.metadata_dir.join(LAUNCHER_MANIFEST_FILE),
@@ -155,6 +156,19 @@ fn complete_update(arguments: Arguments) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
+/// Replaces the launcher without creating a signing rollback backup.
+fn replace_launcher(arguments: &Arguments) -> io::Result<()> {
+    replace_file(&arguments.staged, &arguments.launcher)
+}
+
+#[cfg(target_os = "macos")]
+/// Replaces and signs the launcher while retaining the previous executable for rollback.
+fn replace_launcher(arguments: &Arguments) -> io::Result<()> {
+    replace_and_resign_launcher(arguments, resign_macos_bundle)
+}
+
+#[cfg(any(target_os = "macos", test))]
 /// Replaces the launcher and restores the previous executable if bundle signing fails.
 fn replace_and_resign_launcher(
     arguments: &Arguments,
@@ -296,11 +310,6 @@ fn resign_macos_bundle(launcher: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn resign_macos_bundle(_launcher: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(target_os = "windows")]
 /// Displays a native error because the helper has no persistent user interface.
 fn report_error(message: &str) {
@@ -355,6 +364,28 @@ mod tests {
         promote_pending_file(&pending, &destination).unwrap();
 
         assert_eq!(fs::read(destination).unwrap(), b"current");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn replace_launcher_without_macos_signing_replaces_without_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("launcher");
+        let staged = directory.path().join("staged");
+        fs::write(&launcher, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let arguments = Arguments {
+            launcher: launcher.clone(),
+            staged,
+            metadata_dir: directory.path().to_path_buf(),
+            wait_pid: 1,
+            relaunch: false,
+        };
+
+        replace_launcher(&arguments).unwrap();
+
+        assert_eq!(fs::read(launcher).unwrap(), b"new");
+        assert!(!directory.path().join(LAUNCHER_BACKUP_FILE).exists());
     }
 
     #[test]
