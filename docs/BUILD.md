@@ -83,8 +83,10 @@ Use this workflow only when an existing game version needs its first Linux packa
 matching `rebellion2` and `rebellion2-media` release refs, the existing game version, and the
 published launcher version to embed. The workflow builds only the Linux player and AppImage. A
 publishing run requires explicit backfill confirmation, refuses to replace an existing Linux game
-channel entry, uploads the AppImage and signed Linux player layer, and adds Linux to `dist/game.json`
-without rebuilding or replacing the other platforms.
+channel entry, and uploads the AppImage. If `dist/game.json` already exists for that game version,
+the run also uploads the signed Linux player layer and adds Linux while preserving every existing
+platform entry. If the split game channel does not exist, the run leaves all live channel pointers
+unchanged so older clients continue using the legacy application channel.
 
 ## Release notes
 

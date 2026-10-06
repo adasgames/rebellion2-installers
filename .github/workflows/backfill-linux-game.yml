@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       publish:
-        description: Add Linux to the existing release and live game channel
+        description: Publish Linux and add it to an existing split game channel
         required: true
         default: false
         type: boolean
@@ -158,7 +158,7 @@ jobs:
           name: game-linux-backfill
           path: linux
 
-      - name: Add Linux to the existing release and game channel
+      - name: Publish Linux backfill
         env:
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
           GAME_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
@@ -190,25 +190,6 @@ jobs:
           export RCLONE_S3_REGION=auto
           remote=":s3:${STORAGE_BUCKET}"
 
-          previous_pointer=false
-          source_format=game
-          if rclone lsf "${remote}/dist" --files-only --include game.json | grep -Fxq game.json; then
-            rclone cat "${remote}/dist/game.json" > current-pointer.json
-            previous_pointer=true
-          else
-            rclone cat "${remote}/dist/application.json" > current-pointer.json
-            source_format=application
-          fi
-          node scripts/add-game-platform.mjs \
-            "$source_format" \
-            current-pointer.json \
-            game-with-linux.json \
-            "$VERSION" \
-            linux \
-            "$manifest_path" \
-            game-blobs/ \
-            "$signature"
-
           gh release upload "$TAG" \
             "linux/Rebellion2-${VERSION}-x86_64.AppImage" \
             --clobber \
@@ -216,15 +197,26 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[].name' | grep -Fx "Rebellion2-${VERSION}-x86_64.AppImage"
 
+          pointer_listing="$(rclone lsf "${remote}/dist" --files-only --include game.json)"
+          if ! grep -Fxq game.json <<< "$pointer_listing"; then
+            echo "No split game channel exists; leaving the global channel unchanged."
+            exit 0
+          fi
+          rclone cat "${remote}/dist/game.json" > current-game.json
+          node scripts/add-game-platform.mjs \
+            current-game.json \
+            game-with-linux.json \
+            "$VERSION" \
+            linux \
+            "$manifest_path" \
+            game-blobs/ \
+            "$signature"
+
           rclone copy linux/game-blobs-linux "${remote}/game-blobs" --ignore-existing
           rclone copyto "$manifest" "${remote}/${manifest_path}"
 
           restore_pointer() {
-            if [ "$previous_pointer" = true ]; then
-              rclone copyto current-pointer.json "${remote}/dist/game.json"
-            else
-              rclone deletefile "${remote}/dist/game.json" || true
-            fi
+            rclone copyto current-game.json "${remote}/dist/game.json"
           }
           on_exit() {
             status=$?
