@@ -190,15 +190,24 @@ jobs:
           export RCLONE_S3_REGION=auto
           remote=":s3:${STORAGE_BUCKET}"
 
-          rclone copyto "${remote}/dist/game.json" current-game.json
-          jq -e --arg version "$VERSION" \
-            '.version == $version and .platforms.linux == null' \
-            current-game.json >/dev/null
-          jq \
-            --arg manifest "$manifest_path" \
-            --arg signature "$signature" \
-            '.platforms.linux={manifest:$manifest,blobs:"game-blobs/",signature:$signature}' \
-            current-game.json > game-with-linux.json
+          previous_pointer=false
+          source_format=game
+          if rclone lsf "${remote}/dist" --files-only --include game.json | grep -Fxq game.json; then
+            rclone cat "${remote}/dist/game.json" > current-pointer.json
+            previous_pointer=true
+          else
+            rclone cat "${remote}/dist/application.json" > current-pointer.json
+            source_format=application
+          fi
+          node scripts/add-game-platform.mjs \
+            "$source_format" \
+            current-pointer.json \
+            game-with-linux.json \
+            "$VERSION" \
+            linux \
+            "$manifest_path" \
+            game-blobs/ \
+            "$signature"
 
           gh release upload "$TAG" \
             "linux/Rebellion2-${VERSION}-x86_64.AppImage" \
@@ -211,7 +220,11 @@ jobs:
           rclone copyto "$manifest" "${remote}/${manifest_path}"
 
           restore_pointer() {
-            rclone copyto current-game.json "${remote}/dist/game.json"
+            if [ "$previous_pointer" = true ]; then
+              rclone copyto current-pointer.json "${remote}/dist/game.json"
+            else
+              rclone deletefile "${remote}/dist/game.json" || true
+            fi
           }
           on_exit() {
             status=$?
