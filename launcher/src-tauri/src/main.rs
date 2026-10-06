@@ -87,6 +87,8 @@ const SESSION_FILE: &str = ".session";
 const GAME_EXE: &str = "Rebellion2.exe";
 #[cfg(target_os = "linux")]
 const GAME_EXE: &str = "Rebellion2.x86_64";
+#[cfg(target_os = "linux")]
+const UNITY_CRASH_HANDLER_EXE: &str = "UnityCrashHandler64";
 
 #[cfg(target_os = "macos")]
 const MACOS_GAME_APP_NAME: &str = "Rebellion2 Game.app";
@@ -1133,7 +1135,13 @@ fn do_game_update(
         let changed = plan.changed.len();
         apply(&plan, &game_dir, &blobs)?;
         #[cfg(target_os = "linux")]
-        ensure_executable(&game_dir.join(GAME_EXE))?;
+        {
+            ensure_executable(&game_dir.join(GAME_EXE))?;
+            let crash_handler = game_dir.join(UNITY_CRASH_HANDLER_EXE);
+            if crash_handler.is_file() {
+                ensure_executable(&crash_handler)?;
+            }
+        }
         changed
     };
 
@@ -3749,6 +3757,7 @@ mod tests {
     #[test]
     fn game_executable_on_linux_matches_unity_player_name() {
         assert_eq!(GAME_EXE, "Rebellion2.x86_64");
+        assert_eq!(UNITY_CRASH_HANDLER_EXE, "UnityCrashHandler64");
     }
 
     #[cfg(unix)]
