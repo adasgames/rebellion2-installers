@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       publish:
-        description: Add Linux to the existing release and live game channel
+        description: Publish Linux and add it to an existing split game channel
         required: true
         default: false
         type: boolean
@@ -158,7 +158,7 @@ jobs:
           name: game-linux-backfill
           path: linux
 
-      - name: Add Linux to the existing release and game channel
+      - name: Publish Linux backfill
         env:
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
           GAME_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
@@ -190,22 +190,27 @@ jobs:
           export RCLONE_S3_REGION=auto
           remote=":s3:${STORAGE_BUCKET}"
 
-          rclone copyto "${remote}/dist/game.json" current-game.json
-          jq -e --arg version "$VERSION" \
-            '.version == $version and .platforms.linux == null' \
-            current-game.json >/dev/null
-          jq \
-            --arg manifest "$manifest_path" \
-            --arg signature "$signature" \
-            '.platforms.linux={manifest:$manifest,blobs:"game-blobs/",signature:$signature}' \
-            current-game.json > game-with-linux.json
-
           gh release upload "$TAG" \
             "linux/Rebellion2-${VERSION}-x86_64.AppImage" \
             --clobber \
             --repo "$GITHUB_REPOSITORY"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[].name' | grep -Fx "Rebellion2-${VERSION}-x86_64.AppImage"
+
+          pointer_listing="$(rclone lsf "${remote}/dist" --files-only --include game.json)"
+          if ! grep -Fxq game.json <<< "$pointer_listing"; then
+            echo "No split game channel exists; leaving the global channel unchanged."
+            exit 0
+          fi
+          rclone cat "${remote}/dist/game.json" > current-game.json
+          node scripts/add-game-platform.mjs \
+            current-game.json \
+            game-with-linux.json \
+            "$VERSION" \
+            linux \
+            "$manifest_path" \
+            game-blobs/ \
+            "$signature"
 
           rclone copy linux/game-blobs-linux "${remote}/game-blobs" --ignore-existing
           rclone copyto "$manifest" "${remote}/${manifest_path}"
