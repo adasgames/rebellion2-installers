@@ -5,24 +5,25 @@ How the installers and update channels in this repository are produced. For play
 
 Launcher releases and game releases are independent:
 
-- A **launcher release** has its own version, patch notes, signed Windows and macOS launcher
+- A **launcher release** has its own version, patch notes, signed Windows, macOS, and Linux launcher
   layers, and `dist/launcher.json` pointer. It never builds or publishes the Unity player or game
   content.
-- A **game release** has its own version, patch notes, signed Windows and macOS player layers,
-  matching protected content, installers for both platforms, and `dist/game.json` pointer. It uses
+- A **game release** has its own version, patch notes, signed Windows, macOS, and Linux player
+  layers, matching protected content, packages for all three platforms, and `dist/game.json`
+  pointer. It uses
   the latest published launcher when assembling fresh installers, but it never changes the launcher
   channel.
 
 The packages ship no licensed art. The launcher verifies ownership before downloading protected
-content. Windows and macOS are released together within each channel. Linux remains parked.
+content. Windows, macOS, and Linux are released together within each channel.
 
 | Platform | Package                                | Tool                     | Status |
 | -------- | -------------------------------------- | ------------------------ | ------ |
 | Windows  | `Rebellion2-Windows-Setup.exe`         | Inno Setup (`ISCC.exe`)  | live   |
 | macOS    | `Rebellion2-macOS.zip`                 | universal `.app` archive | live   |
-| Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`           | parked |
+| Linux    | `Rebellion2-<version>-x86_64.AppImage` | `appimagetool`           | live   |
 
-The packages do not have trusted platform signatures yet, so Windows and macOS warn on first
+The packages do not have trusted platform signatures yet, so operating systems may warn on first
 launch. Every downloaded launcher and game file is nevertheless authenticated by a signed manifest
 and a SHA-256 digest. Authenticode and Apple Developer ID signing/notarization remain on the roadmap.
 
@@ -35,10 +36,10 @@ Actions tab → **Build launcher** → **Run workflow**.
 - **publish** controls whether the run moves the live launcher channel.
 - **allow_rollback** is reserved for an intentional emergency rollback.
 
-The workflow builds the Windows and universal macOS launchers together. A non-publishing run uploads
-workflow artifacts only. A publishing run creates or updates GitHub Release `launcher-v<version>`,
-uploads signed manifests and content-addressed blobs, publishes launcher-only release notes, and
-moves `dist/launcher.json` last.
+The workflow builds the Windows, universal macOS, and Linux launchers together. A non-publishing
+run uploads workflow artifacts only. A publishing run creates or updates GitHub Release
+`launcher-v<version>`, uploads signed manifests and content-addressed blobs, publishes launcher-only
+release notes, and moves `dist/launcher.json` last.
 
 Installed launchers display this as a **Launcher update**. They download and stage it without
 restarting or closing. The same session then checks for a game update and always leaves the player
@@ -55,16 +56,19 @@ Actions tab → **Build game** → **Run workflow**.
 - **publish** controls whether the run moves the live game channel.
 - **allow_rollback** is reserved for an intentional emergency rollback.
 
-The workflow builds Windows and macOS players in parallel, packages a signed player layer for each,
-and assembles both fresh installers with the current published launcher. When publishing, it also
-uploads the immutable protected content archive, manifest, and blobs. It creates a draft GitHub
-Release, uploads both installers, publishes `dist/game.json` only after every immutable artifact is
-available, verifies the public pointer, and then publishes the GitHub Release.
+The workflow builds Windows, macOS, and Linux players in parallel, packages a signed player layer
+for each, and assembles fresh packages with the current published launcher. The Linux AppImage
+bootstraps the player into the user's XDG data directory because mounted AppImages are read-only;
+later launcher and game updates replace their independently signed layers. When publishing, the
+workflow also uploads the immutable protected content archive, manifest, and blobs. It creates a
+draft GitHub Release, uploads all three packages, publishes `dist/game.json` only after every
+immutable artifact is available, verifies the public pointer, and then publishes the GitHub Release.
 
 `dist/game.json` binds one game version to all of the following:
 
 - The signed Windows player manifest and public game blobs.
 - The signed macOS player manifest and public game blobs.
+- The signed Linux player manifest and public game blobs.
 - The matching protected content manifest and blobs.
 - The game release-notes document.
 
@@ -159,4 +163,6 @@ launcher/self-update/                         # staged-launcher handoff helper
 launcher/update-core/                         # signed manifest diff/apply engine
 packaging/windows/rebellion2-launcher.iss     # Windows installer
 packaging/macos/build-zip.sh                  # complete macOS app archive
+packaging/linux/build-appimage.sh             # complete Linux AppImage
+packaging/linux/AppRun                        # writable Linux installation bootstrap
 ```

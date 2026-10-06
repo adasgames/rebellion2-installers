@@ -1,24 +1,31 @@
 # Rebellion 2
 
-Download and install **Rebellion 2** for Windows or macOS.
+Download and install **Rebellion 2** for Windows, macOS, or Linux.
 
 ## Download
 
 <table>
   <tr>
-    <td align="center" width="50%">
+    <td align="center" width="33%">
       <a href="https://github.com/adasgames/rebellion2-installers/releases/latest/download/Rebellion2-Windows-Setup.exe">
         <img src="docs/assets/windows.svg" width="64" alt="Windows"><br>
         <strong>Install latest for Windows</strong>
       </a><br>
       <sub>64-bit Windows installer</sub>
     </td>
-    <td align="center" width="50%">
+    <td align="center" width="33%">
       <a href="https://github.com/adasgames/rebellion2-installers/releases/latest/download/Rebellion2-macOS.zip">
         <img src="docs/assets/apple.svg" width="64" alt="macOS"><br>
         <strong>Download latest for macOS</strong>
       </a><br>
       <sub>Universal Intel + Apple Silicon app</sub>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/adasgames/rebellion2-installers/releases/latest">
+        <img src="docs/assets/linux.svg" width="64" alt="Linux"><br>
+        <strong>Download latest for Linux</strong>
+      </a><br>
+      <sub>64-bit x86 AppImage</sub>
     </td>
   </tr>
 </table>
@@ -42,9 +49,16 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 3. The first time, **right-click the app → Open**, then click **Open** in the dialog. (A normal
    double-click will be blocked — you only need the right-click trick once.)
 
+### Linux
+1. Download **`Rebellion2-<version>-x86_64.AppImage`** from the latest release.
+2. Make it executable with **`chmod +x Rebellion2-*-x86_64.AppImage`**.
+3. Run the AppImage. The launcher stores the installed game and update metadata in your XDG data
+   directory, normally **`~/.local/share/rebellion2`**.
+
 The launcher checks separate signed channels for launcher updates and game updates. A launcher
 update downloads in the background, applies the next time the launcher starts, and does not replace
-the game. Game releases update the Windows or macOS player together with its matching game content.
+the game. Game releases update the Windows, macOS, or Linux player together with its matching game
+content.
 
 ## FAQ
 

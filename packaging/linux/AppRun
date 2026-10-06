@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${APPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+BOOTSTRAP="$APP_DIR/usr/share/rebellion2/bootstrap"
+HOME_DIR="${HOME:?HOME is not configured}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME_DIR/.local/share}"
+INSTALL_DIR="$DATA_HOME/rebellion2"
+
+mkdir -p "$INSTALL_DIR"
+
+if [ ! -f "$INSTALL_DIR/.game-version" ]; then
+  cp -a "$BOOTSTRAP/game"/. "$INSTALL_DIR/"
+  cp "$BOOTSTRAP/.game-manifest.json" "$INSTALL_DIR/.game-manifest.json"
+  cp "$BOOTSTRAP/.game-version" "$INSTALL_DIR/.game-version"
+fi
+
+if [ ! -f "$INSTALL_DIR/rebellion2-update-helper" ]; then
+  cp "$BOOTSTRAP/rebellion2-update-helper" "$INSTALL_DIR/rebellion2-update-helper"
+fi
+chmod +x "$INSTALL_DIR/rebellion2-update-helper" "$INSTALL_DIR/Rebellion2.x86_64"
+if [ -f "$INSTALL_DIR/UnityCrashHandler64" ]; then
+  chmod +x "$INSTALL_DIR/UnityCrashHandler64"
+fi
+
+if [ ! -f "$INSTALL_DIR/.launcher-version" ]; then
+  cp "$BOOTSTRAP/.launcher-manifest.json" "$INSTALL_DIR/.launcher-manifest.json"
+  cp "$BOOTSTRAP/.launcher-version" "$INSTALL_DIR/.launcher-version"
+fi
+
+exec "$APP_DIR/AppRun.launcher" "$@"

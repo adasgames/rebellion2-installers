@@ -22,7 +22,7 @@ on:
         required: true
         type: string
       publish:
-        description: Publish Windows, macOS, content, and the game update channel
+        description: Publish Windows, macOS, Linux, content, and the game update channel
         required: true
         default: false
         type: boolean
@@ -74,6 +74,18 @@ jobs:
       asset_ref: ${{ inputs.asset_ref }}
       source_ref: ${{ inputs.source_ref }}
       target: StandaloneOSX
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
+
+  player-linux:
+    name: Build Linux game
+    needs: prepare
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-linux
+      asset_ref: ${{ inputs.asset_ref }}
+      source_ref: ${{ inputs.source_ref }}
+      target: StandaloneLinux64
       version: ${{ needs.prepare.outputs.version }}
     secrets: inherit
 
@@ -294,11 +306,84 @@ jobs:
             game-blobs-macos
           if-no-files-found: error
 
+  package-linux:
+    name: Package Linux game
+    runs-on: ubuntu-22.04
+    needs: [prepare, player-linux]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: player-linux
+          path: player
+
+      - name: Package Linux game layer
+        run: |
+          set -euo pipefail
+          chmod +x player/Rebellion2.x86_64
+          if [ -f player/UnityCrashHandler64 ]; then chmod +x player/UnityCrashHandler64; fi
+          node scripts/package-update-layer.mjs \
+            player \
+            "${{ needs.prepare.outputs.version }}" \
+            game-manifest-linux.json \
+            game-blobs-linux
+
+      - name: Download the current Linux launcher bundle
+        env:
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          set -euo pipefail
+          base="${CHANNEL_BASE%/}"
+          curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
+          launcher_version="$(jq -er '.version | select(length > 0)' launcher.json)"
+          launcher_manifest="$(jq -er '.platforms.linux.manifest | select(length > 0)' launcher.json)"
+          curl --fail --location --silent --show-error \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${launcher_version}/Rebellion2-launcher-Linux.tar.gz" \
+            -o launcher.tar.gz
+          mkdir launcher-bundle
+          tar -xzf launcher.tar.gz -C launcher-bundle
+          curl --fail --location --silent --show-error \
+            "$base/$launcher_manifest" \
+            -o launcher-manifest-linux.json
+          printf '%s' "$launcher_version" > launcher-version.txt
+          test -f launcher-bundle/Rebellion2-launcher-Linux.AppImage
+          test -f launcher-bundle/rebellion2-update-helper
+
+      - name: Assemble Linux AppImage
+        env:
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+            -o appimagetool
+          printf '%s  %s\n' "$APPIMAGETOOL_SHA256" appimagetool | sha256sum --check
+          chmod +x appimagetool
+          APPIMAGETOOL="$PWD/appimagetool" bash packaging/linux/build-appimage.sh \
+            launcher-bundle/Rebellion2-launcher-Linux.AppImage \
+            launcher-bundle/rebellion2-update-helper \
+            player \
+            launcher-manifest-linux.json \
+            "$(cat launcher-version.txt)" \
+            game-manifest-linux.json \
+            "${{ needs.prepare.outputs.version }}" \
+            "Rebellion2-${{ needs.prepare.outputs.version }}-x86_64.AppImage"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: game-linux
+          path: |
+            Rebellion2-${{ needs.prepare.outputs.version }}-x86_64.AppImage
+            game-manifest-linux.json
+            game-blobs-linux
+          if-no-files-found: error
+
   publish:
     name: Publish cross-platform game release
     if: inputs.publish
     runs-on: ubuntu-latest
-    needs: [prepare, content, package-windows, package-macos]
+    needs: [prepare, content, package-windows, package-macos, package-linux]
     permissions:
       contents: write
     steps:
@@ -316,6 +401,11 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          name: game-linux
+          path: linux
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
           name: content-pointer
           path: content
 
@@ -330,10 +420,23 @@ jobs:
           printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
-            gh release upload "$TAG" windows/Rebellion2-Windows-Setup.exe macos/Rebellion2-macOS.zip --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" \
+              windows/Rebellion2-Windows-Setup.exe \
+              macos/Rebellion2-macOS.zip \
+              "linux/Rebellion2-${VERSION}-x86_64.AppImage" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
             gh release edit "$TAG" --title "Rebellion 2 $VERSION" --notes-file game-release-notes.md --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" --target "$GITHUB_SHA" --draft --title "Rebellion 2 $VERSION" --notes-file game-release-notes.md --repo "$GITHUB_REPOSITORY" windows/Rebellion2-Windows-Setup.exe macos/Rebellion2-macOS.zip
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --draft \
+              --title "Rebellion 2 $VERSION" \
+              --notes-file game-release-notes.md \
+              --repo "$GITHUB_REPOSITORY" \
+              windows/Rebellion2-Windows-Setup.exe \
+              macos/Rebellion2-macOS.zip \
+              "linux/Rebellion2-${VERSION}-x86_64.AppImage"
           fi
 
       - name: Publish the game channel
@@ -354,6 +457,7 @@ jobs:
           set -euo pipefail
           windows_manifest=windows/game-manifest-windows.json
           macos_manifest=macos/game-manifest-macos.json
+          linux_manifest=linux/game-manifest-linux.json
           content_pointer=content/latest.json
           notes="release-notes-${VERSION}.json"
           printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
@@ -370,6 +474,7 @@ jobs:
           }
           windows_signature="$(sign_manifest "$windows_manifest")"
           macos_signature="$(sign_manifest "$macos_manifest")"
+          linux_signature="$(sign_manifest "$linux_manifest")"
           notes_sha="$(sha256sum "$notes" | cut -d' ' -f1)"
           jq \
             --arg path "dist/$notes" \
@@ -382,12 +487,15 @@ jobs:
             --arg windows_signature "$windows_signature" \
             --arg macos_manifest "dist/game-manifest-macos-${VERSION}.json" \
             --arg macos_signature "$macos_signature" \
+            --arg linux_manifest "dist/game-manifest-linux-${VERSION}.json" \
+            --arg linux_signature "$linux_signature" \
             --slurpfile content content-with-notes.json \
             '{
               version:$version,
               platforms:{
                 windows:{manifest:$windows_manifest,blobs:"game-blobs/",signature:$windows_signature},
-                macos:{manifest:$macos_manifest,blobs:"game-blobs/",signature:$macos_signature}
+                macos:{manifest:$macos_manifest,blobs:"game-blobs/",signature:$macos_signature},
+                linux:{manifest:$linux_manifest,blobs:"game-blobs/",signature:$linux_signature}
               },
               content:$content[0]
             }' > game.json
@@ -407,8 +515,10 @@ jobs:
           fi
           rclone copy windows/game-blobs-windows "${remote}/game-blobs" --ignore-existing
           rclone copy macos/game-blobs-macos "${remote}/game-blobs" --ignore-existing
+          rclone copy linux/game-blobs-linux "${remote}/game-blobs" --ignore-existing
           rclone copyto "$windows_manifest" "${remote}/dist/game-manifest-windows-${VERSION}.json"
           rclone copyto "$macos_manifest" "${remote}/dist/game-manifest-macos-${VERSION}.json"
+          rclone copyto "$linux_manifest" "${remote}/dist/game-manifest-linux-${VERSION}.json"
           rclone copyto "$notes" "${remote}/dist/${notes}"
           rollback="$(mktemp -d)"
           previous_pointer=false
