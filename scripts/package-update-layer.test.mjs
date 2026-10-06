@@ -28,9 +28,14 @@ test("packageUpdateLayer records paths, hashes, and sizes", async () => {
 test("packageUpdateLayer rejects symbolic links", async () => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "reb2-layer-"));
   const root = path.join(temporary, "root");
+  const target = path.join(root, "target");
   await mkdir(root);
-  await writeFile(path.join(root, "target"), "data");
-  await symlink("target", path.join(root, "link"));
+  await mkdir(target);
+  await symlink(
+    target,
+    path.join(root, "link"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
 
   await assert.rejects(
     packageUpdateLayer(

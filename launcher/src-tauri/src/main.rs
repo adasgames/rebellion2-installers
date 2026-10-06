@@ -67,22 +67,28 @@ const PENDING_APPLICATION_VERSION_FILE: &str = ".application-version.pending";
 const STAGED_LAUNCHER_FILE_NAME: &str = ".rebellion2-launcher.next.exe";
 #[cfg(target_os = "macos")]
 const STAGED_LAUNCHER_FILE_NAME: &str = ".rebellion2-launcher.next";
+#[cfg(target_os = "linux")]
+const STAGED_LAUNCHER_FILE_NAME: &str = ".rebellion2-launcher.next.AppImage";
 #[cfg(target_os = "windows")]
 const UPDATE_HELPER_FILE_NAME: &str = "rebellion2-update-helper.exe";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const UPDATE_HELPER_FILE_NAME: &str = "rebellion2-update-helper";
 
 #[cfg(target_os = "windows")]
 const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher.exe";
 #[cfg(target_os = "macos")]
 const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher";
+#[cfg(target_os = "linux")]
+const LAUNCHER_FILE_NAME: &str = "Rebellion2-launcher-Linux.AppImage";
 /// Cached ownership session token, stored next to the launcher.
 const SESSION_FILE: &str = ".session";
 
 #[cfg(target_os = "windows")]
 const GAME_EXE: &str = "Rebellion2.exe";
 #[cfg(target_os = "linux")]
-const GAME_EXE: &str = "Rebellion2";
+const GAME_EXE: &str = "Rebellion2.x86_64";
+#[cfg(target_os = "linux")]
+const UNITY_CRASH_HANDLER_EXE: &str = "UnityCrashHandler64";
 
 #[cfg(target_os = "macos")]
 const MACOS_GAME_APP_NAME: &str = "Rebellion2 Game.app";
@@ -147,6 +153,8 @@ struct LauncherPlatforms {
     windows: Option<SignedLauncherLayer>,
     #[cfg(any(target_os = "macos", test))]
     macos: Option<SignedLauncherLayer>,
+    #[cfg(any(target_os = "linux", test))]
+    linux: Option<SignedLauncherLayer>,
 }
 
 /// The independent launcher release at `dist/launcher.json`.
@@ -174,6 +182,8 @@ struct GamePlatforms {
     windows: Option<SignedGameLayer>,
     #[cfg(any(target_os = "macos", test))]
     macos: Option<SignedGameLayer>,
+    #[cfg(any(target_os = "linux", test))]
+    linux: Option<SignedGameLayer>,
 }
 
 /// A game-player release paired atomically with protected content.
@@ -808,7 +818,11 @@ fn launcher_layer(update: &LauncherUpdate) -> Option<&SignedLauncherLayer> {
     {
         update.platforms.macos.as_ref()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        update.platforms.linux.as_ref()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = update;
         None
@@ -904,11 +918,18 @@ fn fetch_verified_blob(
 /// Writes a launcher component and makes it executable on Unix platforms.
 fn write_executable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::write(path, bytes)?;
+    ensure_executable(path)
+}
+
+/// Ensures a program can be executed on Unix without changing Windows metadata.
+fn ensure_executable(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -1002,7 +1023,11 @@ fn game_layer(update: &GameUpdate) -> Option<&SignedGameLayer> {
     {
         update.platforms.macos.as_ref()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        update.platforms.linux.as_ref()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = update;
         None
@@ -1109,6 +1134,14 @@ fn do_game_update(
         );
         let changed = plan.changed.len();
         apply(&plan, &game_dir, &blobs)?;
+        #[cfg(target_os = "linux")]
+        {
+            ensure_executable(&game_dir.join(GAME_EXE))?;
+            let crash_handler = game_dir.join(UNITY_CRASH_HANDLER_EXE);
+            if crash_handler.is_file() {
+                ensure_executable(&crash_handler)?;
+            }
+        }
         changed
     };
 
@@ -1270,6 +1303,7 @@ fn is_launcher_metadata_path(path: &Path) -> bool {
             | ".launcher-manifest.pending.json"
             | ".rebellion2-launcher.next.exe"
             | ".rebellion2-launcher.next"
+            | ".rebellion2-launcher.next.appimage"
             | ".session"
             | "launcher.log"
     )
@@ -1415,6 +1449,7 @@ fn start_application_update(handle: &tauri::AppHandle) {
 fn start_application_update(_handle: &tauri::AppHandle) {}
 
 /// Returns whether protected content can be downloaded, or opens ownership verification.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn begin_application_update_or_request_authorization(
     handle: &tauri::AppHandle,
     version: &str,
@@ -1523,6 +1558,7 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
 }
 
 /// Resolves and authorizes the protected content paired with an application release.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn prepare_application_content(
     version: &str,
     embedded: Option<Latest>,
@@ -1542,6 +1578,7 @@ fn prepare_application_content(
 }
 
 /// Reports a failure that occurs before any application files are changed.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn show_application_update_preparation_error(
     handle: &tauri::AppHandle,
     version: &str,
@@ -2018,7 +2055,7 @@ impl BlobSource for PublicHttpBlobs {
 fn start_update_helper(relaunch: bool) -> io::Result<()> {
     let metadata_dir = install_dir()?;
     let helper = metadata_dir.join(UPDATE_HELPER_FILE_NAME);
-    let launcher = std::env::current_exe()?;
+    let launcher = launcher_path()?;
     let staged = metadata_dir.join(STAGED_LAUNCHER_FILE_NAME);
     let mut command = std::process::Command::new(helper);
     command
@@ -2041,6 +2078,22 @@ fn start_update_helper(relaunch: bool) -> io::Result<()> {
     }
     command.spawn()?;
     Ok(())
+}
+
+/// Returns the replaceable launcher artifact for the current platform.
+#[cfg(not(target_os = "linux"))]
+fn launcher_path() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
+/// Returns the mounted AppImage's outer file, falling back to the process for development builds.
+#[cfg(target_os = "linux")]
+fn launcher_path() -> io::Result<PathBuf> {
+    std::env::var_os("APPIMAGE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_exe)
 }
 
 /// Completes a previously interrupted launcher handoff before any window appears.
@@ -2710,6 +2763,7 @@ fn store_approved_content_update(version: &str) -> io::Result<()> {
     write_approved_content_update(&directory, version)
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 fn write_approved_content_update(directory: &Path, version: &str) -> io::Result<()> {
     let version = version.trim();
     if version.is_empty() {
@@ -3188,13 +3242,7 @@ fn launcher_update_screen(version: &str, notes: Option<&ReleaseNotes>) -> String
 /// Offers a game-player update without conflating it with a launcher release.
 fn show_game_update(handle: &tauri::AppHandle, version: &str) {
     let release_notes = content_base()
-        .and_then(|base| {
-            PENDING_GAME_UPDATE
-                .lock()
-                .unwrap()
-                .clone()
-                .map(|update| (base, update))
-        })
+        .zip(PENDING_GAME_UPDATE.lock().unwrap().clone())
         .and_then(|(base, update)| fetch_release_notes(&base, &update.content));
     write_screen(
         handle,
@@ -3392,12 +3440,23 @@ fn update_progress(handle: &tauri::AppHandle, percent: u64, label: &str) {
 
 // -- filesystem + process ----------------------------------------------------
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn install_dir() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     exe.parent()
         .map(|dir| dir.to_path_buf())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "launcher has no parent directory"))
+}
+
+#[cfg(target_os = "linux")]
+fn install_dir() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not configured"))?;
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let directory = linux_data_dir(&home, xdg_data_home.as_deref());
+    fs::create_dir_all(&directory)?;
+    Ok(directory)
 }
 
 #[cfg(target_os = "macos")]
@@ -3415,6 +3474,14 @@ fn macos_data_dir(home: &Path) -> PathBuf {
     home.join("Library")
         .join("Application Support")
         .join("Rebellion 2")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_data_dir(home: &Path, xdg_data_home: Option<&Path>) -> PathBuf {
+    xdg_data_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".local").join("share"))
+        .join("rebellion2")
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3621,6 +3688,94 @@ mod tests {
         }
     }
 
+    fn signed_launcher_layer(manifest: &str) -> SignedLauncherLayer {
+        SignedLauncherLayer {
+            manifest: manifest.to_string(),
+            blobs: default_launcher_blobs(),
+            signature: "signature".to_string(),
+        }
+    }
+
+    fn signed_game_layer(manifest: &str) -> SignedGameLayer {
+        SignedGameLayer {
+            manifest: manifest.to_string(),
+            blobs: default_game_blobs(),
+            signature: "signature".to_string(),
+        }
+    }
+
+    #[test]
+    fn launcher_layer_with_all_platforms_selects_current_platform() {
+        let update = LauncherUpdate {
+            version: "1.2.3".to_string(),
+            platforms: LauncherPlatforms {
+                windows: Some(signed_launcher_layer("windows")),
+                macos: Some(signed_launcher_layer("macos")),
+                linux: Some(signed_launcher_layer("linux")),
+            },
+            release_notes: None,
+        };
+
+        let layer = launcher_layer(&update).unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(layer.manifest, "windows");
+        #[cfg(target_os = "macos")]
+        assert_eq!(layer.manifest, "macos");
+        #[cfg(target_os = "linux")]
+        assert_eq!(layer.manifest, "linux");
+    }
+
+    #[test]
+    fn game_layer_with_all_platforms_selects_current_platform() {
+        let update = GameUpdate {
+            version: "1.2.3".to_string(),
+            platforms: GamePlatforms {
+                windows: Some(signed_game_layer("windows")),
+                macos: Some(signed_game_layer("macos")),
+                linux: Some(signed_game_layer("linux")),
+            },
+            content: Latest {
+                version: "1.2.3".to_string(),
+                manifest: "content".to_string(),
+                blobs: "blobs".to_string(),
+                release_notes: None,
+            },
+        };
+
+        let layer = game_layer(&update).unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(layer.manifest, "windows");
+        #[cfg(target_os = "macos")]
+        assert_eq!(layer.manifest, "macos");
+        #[cfg(target_os = "linux")]
+        assert_eq!(layer.manifest, "linux");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn game_executable_on_linux_matches_unity_player_name() {
+        assert_eq!(GAME_EXE, "Rebellion2.x86_64");
+        assert_eq!(UNITY_CRASH_HANDLER_EXE, "UnityCrashHandler64");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_executable_on_unix_sets_execute_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("program");
+
+        write_executable(&path, b"program").unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+    }
+
     #[test]
     fn launcher_update_screen_with_release_notes_identifies_launcher_update() {
         let notes = release_notes();
@@ -3708,6 +3863,13 @@ mod tests {
         assert!(validate_game_manifest(&manifest, "0.0.26").is_err());
     }
 
+    #[test]
+    fn game_manifest_with_staged_linux_launcher_returns_error() {
+        let manifest = application_manifest("0.0.26", &[".rebellion2-launcher.next.AppImage"]);
+
+        assert!(validate_game_manifest(&manifest, "0.0.26").is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_game_archive_manifest_with_one_archive_returns_entry() {
@@ -3733,7 +3895,8 @@ mod tests {
                 "version":"1.2.3",
                 "platforms":{
                     "windows":{"manifest":"dist/launcher-manifest-windows-1.2.3.json","signature":"signed"},
-                    "macos":{"manifest":"dist/launcher-manifest-macos-1.2.3.json","signature":"signed"}
+                    "macos":{"manifest":"dist/launcher-manifest-macos-1.2.3.json","signature":"signed"},
+                    "linux":{"manifest":"dist/launcher-manifest-linux-1.2.3.json","signature":"signed"}
                 }
             }"#,
         )
@@ -3743,7 +3906,8 @@ mod tests {
                 "version":"0.0.26",
                 "platforms":{
                     "windows":{"manifest":"dist/game-manifest-windows-0.0.26.json","signature":"signed"},
-                    "macos":{"manifest":"dist/game-manifest-macos-0.0.26.json","signature":"signed"}
+                    "macos":{"manifest":"dist/game-manifest-macos-0.0.26.json","signature":"signed"},
+                    "linux":{"manifest":"dist/game-manifest-linux-0.0.26.json","signature":"signed"}
                 },
                 "content":{"version":"0.0.26","manifest":"dist/manifest-0.0.26.json"}
             }"#,
@@ -3753,9 +3917,11 @@ mod tests {
         assert_eq!(launcher.version, "1.2.3");
         assert!(launcher.platforms.windows.is_some());
         assert!(launcher.platforms.macos.is_some());
+        assert!(launcher.platforms.linux.is_some());
         assert_eq!(game.version, "0.0.26");
         assert!(game.platforms.windows.is_some());
         assert!(game.platforms.macos.is_some());
+        assert!(game.platforms.linux.is_some());
         assert_eq!(game.content.version, "0.0.26");
     }
 
@@ -4334,6 +4500,22 @@ mod tests {
         assert_eq!(
             macos_data_dir(Path::new("/Users/player")),
             Path::new("/Users/player/Library/Application Support/Rebellion 2")
+        );
+    }
+
+    #[test]
+    fn linux_data_dir_with_xdg_home_uses_configured_directory() {
+        assert_eq!(
+            linux_data_dir(Path::new("/home/player"), Some(Path::new("/data"))),
+            Path::new("/data/rebellion2")
+        );
+    }
+
+    #[test]
+    fn linux_data_dir_without_xdg_home_uses_local_share() {
+        assert_eq!(
+            linux_data_dir(Path::new("/home/player"), None),
+            Path::new("/home/player/.local/share/rebellion2")
         );
     }
 
