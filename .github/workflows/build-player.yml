@@ -141,7 +141,7 @@ jobs:
           projectPath: game
           unityVersion: ${{ inputs.unity_version }}
           targetPlatform: ${{ inputs.target }}
-          buildName: Rebellion2
+          buildName: ${{ inputs.target == 'StandaloneLinux64' && 'Rebellion2.x86_64' || 'Rebellion2' }}
           buildsPath: build
           buildMethod: StandalonePlayerBuild.Build
           customParameters: -buildVersion ${{ inputs.version }}
