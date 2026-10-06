@@ -75,6 +75,17 @@ immutable artifact is available, verifies the public pointer, and then publishes
 Publishing a game release cannot move `dist/launcher.json`. Publishing a launcher release cannot
 move `dist/game.json`, publish content, or replace a game player.
 
+## Backfilling Linux for an existing game release
+
+Actions tab → **Backfill Linux game** → **Run workflow**.
+
+Use this workflow only when an existing game version needs its first Linux package. Select the
+matching `rebellion2` and `rebellion2-media` release refs, the existing game version, and the
+published launcher version to embed. The workflow builds only the Linux player and AppImage. A
+publishing run requires explicit backfill confirmation, refuses to replace an existing Linux game
+channel entry, uploads the AppImage and signed Linux player layer, and adds Linux to `dist/game.json`
+without rebuilding or replacing the other platforms.
+
 ## Release notes
 
 Both workflows accept Markdown with `##` section headings and `*` or `-` bullets. Other prose may
