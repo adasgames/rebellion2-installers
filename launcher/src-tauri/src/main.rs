@@ -3753,6 +3753,26 @@ mod tests {
         assert_eq!(layer.manifest, "linux");
     }
 
+    #[test]
+    fn game_layer_without_current_platform_returns_none() {
+        let update = GameUpdate {
+            version: "1.2.3".to_string(),
+            platforms: GamePlatforms {
+                windows: None,
+                macos: None,
+                linux: None,
+            },
+            content: Latest {
+                version: "1.2.3".to_string(),
+                manifest: "content".to_string(),
+                blobs: "blobs".to_string(),
+                release_notes: None,
+            },
+        };
+
+        assert!(game_layer(&update).is_none());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn game_executable_on_linux_matches_unity_player_name() {
