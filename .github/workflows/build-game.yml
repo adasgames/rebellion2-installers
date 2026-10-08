@@ -21,8 +21,18 @@ on:
         description: Game patch notes in Markdown
         required: true
         type: string
+      platform:
+        description: Platforms to build and publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+          - linux
       publish:
-        description: Publish Windows, macOS, Linux, content, and the game update channel
+        description: Publish the selected platforms, content, and the game update channel
         required: true
         default: false
         type: boolean
@@ -55,6 +65,7 @@ jobs:
 
   player-windows:
     name: Build Windows game
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
     needs: prepare
     uses: ./.github/workflows/build-player.yml
     with:
@@ -67,6 +78,7 @@ jobs:
 
   player-macos:
     name: Build macOS game
+    if: inputs.platform == 'all' || inputs.platform == 'macos'
     needs: prepare
     uses: ./.github/workflows/build-player.yml
     with:
@@ -79,6 +91,7 @@ jobs:
 
   player-linux:
     name: Build Linux game
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
     needs: prepare
     uses: ./.github/workflows/build-player.yml
     with:
@@ -170,6 +183,7 @@ jobs:
 
   package-windows:
     name: Package Windows game
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     needs: [prepare, player-windows]
     steps:
@@ -238,6 +252,7 @@ jobs:
 
   package-macos:
     name: Package macOS game
+    if: inputs.platform == 'all' || inputs.platform == 'macos'
     runs-on: macos-latest
     needs: [prepare, player-macos]
     steps:
@@ -308,6 +323,7 @@ jobs:
 
   package-linux:
     name: Package Linux game
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
     runs-on: ubuntu-22.04
     needs: [prepare, player-linux]
     steps:
@@ -380,8 +396,21 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish cross-platform game release
-    if: inputs.publish
+    name: Publish game release
+    if: >-
+      ${{
+        always() &&
+        inputs.publish &&
+        needs.prepare.result == 'success' &&
+        needs.content.result == 'success' &&
+        (inputs.platform != 'all' ||
+          (needs.package-windows.result == 'success' &&
+           needs.package-macos.result == 'success' &&
+           needs.package-linux.result == 'success')) &&
+        (inputs.platform != 'windows' || needs.package-windows.result == 'success') &&
+        (inputs.platform != 'macos' || needs.package-macos.result == 'success') &&
+        (inputs.platform != 'linux' || needs.package-linux.result == 'success')
+      }}
     runs-on: ubuntu-latest
     needs: [prepare, content, package-windows, package-macos, package-linux]
     permissions:
@@ -390,16 +419,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.platform == 'all' || inputs.platform == 'windows'
         with:
           name: game-windows
           path: windows
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.platform == 'all' || inputs.platform == 'macos'
         with:
           name: game-macos
           path: macos
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.platform == 'all' || inputs.platform == 'linux'
         with:
           name: game-linux
           path: linux
@@ -412,20 +444,26 @@ jobs:
       - name: Stage the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLATFORM: ${{ inputs.platform }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
+          assets=()
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = windows ]; then
+            assets+=(windows/Rebellion2-Windows-Setup.exe)
+          fi
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = macos ]; then
+            assets+=(macos/Rebellion2-macOS.zip)
+          fi
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = linux ]; then
+            assets+=("linux/Rebellion2-${VERSION}-x86_64.AppImage")
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
-            gh release upload "$TAG" \
-              windows/Rebellion2-Windows-Setup.exe \
-              macos/Rebellion2-macOS.zip \
-              "linux/Rebellion2-${VERSION}-x86_64.AppImage" \
-              --clobber \
-              --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$TAG" --title "Rebellion 2 $VERSION" --notes-file game-release-notes.md --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" \
@@ -434,9 +472,7 @@ jobs:
               --title "Rebellion 2 $VERSION" \
               --notes-file game-release-notes.md \
               --repo "$GITHUB_REPOSITORY" \
-              windows/Rebellion2-Windows-Setup.exe \
-              macos/Rebellion2-macOS.zip \
-              "linux/Rebellion2-${VERSION}-x86_64.AppImage"
+              "${assets[@]}"
           fi
 
       - name: Publish the game channel
@@ -445,6 +481,7 @@ jobs:
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GAME_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
+          PLATFORM: ${{ inputs.platform }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
           STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -455,9 +492,6 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          windows_manifest=windows/game-manifest-windows.json
-          macos_manifest=macos/game-manifest-macos.json
-          linux_manifest=linux/game-manifest-linux.json
           content_pointer=content/latest.json
           notes="release-notes-${VERSION}.json"
           printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
@@ -472,9 +506,34 @@ jobs:
               process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
             ' "$1"
           }
-          windows_signature="$(sign_manifest "$windows_manifest")"
-          macos_signature="$(sign_manifest "$macos_manifest")"
-          linux_signature="$(sign_manifest "$linux_manifest")"
+          platforms='{}'
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = windows ]; then
+            windows_manifest=windows/game-manifest-windows.json
+            windows_signature="$(sign_manifest "$windows_manifest")"
+            platforms="$(jq \
+              --arg manifest "dist/game-manifest-windows-${VERSION}.json" \
+              --arg signature "$windows_signature" \
+              '.windows={manifest:$manifest,blobs:"game-blobs/",signature:$signature}' \
+              <<<"$platforms")"
+          fi
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = macos ]; then
+            macos_manifest=macos/game-manifest-macos.json
+            macos_signature="$(sign_manifest "$macos_manifest")"
+            platforms="$(jq \
+              --arg manifest "dist/game-manifest-macos-${VERSION}.json" \
+              --arg signature "$macos_signature" \
+              '.macos={manifest:$manifest,blobs:"game-blobs/",signature:$signature}' \
+              <<<"$platforms")"
+          fi
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = linux ]; then
+            linux_manifest=linux/game-manifest-linux.json
+            linux_signature="$(sign_manifest "$linux_manifest")"
+            platforms="$(jq \
+              --arg manifest "dist/game-manifest-linux-${VERSION}.json" \
+              --arg signature "$linux_signature" \
+              '.linux={manifest:$manifest,blobs:"game-blobs/",signature:$signature}' \
+              <<<"$platforms")"
+          fi
           notes_sha="$(sha256sum "$notes" | cut -d' ' -f1)"
           jq \
             --arg path "dist/$notes" \
@@ -483,20 +542,11 @@ jobs:
             "$content_pointer" > content-with-notes.json
           jq -n \
             --arg version "$VERSION" \
-            --arg windows_manifest "dist/game-manifest-windows-${VERSION}.json" \
-            --arg windows_signature "$windows_signature" \
-            --arg macos_manifest "dist/game-manifest-macos-${VERSION}.json" \
-            --arg macos_signature "$macos_signature" \
-            --arg linux_manifest "dist/game-manifest-linux-${VERSION}.json" \
-            --arg linux_signature "$linux_signature" \
+            --argjson platforms "$platforms" \
             --slurpfile content content-with-notes.json \
             '{
               version:$version,
-              platforms:{
-                windows:{manifest:$windows_manifest,blobs:"game-blobs/",signature:$windows_signature},
-                macos:{manifest:$macos_manifest,blobs:"game-blobs/",signature:$macos_signature},
-                linux:{manifest:$linux_manifest,blobs:"game-blobs/",signature:$linux_signature}
-              },
+              platforms:$platforms,
               content:$content[0]
             }' > game.json
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
@@ -513,12 +563,18 @@ jobs:
               exit 1
             fi
           fi
-          rclone copy windows/game-blobs-windows "${remote}/game-blobs" --ignore-existing
-          rclone copy macos/game-blobs-macos "${remote}/game-blobs" --ignore-existing
-          rclone copy linux/game-blobs-linux "${remote}/game-blobs" --ignore-existing
-          rclone copyto "$windows_manifest" "${remote}/dist/game-manifest-windows-${VERSION}.json"
-          rclone copyto "$macos_manifest" "${remote}/dist/game-manifest-macos-${VERSION}.json"
-          rclone copyto "$linux_manifest" "${remote}/dist/game-manifest-linux-${VERSION}.json"
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = windows ]; then
+            rclone copy windows/game-blobs-windows "${remote}/game-blobs" --ignore-existing
+            rclone copyto "$windows_manifest" "${remote}/dist/game-manifest-windows-${VERSION}.json"
+          fi
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = macos ]; then
+            rclone copy macos/game-blobs-macos "${remote}/game-blobs" --ignore-existing
+            rclone copyto "$macos_manifest" "${remote}/dist/game-manifest-macos-${VERSION}.json"
+          fi
+          if [ "$PLATFORM" = all ] || [ "$PLATFORM" = linux ]; then
+            rclone copy linux/game-blobs-linux "${remote}/game-blobs" --ignore-existing
+            rclone copyto "$linux_manifest" "${remote}/dist/game-manifest-linux-${VERSION}.json"
+          fi
           rclone copyto "$notes" "${remote}/dist/${notes}"
           rollback="$(mktemp -d)"
           previous_pointer=false
