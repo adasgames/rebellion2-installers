@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use content_packs::{ContentPackCatalog, ContentPackRelease};
+use content_packs::{ContentPackCatalog, ContentPackRelease, GAME_DEPENDENCY_ID};
 use rebellion2_update_core::FileEntry;
 #[cfg(target_os = "windows")]
 use rebellion2_update_core::Plan;
@@ -3263,24 +3263,32 @@ fn content_pack_manager_screen_for(
     }
     for pack in &catalog.packs {
         let installed = content_packs::read_installed(install_root, &pack.id);
-        let game_compatible = content_packs::supports_game_version(pack, game_version);
-        let installed_base_version = pack
-            .base_pack_id
-            .as_deref()
-            .and_then(|id| installed_content_pack_version(install_root, id));
-        let base_compatible = pack
-            .base_pack_version
-            .as_deref()
-            .is_none_or(|required| installed_base_version.as_deref() == Some(required));
-        let compatibility = format!(
-            "Compatible with game {}",
-            pack.compatible_game_versions.join(", ")
+        let game_compatible =
+            content_packs::supports_dependency_version(pack, GAME_DEPENDENCY_ID, game_version);
+        let unavailable_content = pack
+            .depends
+            .iter()
+            .filter(|(id, _)| id.as_str() != GAME_DEPENDENCY_ID)
+            .find_map(|(id, _)| {
+                let installed_version = installed_content_pack_version(install_root, id);
+                (!content_packs::supports_dependency_version(
+                    pack,
+                    id,
+                    installed_version.as_deref(),
+                ))
+                .then_some((id, installed_version))
+            });
+        let mut requirements = vec![format!(
+            "Rebellion 2 {}",
+            pack.depends[GAME_DEPENDENCY_ID].display()
+        )];
+        requirements.extend(
+            pack.depends
+                .iter()
+                .filter(|(id, _)| id.as_str() != GAME_DEPENDENCY_ID)
+                .map(|(id, requirement)| format!("{id} {}", requirement.display())),
         );
-        let base_requirement = pack
-            .base_pack_id
-            .as_deref()
-            .zip(pack.base_pack_version.as_deref())
-            .map(|(id, version)| format!("Requires {id} {version}"));
+        let compatibility = format!("Requires {}", requirements.join(" · "));
         let description = if pack.description.trim().is_empty() {
             "Optional game content."
         } else {
@@ -3300,16 +3308,17 @@ fn content_pack_manager_screen_for(
                 },
                 None,
             ),
-            Some(installed) if !base_compatible => (
-                match installed_base_version.as_deref() {
-                    Some(version) => format!(
-                        "Installed {} · Incompatible with base pack {version}",
+            Some(installed) if unavailable_content.is_some() => (
+                match unavailable_content.as_ref() {
+                    Some((id, Some(version))) => format!(
+                        "Installed {} · Incompatible with {id} {version}",
                         installed.version
                     ),
-                    None => format!(
-                        "Installed {} · Required base pack is missing",
+                    Some((id, None)) => format!(
+                        "Installed {} · Required content pack {id} is missing",
                         installed.version
                     ),
+                    None => unreachable!(),
                 },
                 None,
             ),
@@ -3332,12 +3341,13 @@ fn content_pack_manager_screen_for(
                 },
                 None,
             ),
-            None if !base_compatible => (
-                match installed_base_version.as_deref() {
-                    Some(version) => {
-                        format!("Requires a compatible base pack · Installed {version}")
+            None if unavailable_content.is_some() => (
+                match unavailable_content.as_ref() {
+                    Some((id, Some(version))) => {
+                        format!("Requires compatible {id} content · Installed {version}")
                     }
-                    None => "Install the required base pack first".to_string(),
+                    Some((id, None)) => format!("Install required content pack {id} first"),
+                    None => unreachable!(),
                 },
                 None,
             ),
@@ -3350,12 +3360,7 @@ fn content_pack_manager_screen_for(
                 Some("Install"),
             ),
         };
-        let status = match base_requirement {
-            Some(requirement) => {
-                format!("{release_status} · {compatibility} · {requirement}")
-            }
-            None => format!("{release_status} · {compatibility}"),
-        };
+        let status = format!("{release_status} · {compatibility}");
         let mut actions = String::from("<div class=\"pack-actions\">");
         if let Some(label) = action_label {
             actions.push_str(&button(label, &format!("content-pack-install:{}", pack.id)));
@@ -3433,12 +3438,17 @@ fn install_content_pack(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     content_packs::validate_release(pack)?;
     let game_version = current_game_version();
-    if !content_packs::supports_game_version(pack, game_version.as_deref()) {
+    let game_requirement = &pack.depends[GAME_DEPENDENCY_ID];
+    if !content_packs::supports_dependency_version(
+        pack,
+        GAME_DEPENDENCY_ID,
+        game_version.as_deref(),
+    ) {
         let installed = game_version.as_deref().unwrap_or("not installed");
         return Err(format!(
-            "{} requires game version {}; installed version is {installed}",
+            "{} requires Rebellion 2 {}; installed version is {installed}",
             pack.name,
-            pack.compatible_game_versions.join(", ")
+            game_requirement.display()
         )
         .into());
     }
@@ -3446,21 +3456,30 @@ fn install_content_pack(
     let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), None)?;
     content_packs::validate_pack_manifest(&remote, pack)?;
     let install_root = install_dir()?;
-    if let (Some(base_pack_id), Some(required_base_version)) = (
-        pack.base_pack_id.as_deref(),
-        pack.base_pack_version.as_deref(),
-    ) {
-        let installed_base_version = installed_content_pack_version(&install_root, base_pack_id);
-        match installed_base_version {
+    for (dependency_id, requirement) in pack
+        .depends
+        .iter()
+        .filter(|(id, _)| id.as_str() != GAME_DEPENDENCY_ID)
+    {
+        let installed_dependency_version =
+            installed_content_pack_version(&install_root, dependency_id);
+        match installed_dependency_version {
             None => {
                 return Err(
-                    format!("required base content pack {base_pack_id} is not installed").into(),
+                    format!("required content pack {dependency_id} is not installed").into(),
                 );
             }
-            Some(installed_version) if installed_version != required_base_version => {
+            Some(installed_version)
+                if !content_packs::supports_dependency_version(
+                    pack,
+                    dependency_id,
+                    Some(&installed_version),
+                ) =>
+            {
                 return Err(format!(
-                    "{} requires base content pack {base_pack_id} version {required_base_version}; installed version is {installed_version}",
-                    pack.name
+                    "{} requires content pack {dependency_id} {}; installed version is {installed_version}",
+                    pack.name,
+                    requirement.display()
                 )
                 .into());
             }
@@ -3560,7 +3579,7 @@ fn remove_content_pack(id: &str) -> io::Result<()> {
                 .packs
                 .iter()
                 .find(|pack| {
-                    pack.base_pack_id.as_deref() == Some(id)
+                    pack.depends.contains_key(id)
                         && content_packs::read_installed(&install_root, &pack.id).is_some()
                 })
                 .map(|pack| pack.name.clone())
@@ -4229,7 +4248,7 @@ mod tests {
         let manifest = application_manifest("1.0.1", &["pack.xml"]);
         content_packs::write_install(root.path(), &pack, &manifest).unwrap();
         let catalog = ContentPackCatalog {
-            schema_version: 1,
+            schema_version: 2,
             packs: vec![pack],
         };
 
@@ -4241,7 +4260,32 @@ mod tests {
     }
 
     #[test]
-    fn content_pack_manager_with_incompatible_base_keeps_only_remove_action() {
+    fn content_pack_manager_with_newer_game_keeps_pack_compatible() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = content_pack_release("1.0.1");
+        let manifest = application_manifest("1.0.1", &["pack.xml"]);
+        content_packs::write_install(root.path(), &pack, &manifest).unwrap();
+        write_pack_definition(
+            root.path(),
+            "ClassicGalacticCivilWar",
+            "classic-galactic-civil-war",
+            "1.0.0",
+        );
+        let catalog = ContentPackCatalog {
+            schema_version: 2,
+            packs: vec![pack],
+        };
+
+        let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.32"));
+
+        assert!(screen.contains("Installed 1.0.1"));
+        assert!(screen.contains("Requires Rebellion 2 &gt;=0.0.31"));
+        assert!(!screen.contains("Incompatible with game"));
+        assert!(screen.contains("choice=content-pack-remove:sample-pack"));
+    }
+
+    #[test]
+    fn content_pack_manager_with_incompatible_content_dependency_keeps_only_remove_action() {
         let root = tempfile::tempdir().unwrap();
         let installed_pack = content_pack_release("1.0.0");
         let manifest = application_manifest("1.0.0", &["pack.xml"]);
@@ -4253,13 +4297,13 @@ mod tests {
             "0.9.0",
         );
         let catalog = ContentPackCatalog {
-            schema_version: 1,
+            schema_version: 2,
             packs: vec![content_pack_release("1.0.1")],
         };
 
         let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.31"));
 
-        assert!(screen.contains("Incompatible with base pack 0.9.0"));
+        assert!(screen.contains("Incompatible with classic-galactic-civil-war 0.9.0"));
         assert!(screen.contains("choice=content-pack-remove:sample-pack"));
         assert!(!screen.contains("choice=content-pack-install:sample-pack"));
     }
@@ -4270,8 +4314,7 @@ mod tests {
         let mut base_pack = content_pack_release("2.0.0");
         base_pack.id = "foundation-pack".to_string();
         base_pack.directory = "FoundationPack".to_string();
-        base_pack.base_pack_id = None;
-        base_pack.base_pack_version = None;
+        base_pack.depends.remove("classic-galactic-civil-war");
         let manifest = application_manifest("2.0.0", &["pack.xml"]);
         content_packs::write_install(root.path(), &base_pack, &manifest).unwrap();
         write_pack_definition(root.path(), "FoundationPack", "foundation-pack", "1.0.0");
@@ -4313,9 +4356,16 @@ mod tests {
             manifest: format!("dist/content-packs/sample-pack/manifest-{version}.json"),
             blobs: "content-pack-blobs/".to_string(),
             download_size: 100,
-            base_pack_id: Some("classic-galactic-civil-war".to_string()),
-            base_pack_version: Some("1.0.0".to_string()),
-            compatible_game_versions: vec!["0.0.31".to_string()],
+            depends: std::collections::BTreeMap::from([
+                (
+                    GAME_DEPENDENCY_ID.to_string(),
+                    content_packs::VersionRequirement::Single(">=0.0.31".to_string()),
+                ),
+                (
+                    "classic-galactic-civil-war".to_string(),
+                    content_packs::VersionRequirement::Single("1.0.0".to_string()),
+                ),
+            ]),
         }
     }
 
