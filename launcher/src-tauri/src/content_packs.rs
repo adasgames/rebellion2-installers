@@ -33,6 +33,9 @@ pub struct ContentPackRelease {
     pub download_size: u64,
     #[serde(default)]
     pub base_pack_id: Option<String>,
+    #[serde(default)]
+    pub base_pack_version: Option<String>,
+    pub compatible_game_versions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,7 +109,46 @@ pub fn validate_release(pack: &ContentPackRelease) -> io::Result<()> {
             return Err(invalid_data("a content pack cannot inherit from itself"));
         }
     }
+    if pack.base_pack_id.is_some() != pack.base_pack_version.is_some() {
+        return Err(invalid_data(
+            "base content-pack id and version must be declared together",
+        ));
+    }
+    if pack
+        .base_pack_version
+        .as_deref()
+        .is_some_and(|version| !is_semantic_version(version))
+    {
+        return Err(invalid_data(
+            "base content-pack version must be a semantic version",
+        ));
+    }
+    if pack.compatible_game_versions.is_empty() {
+        return Err(invalid_data(
+            "content pack must declare at least one compatible game version",
+        ));
+    }
+    let mut compatible_versions = BTreeSet::new();
+    for version in &pack.compatible_game_versions {
+        if !is_semantic_version(version) {
+            return Err(invalid_data(
+                "compatible game versions must be semantic versions",
+            ));
+        }
+        if !compatible_versions.insert(version) {
+            return Err(invalid_data("compatible game versions must be unique"));
+        }
+    }
     Ok(())
+}
+
+/// Returns whether a release explicitly supports the installed game version.
+pub fn supports_game_version(pack: &ContentPackRelease, game_version: Option<&str>) -> bool {
+    game_version.is_some_and(|installed| {
+        pack.compatible_game_versions
+            .iter()
+            .any(|compatible| compatible == installed)
+    })
 }
 
 pub fn validate_pack_manifest(manifest: &Manifest, pack: &ContentPackRelease) -> io::Result<()> {
@@ -158,6 +200,15 @@ pub fn read_manifest(install_root: &Path, id: &str) -> Option<Manifest> {
     }
     Manifest::from_json(&fs::read(metadata_directory(install_root, id).join(MANIFEST_FILE)).ok()?)
         .ok()
+}
+
+/// Reads a pack definition's version after verifying its declared identity.
+pub fn read_pack_version(definition_path: &Path, expected_id: &str) -> Option<String> {
+    let xml = fs::read_to_string(definition_path).ok()?;
+    if xml_element(&xml, "ID")? != expected_id {
+        return None;
+    }
+    xml_element(&xml, "Version")
 }
 
 pub fn write_install(
@@ -225,6 +276,50 @@ fn is_single_path_component(value: &str) -> bool {
         && !value.contains(':')
 }
 
+fn xml_element(xml: &str, element: &str) -> Option<String> {
+    let open = format!("<{element}>");
+    let close = format!("</{element}>");
+    let (_, remainder) = xml.split_once(&open)?;
+    let (value, trailing) = remainder.split_once(&close)?;
+    if trailing.contains(&open) || value.contains('<') {
+        return None;
+    }
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn is_semantic_version(value: &str) -> bool {
+    let core = value.split_once('+').map_or(value, |(version, metadata)| {
+        if is_version_suffix(metadata) {
+            version
+        } else {
+            ""
+        }
+    });
+    let core = core.split_once('-').map_or(core, |(version, prerelease)| {
+        if is_version_suffix(prerelease) {
+            version
+        } else {
+            ""
+        }
+    });
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|character| character.is_ascii_digit())
+        })
+}
+
+fn is_version_suffix(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|character| character.is_ascii_alphanumeric() || character == b'-')
+        })
+}
+
 fn validate_channel_path(value: &str) -> io::Result<()> {
     let path = value.trim_end_matches('/');
     if path.is_empty()
@@ -269,6 +364,8 @@ mod tests {
             blobs: "content-pack-blobs/".to_string(),
             download_size: 4,
             base_pack_id: Some("classic-galactic-civil-war".to_string()),
+            base_pack_version: Some("1.0.0".to_string()),
+            compatible_game_versions: vec!["0.0.31".to_string()],
         }
     }
 
@@ -307,6 +404,39 @@ mod tests {
     }
 
     #[test]
+    fn release_without_compatible_game_versions_is_rejected() {
+        let mut pack = release();
+        pack.compatible_game_versions.clear();
+
+        assert!(validate_release(&pack).is_err());
+    }
+
+    #[test]
+    fn release_requires_base_pack_id_and_version_together() {
+        let mut pack = release();
+        pack.base_pack_version = None;
+
+        assert!(validate_release(&pack).is_err());
+    }
+
+    #[test]
+    fn release_with_invalid_compatible_game_version_is_rejected() {
+        let mut pack = release();
+        pack.compatible_game_versions = vec!["next".to_string()];
+
+        assert!(validate_release(&pack).is_err());
+    }
+
+    #[test]
+    fn supports_game_version_requires_an_exact_declared_version() {
+        let pack = release();
+
+        assert!(supports_game_version(&pack, Some("0.0.31")));
+        assert!(!supports_game_version(&pack, Some("0.0.30")));
+        assert!(!supports_game_version(&pack, None));
+    }
+
+    #[test]
     fn release_cannot_escape_content_packs_directory() {
         for directory in ["../Outside", "Nested/Pack", "C:\\Pack"] {
             let mut pack = release();
@@ -336,5 +466,22 @@ mod tests {
         assert_eq!(installed.version, pack.version);
         assert_eq!(read_manifest(root.path(), &pack.id).unwrap(), manifest);
         assert!(!root.path().join("Content").exists());
+    }
+
+    #[test]
+    fn read_pack_version_requires_matching_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let definition = root.path().join("pack.xml");
+        fs::write(
+            &definition,
+            "<ContentPack><ID>base-pack</ID><Version>1.0.0</Version></ContentPack>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_pack_version(&definition, "base-pack").as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(read_pack_version(&definition, "other-pack"), None);
     }
 }

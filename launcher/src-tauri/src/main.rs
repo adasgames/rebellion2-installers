@@ -3243,27 +3243,66 @@ fn fetch_content_pack_catalog() -> Result<ContentPackCatalog, Box<dyn std::error
 
 fn content_pack_manager_screen(catalog: &ContentPackCatalog) -> io::Result<String> {
     let install_root = install_dir()?;
+    let game_version = current_game_version();
     let mut packs = String::from("<div class=\"pack-list\">");
     if catalog.packs.is_empty() {
         packs.push_str("<p>No optional content packs are currently available.</p>");
     }
     for pack in &catalog.packs {
         let installed = content_packs::read_installed(&install_root, &pack.id);
+        let game_compatible = content_packs::supports_game_version(pack, game_version.as_deref());
+        let installed_base_version = pack
+            .base_pack_id
+            .as_deref()
+            .and_then(|id| installed_content_pack_version(&install_root, id));
+        let base_compatible = pack
+            .base_pack_version
+            .as_deref()
+            .is_none_or(|required| installed_base_version.as_deref() == Some(required));
+        let compatible = game_compatible && base_compatible;
+        let compatibility = format!(
+            "Compatible with game {}",
+            pack.compatible_game_versions.join(", ")
+        );
+        let base_requirement = pack
+            .base_pack_id
+            .as_deref()
+            .zip(pack.base_pack_version.as_deref())
+            .map(|(id, version)| format!("Requires {id} {version}"));
         let description = if pack.description.trim().is_empty() {
             "Optional game content."
         } else {
             pack.description.trim()
         };
-        let (status, action_label) = match installed.as_ref() {
+        let (release_status, action_label) = match installed.as_ref() {
             Some(installed) if installed.version == pack.version => {
                 (format!("Installed {}", installed.version), None)
             }
-            Some(installed) => (
+            Some(installed) if compatible => (
                 format!(
                     "Installed {} · Update {} available",
                     installed.version, pack.version
                 ),
                 Some("Update"),
+            ),
+            Some(installed) => (format!("Installed {}", installed.version), None),
+            None if !game_compatible => (
+                match game_version.as_deref() {
+                    Some(version) => {
+                        format!("Requires a compatible game version · Installed {version}")
+                    }
+                    None => "Install the game before installing this content pack".to_string(),
+                },
+                None,
+            ),
+            None if !base_compatible => (
+                match installed_base_version.as_deref() {
+                    Some(version) => {
+                        format!("Requires a compatible base pack · Installed {version}")
+                    }
+                    None => "Install the required base pack first".to_string(),
+                },
+                None,
             ),
             None => (
                 format!(
@@ -3273,6 +3312,12 @@ fn content_pack_manager_screen(catalog: &ContentPackCatalog) -> io::Result<Strin
                 ),
                 Some("Install"),
             ),
+        };
+        let status = match base_requirement {
+            Some(requirement) => {
+                format!("{release_status} · {compatibility} · {requirement}")
+            }
+            None => format!("{release_status} · {compatibility}"),
         };
         let mut actions = String::from("<div class=\"pack-actions\">");
         if let Some(label) = action_label {
@@ -3350,25 +3395,39 @@ fn install_content_pack(
     pack: &ContentPackRelease,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     content_packs::validate_release(pack)?;
+    let game_version = current_game_version();
+    if !content_packs::supports_game_version(pack, game_version.as_deref()) {
+        let installed = game_version.as_deref().unwrap_or("not installed");
+        return Err(format!(
+            "{} requires game version {}; installed version is {installed}",
+            pack.name,
+            pack.compatible_game_versions.join(", ")
+        )
+        .into());
+    }
     let base = content_pack_base().ok_or("content-pack channel is not configured")?;
     let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), None)?;
     content_packs::validate_pack_manifest(&remote, pack)?;
     let install_root = install_dir()?;
-    if let Some(base_pack_id) = pack.base_pack_id.as_deref() {
-        let base_available = if base_pack_id == "classic-galactic-civil-war" {
-            install_root
-                .join("Content")
-                .join("Packs")
-                .join("ClassicGalacticCivilWar")
-                .join("pack.xml")
-                .is_file()
-        } else {
-            content_packs::read_installed(&install_root, base_pack_id).is_some()
-        };
-        if !base_available {
-            return Err(
-                format!("required base content pack {base_pack_id} is not installed").into(),
-            );
+    if let (Some(base_pack_id), Some(required_base_version)) = (
+        pack.base_pack_id.as_deref(),
+        pack.base_pack_version.as_deref(),
+    ) {
+        let installed_base_version = installed_content_pack_version(&install_root, base_pack_id);
+        match installed_base_version {
+            None => {
+                return Err(
+                    format!("required base content pack {base_pack_id} is not installed").into(),
+                );
+            }
+            Some(installed_version) if installed_version != required_base_version => {
+                return Err(format!(
+                    "{} requires base content pack {base_pack_id} version {required_base_version}; installed version is {installed_version}",
+                    pack.name
+                )
+                .into());
+            }
+            Some(_) => {}
         }
     }
     let pack_directory = content_packs::install_directory(&install_root, pack)?;
@@ -3409,6 +3468,21 @@ fn install_content_pack(
     }
     content_packs::write_install(&install_root, pack, &remote)?;
     Ok(changed)
+}
+
+/// Returns the installed version for the built-in pack or a launcher-managed optional pack.
+fn installed_content_pack_version(install_root: &Path, id: &str) -> Option<String> {
+    if id == "classic-galactic-civil-war" {
+        return content_packs::read_pack_version(
+            &install_root
+                .join("Content")
+                .join("Packs")
+                .join("ClassicGalacticCivilWar")
+                .join("pack.xml"),
+            id,
+        );
+    }
+    content_packs::read_installed(install_root, id).map(|installed| installed.version)
 }
 
 fn start_content_pack_remove(handle: &tauri::AppHandle, id: &str) {
