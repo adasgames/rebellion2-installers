@@ -2,14 +2,16 @@ use rebellion2_update_core::{
     apply, diff, validate_manifest_paths, verify_install, BlobSource, Manifest,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::cmp::Ordering as VersionOrdering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::parse_semantic_version;
+use crate::{compare_versions, parse_semantic_version};
 
 pub const CATALOG_PATH: &str = "dist/catalogue.json";
+pub const GAME_DEPENDENCY_ID: &str = "rebellion2";
 const METADATA_DIRECTORY: &str = ".content-packs";
 const INSTALL_RECORD_FILE: &str = "install.json";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -37,11 +39,14 @@ pub struct ContentPackRelease {
     pub blobs: String,
     #[serde(default)]
     pub download_size: u64,
-    #[serde(default)]
-    pub base_pack_id: Option<String>,
-    #[serde(default)]
-    pub base_pack_version: Option<String>,
-    pub compatible_game_versions: Vec<String>,
+    pub depends: BTreeMap<String, VersionRequirement>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum VersionRequirement {
+    Single(String),
+    Alternatives(Vec<String>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,7 +63,7 @@ fn default_blobs() -> String {
 }
 
 pub fn validate_catalog(catalog: &ContentPackCatalog) -> io::Result<()> {
-    if catalog.schema_version != 1 {
+    if catalog.schema_version != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -110,56 +115,123 @@ pub fn validate_release(pack: &ContentPackRelease) -> io::Result<()> {
     if !pack.blobs.ends_with('/') {
         return Err(invalid_data("content-pack blob path must end with a slash"));
     }
-    if let Some(base_pack_id) = &pack.base_pack_id {
-        if !is_safe_id(base_pack_id) {
+    if !pack.depends.contains_key(GAME_DEPENDENCY_ID) {
+        return Err(invalid_data("content pack must depend on rebellion2"));
+    }
+    for (id, requirement) in &pack.depends {
+        if !is_safe_id(id) || id == &pack.id {
+            return Err(invalid_data("content-pack dependency id is invalid"));
+        }
+        if !requirement.is_valid() {
             return Err(invalid_data(
-                "base content-pack id must be a lowercase slug",
+                "content-pack dependency requirement is invalid",
             ));
-        }
-        if base_pack_id == &pack.id {
-            return Err(invalid_data("a content pack cannot inherit from itself"));
-        }
-    }
-    if pack.base_pack_id.is_some() != pack.base_pack_version.is_some() {
-        return Err(invalid_data(
-            "base content-pack id and version must be declared together",
-        ));
-    }
-    if pack
-        .base_pack_version
-        .as_deref()
-        .is_some_and(|version| parse_semantic_version(version).is_none())
-    {
-        return Err(invalid_data(
-            "base content-pack version must be a semantic version",
-        ));
-    }
-    if pack.compatible_game_versions.is_empty() {
-        return Err(invalid_data(
-            "content pack must declare at least one compatible game version",
-        ));
-    }
-    let mut compatible_versions = BTreeSet::new();
-    for version in &pack.compatible_game_versions {
-        if parse_semantic_version(version).is_none() {
-            return Err(invalid_data(
-                "compatible game versions must be semantic versions",
-            ));
-        }
-        if !compatible_versions.insert(version) {
-            return Err(invalid_data("compatible game versions must be unique"));
         }
     }
     Ok(())
 }
 
-/// Returns whether a release explicitly supports the installed game version.
-pub fn supports_game_version(pack: &ContentPackRelease, game_version: Option<&str>) -> bool {
-    game_version.is_some_and(|installed| {
-        pack.compatible_game_versions
-            .iter()
-            .any(|compatible| compatible == installed)
+/// Returns whether an installed dependency version satisfies a pack's requirement.
+pub fn supports_dependency_version(
+    pack: &ContentPackRelease,
+    dependency_id: &str,
+    installed_version: Option<&str>,
+) -> bool {
+    pack.depends
+        .get(dependency_id)
+        .zip(installed_version)
+        .is_some_and(|(requirement, installed)| requirement.is_satisfied_by(installed))
+}
+
+impl VersionRequirement {
+    /// Returns the authored requirement text for display.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Single(requirement) => requirement.clone(),
+            Self::Alternatives(requirements) => requirements.join(" or "),
+        }
+    }
+
+    /// Returns whether every alternative uses the supported constraint grammar.
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Single(requirement) => requirement_expression_is_valid(requirement),
+            Self::Alternatives(requirements) => {
+                !requirements.is_empty()
+                    && requirements
+                        .iter()
+                        .all(|requirement| requirement_expression_is_valid(requirement))
+            }
+        }
+    }
+
+    /// Returns whether a semantic version satisfies any authored alternative.
+    fn is_satisfied_by(&self, version: &str) -> bool {
+        if !self.is_valid() || parse_semantic_version(version).is_none() {
+            return false;
+        }
+        match self {
+            Self::Single(requirement) => requirement_expression_matches(requirement, version),
+            Self::Alternatives(requirements) => requirements
+                .iter()
+                .any(|requirement| requirement_expression_matches(requirement, version)),
+        }
+    }
+}
+
+/// Returns whether one whitespace-separated conjunction contains valid constraints.
+fn requirement_expression_is_valid(requirement: &str) -> bool {
+    let mut constraints = requirement.split_whitespace().peekable();
+    constraints.peek().is_some()
+        && constraints.all(|constraint| parse_version_constraint(constraint).is_some())
+}
+
+/// Returns whether every constraint in one alternative matches a version.
+fn requirement_expression_matches(requirement: &str, version: &str) -> bool {
+    requirement.split_whitespace().all(|constraint| {
+        parse_version_constraint(constraint)
+            .is_some_and(|(operator, target)| operator.matches(compare_versions(version, target)))
     })
+}
+
+/// Parses one exact or ordered semantic-version constraint.
+fn parse_version_constraint(constraint: &str) -> Option<(VersionOperator, &str)> {
+    let (operator, target) = if let Some(target) = constraint.strip_prefix(">=") {
+        (VersionOperator::GreaterOrEqual, target)
+    } else if let Some(target) = constraint.strip_prefix("<=") {
+        (VersionOperator::LessOrEqual, target)
+    } else if let Some(target) = constraint.strip_prefix('>') {
+        (VersionOperator::Greater, target)
+    } else if let Some(target) = constraint.strip_prefix('<') {
+        (VersionOperator::Less, target)
+    } else if let Some(target) = constraint.strip_prefix('=') {
+        (VersionOperator::Equal, target)
+    } else {
+        (VersionOperator::Equal, constraint)
+    };
+    parse_semantic_version(target).map(|_| (operator, target))
+}
+
+#[derive(Clone, Copy)]
+enum VersionOperator {
+    Equal,
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+}
+
+impl VersionOperator {
+    /// Returns whether a semantic-version ordering passes this operator.
+    fn matches(self, ordering: VersionOrdering) -> bool {
+        match self {
+            Self::Equal => ordering == VersionOrdering::Equal,
+            Self::Greater => ordering == VersionOrdering::Greater,
+            Self::GreaterOrEqual => ordering != VersionOrdering::Less,
+            Self::Less => ordering == VersionOrdering::Less,
+            Self::LessOrEqual => ordering != VersionOrdering::Greater,
+        }
+    }
 }
 
 pub fn validate_pack_manifest(manifest: &Manifest, pack: &ContentPackRelease) -> io::Result<()> {
@@ -458,9 +530,16 @@ mod tests {
             manifest: "dist/content-packs/sample-pack/manifest-1.2.3.json".to_string(),
             blobs: "content-pack-blobs/".to_string(),
             download_size: 4,
-            base_pack_id: Some("classic-galactic-civil-war".to_string()),
-            base_pack_version: Some("1.0.0".to_string()),
-            compatible_game_versions: vec!["0.0.31".to_string()],
+            depends: BTreeMap::from([
+                (
+                    GAME_DEPENDENCY_ID.to_string(),
+                    VersionRequirement::Single(">=0.0.31".to_string()),
+                ),
+                (
+                    "classic-galactic-civil-war".to_string(),
+                    VersionRequirement::Single("1.0.0".to_string()),
+                ),
+            ]),
         }
     }
 
@@ -528,7 +607,7 @@ mod tests {
     #[test]
     fn catalog_accepts_independently_scoped_pack() {
         let catalog = ContentPackCatalog {
-            schema_version: 1,
+            schema_version: 2,
             packs: vec![release()],
         };
 
@@ -541,7 +620,7 @@ mod tests {
         let mut second = release();
         second.id = "another-pack".to_string();
         let catalog = ContentPackCatalog {
-            schema_version: 1,
+            schema_version: 2,
             packs: vec![release(), second],
         };
 
@@ -549,26 +628,32 @@ mod tests {
     }
 
     #[test]
-    fn release_without_compatible_game_versions_is_rejected() {
+    fn release_without_game_dependency_is_rejected() {
         let mut pack = release();
-        pack.compatible_game_versions.clear();
+        pack.depends.remove(GAME_DEPENDENCY_ID);
 
         assert!(validate_release(&pack).is_err());
     }
 
     #[test]
-    fn release_requires_base_pack_id_and_version_together() {
+    fn release_with_self_dependency_is_rejected() {
         let mut pack = release();
-        pack.base_pack_version = None;
+        pack.depends.insert(
+            pack.id.clone(),
+            VersionRequirement::Single("1.0.0".to_string()),
+        );
 
         assert!(validate_release(&pack).is_err());
     }
 
     #[test]
-    fn release_with_invalid_compatible_game_version_is_rejected() {
-        for version in ["next", "01.0.0", "1.0.0-beta.01"] {
+    fn release_with_invalid_dependency_requirement_is_rejected() {
+        for requirement in ["", ">=", "^0.0.31", "01.0.0"] {
             let mut pack = release();
-            pack.compatible_game_versions = vec![version.to_string()];
+            pack.depends.insert(
+                GAME_DEPENDENCY_ID.to_string(),
+                VersionRequirement::Single(requirement.to_string()),
+            );
 
             assert!(validate_release(&pack).is_err());
         }
@@ -585,12 +670,61 @@ mod tests {
     }
 
     #[test]
-    fn supports_game_version_requires_an_exact_declared_version() {
-        let pack = release();
+    fn supports_dependency_version_accepts_a_bounded_range() {
+        let mut pack = release();
+        pack.depends.insert(
+            GAME_DEPENDENCY_ID.to_string(),
+            VersionRequirement::Single(">=0.0.31 <0.0.40".to_string()),
+        );
 
-        assert!(supports_game_version(&pack, Some("0.0.31")));
-        assert!(!supports_game_version(&pack, Some("0.0.30")));
-        assert!(!supports_game_version(&pack, None));
+        assert!(supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            Some("0.0.31")
+        ));
+        assert!(supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            Some("0.0.39")
+        ));
+        assert!(!supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            Some("0.0.40")
+        ));
+        assert!(!supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            None
+        ));
+    }
+
+    #[test]
+    fn supports_dependency_version_accepts_alternative_ranges() {
+        let mut pack = release();
+        pack.depends.insert(
+            GAME_DEPENDENCY_ID.to_string(),
+            VersionRequirement::Alternatives(vec![
+                ">=0.0.31 <0.0.35".to_string(),
+                ">=0.0.40".to_string(),
+            ]),
+        );
+
+        assert!(supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            Some("0.0.33")
+        ));
+        assert!(!supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            Some("0.0.37")
+        ));
+        assert!(supports_dependency_version(
+            &pack,
+            GAME_DEPENDENCY_ID,
+            Some("0.0.40")
+        ));
     }
 
     #[test]
