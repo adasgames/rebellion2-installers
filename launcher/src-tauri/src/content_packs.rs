@@ -1,4 +1,6 @@
-use rebellion2_update_core::{validate_manifest_paths, Manifest};
+use rebellion2_update_core::{
+    apply, diff, validate_manifest_paths, verify_install, BlobSource, Manifest,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,6 +13,8 @@ pub const CATALOG_PATH: &str = "dist/catalogue.json";
 const METADATA_DIRECTORY: &str = ".content-packs";
 const INSTALL_RECORD_FILE: &str = "install.json";
 const MANIFEST_FILE: &str = "manifest.json";
+const PENDING_INSTALL_FILE: &str = "pending-install.json";
+const STAGING_DIRECTORY: &str = "staging";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,6 +189,78 @@ pub fn install_directory(install_root: &Path, pack: &ContentPackRelease) -> io::
         .join(&pack.directory))
 }
 
+/// Installs a previously unmanaged pack without exposing partial files in the live pack directory.
+pub fn install_fresh(
+    install_root: &Path,
+    pack: &ContentPackRelease,
+    manifest: &Manifest,
+    blobs: &dyn BlobSource,
+) -> io::Result<usize> {
+    validate_release(pack)?;
+    validate_pack_manifest(manifest, pack)?;
+
+    let destination = install_directory(install_root, pack)?;
+    let pending = read_pending_install(install_root, &pack.id);
+    let destination_has_files = directory_has_entries(&destination)?;
+    let owns_destination = pending
+        .as_ref()
+        .is_some_and(|record| record.id == pack.id && record.directory == pack.directory);
+    if destination_has_files && !owns_destination {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists but is not managed by the launcher",
+                destination.display()
+            ),
+        ));
+    }
+
+    if destination_has_files
+        && pending
+            .as_ref()
+            .is_some_and(|record| record.version == pack.version)
+        && verify_install(&destination, manifest)?
+    {
+        write_install(install_root, pack, manifest)?;
+        return Ok(0);
+    }
+
+    let metadata = metadata_directory(install_root, &pack.id);
+    let staging = metadata.join(STAGING_DIRECTORY);
+    remove_directory_if_present(&staging)?;
+    fs::create_dir_all(&metadata)?;
+    if pending.as_ref().is_none_or(|record| {
+        !destination_has_files
+            && (record.id != pack.id
+                || record.version != pack.version
+                || record.directory != pack.directory)
+    }) {
+        write_json_atomically(&metadata.join(PENDING_INSTALL_FILE), &install_record(pack))?;
+    }
+
+    let plan = diff(None, manifest);
+    apply(&plan, &staging, blobs)?;
+    if !verify_install(&staging, manifest)? {
+        return Err(invalid_data(
+            "content-pack verification failed after staging",
+        ));
+    }
+
+    if destination.exists() {
+        if destination_has_files {
+            fs::remove_dir_all(&destination)?;
+        } else {
+            fs::remove_dir(&destination)?;
+        }
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&staging, &destination)?;
+    write_install(install_root, pack, manifest)?;
+    Ok(plan.changed.len())
+}
+
 pub fn read_installed(install_root: &Path, id: &str) -> Option<InstalledContentPack> {
     if !is_safe_id(id) {
         return None;
@@ -227,14 +303,57 @@ pub fn write_install(
     validate_pack_manifest(manifest, pack)?;
     let metadata = metadata_directory(install_root, &pack.id);
     fs::create_dir_all(&metadata)?;
-    let installed = InstalledContentPack {
+    let installed = install_record(pack);
+    write_json_atomically(&metadata.join(MANIFEST_FILE), manifest)?;
+    write_json_atomically(&metadata.join(INSTALL_RECORD_FILE), &installed)?;
+    clear_pending_install(install_root, &pack.id);
+    Ok(())
+}
+
+fn install_record(pack: &ContentPackRelease) -> InstalledContentPack {
+    InstalledContentPack {
         id: pack.id.clone(),
         name: pack.name.clone(),
         version: pack.version.clone(),
         directory: pack.directory.clone(),
-    };
-    write_json_atomically(&metadata.join(MANIFEST_FILE), manifest)?;
-    write_json_atomically(&metadata.join(INSTALL_RECORD_FILE), &installed)
+    }
+}
+
+fn read_pending_install(install_root: &Path, id: &str) -> Option<InstalledContentPack> {
+    if !is_safe_id(id) {
+        return None;
+    }
+    serde_json::from_slice(
+        &fs::read(metadata_directory(install_root, id).join(PENDING_INSTALL_FILE)).ok()?,
+    )
+    .ok()
+}
+
+fn clear_pending_install(install_root: &Path, id: &str) {
+    let metadata = metadata_directory(install_root, id);
+    let _ = fs::remove_file(metadata.join(PENDING_INSTALL_FILE));
+    let _ = remove_directory_if_present(&metadata.join(STAGING_DIRECTORY));
+}
+
+fn directory_has_entries(path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a directory", path.display()),
+        ));
+    }
+    Ok(fs::read_dir(path)?.next().is_some())
+}
+
+fn remove_directory_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn remove_install_metadata(install_root: &Path, id: &str) -> io::Result<()> {
@@ -326,7 +445,8 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rebellion2_update_core::FileEntry;
+    use rebellion2_update_core::{sha256_hex, FileEntry};
+    use std::collections::BTreeMap;
 
     fn release() -> ContentPackRelease {
         ContentPackRelease {
@@ -353,6 +473,56 @@ mod tests {
                 size: 4,
             }],
         }
+    }
+
+    struct TestBlobs {
+        values: BTreeMap<String, Vec<u8>>,
+        fail_on: Option<String>,
+    }
+
+    impl BlobSource for TestBlobs {
+        fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
+            if self.fail_on.as_deref() == Some(sha256) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "interrupted",
+                ));
+            }
+            self.values
+                .get(sha256)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing blob"))
+        }
+    }
+
+    fn install_fixture() -> (Manifest, TestBlobs) {
+        let first = b"first".to_vec();
+        let second = b"second".to_vec();
+        let first_hash = sha256_hex(&first);
+        let second_hash = sha256_hex(&second);
+        let manifest = Manifest {
+            version: "1.2.3".to_string(),
+            files: vec![
+                FileEntry {
+                    path: "pack.xml".to_string(),
+                    sha256: first_hash.clone(),
+                    size: first.len() as u64,
+                },
+                FileEntry {
+                    path: "Data/ships.xml".to_string(),
+                    sha256: second_hash.clone(),
+                    size: second.len() as u64,
+                },
+            ],
+        };
+        let values = BTreeMap::from([(first_hash, first), (second_hash.clone(), second)]);
+        (
+            manifest,
+            TestBlobs {
+                values,
+                fail_on: Some(second_hash),
+            },
+        )
     }
 
     #[test]
@@ -453,6 +623,79 @@ mod tests {
         assert_eq!(installed.version, pack.version);
         assert_eq!(read_manifest(root.path(), &pack.id).unwrap(), manifest);
         assert!(!root.path().join("Content").exists());
+    }
+
+    #[test]
+    fn interrupted_fresh_install_keeps_live_directory_clean_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = release();
+        let (manifest, failing_blobs) = install_fixture();
+
+        assert!(install_fresh(root.path(), &pack, &manifest, &failing_blobs).is_err());
+        assert!(!install_directory(root.path(), &pack).unwrap().exists());
+        assert!(read_installed(root.path(), &pack.id).is_none());
+
+        let successful_blobs = TestBlobs {
+            values: failing_blobs.values,
+            fail_on: None,
+        };
+        assert_eq!(
+            install_fresh(root.path(), &pack, &manifest, &successful_blobs).unwrap(),
+            2
+        );
+        assert!(
+            verify_install(&install_directory(root.path(), &pack).unwrap(), &manifest).unwrap()
+        );
+        assert_eq!(
+            read_installed(root.path(), &pack.id).unwrap().version,
+            pack.version
+        );
+    }
+
+    #[test]
+    fn fresh_install_does_not_replace_an_unmanaged_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = release();
+        let (manifest, blobs) = install_fixture();
+        let destination = install_directory(root.path(), &pack).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("custom.txt"), "keep").unwrap();
+
+        let error = install_fresh(root.path(), &pack, &manifest, &blobs).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(destination.join("custom.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn fresh_install_finishes_a_promoted_pending_install_without_downloading_again() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = release();
+        let (manifest, blobs) = install_fixture();
+        let destination = install_directory(root.path(), &pack).unwrap();
+        let metadata = metadata_directory(root.path(), &pack.id);
+        fs::create_dir_all(&metadata).unwrap();
+        write_json_atomically(&metadata.join(PENDING_INSTALL_FILE), &install_record(&pack))
+            .unwrap();
+        let complete_blobs = TestBlobs {
+            values: blobs.values,
+            fail_on: None,
+        };
+        apply(&diff(None, &manifest), &destination, &complete_blobs).unwrap();
+        let unavailable_blobs = TestBlobs {
+            values: BTreeMap::new(),
+            fail_on: None,
+        };
+
+        assert_eq!(
+            install_fresh(root.path(), &pack, &manifest, &unavailable_blobs).unwrap(),
+            0
+        );
+        assert!(read_installed(root.path(), &pack.id).is_some());
+        assert!(!metadata.join(PENDING_INSTALL_FILE).exists());
     }
 
     #[test]

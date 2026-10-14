@@ -3467,21 +3467,15 @@ fn install_content_pack(
             Some(_) => {}
         }
     }
-    let pack_directory = content_packs::install_directory(&install_root, pack)?;
     let installed = content_packs::read_installed(&install_root, &pack.id);
     if let Some(installed) = installed.as_ref() {
         if installed.directory != pack.directory {
             return Err("content-pack install directory changed unexpectedly".into());
         }
-    } else if pack_directory.exists() && fs::read_dir(&pack_directory)?.next().is_some() {
-        return Err(format!(
-            "{} already exists but is not managed by the launcher",
-            pack_directory.display()
-        )
-        .into());
     }
+    let pack_directory = content_packs::install_directory(&install_root, pack)?;
     let local = content_packs::read_manifest(&install_root, &pack.id);
-    let plan = diff(local.as_ref(), &remote);
+    let plan = diff(installed.as_ref().and(local.as_ref()), &remote);
     let changed = plan.changed.len();
     let bytes = plan.download_size();
     update_progress(
@@ -3499,6 +3493,14 @@ fn install_content_pack(
         progress_end: 95,
         application_update: false,
     };
+    if installed.is_none() {
+        return Ok(content_packs::install_fresh(
+            &install_root,
+            pack,
+            &remote,
+            &blobs,
+        )?);
+    }
     apply(&plan, &pack_directory, &blobs)?;
     if !verify_install(&pack_directory, &remote)? {
         return Err("content-pack verification failed after installation".into());
