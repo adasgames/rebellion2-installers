@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const CATALOG_PATH: &str = "dist/content-packs.json";
+pub const CATALOG_PATH: &str = "dist/catalogue.json";
 const METADATA_DIRECTORY: &str = ".content-packs";
 const INSTALL_RECORD_FILE: &str = "install.json";
 const MANIFEST_FILE: &str = "manifest.json";

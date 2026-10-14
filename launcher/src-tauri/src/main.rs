@@ -49,6 +49,8 @@ const CONTENT_VERSION: Option<&str> = option_env!("REB2_CONTENT_VERSION");
 /// Public base URL of the release channel (REB2_CONTENT_BASE_URL): holds the public
 /// atomic application pointer and token-gated content manifests + blobs.
 const CONTENT_BASE: Option<&str> = option_env!("REB2_CONTENT_BASE_URL");
+/// Public base URL of the optional content-pack channel (REB2_CONTENT_PACK_BASE_URL).
+const CONTENT_PACK_BASE: Option<&str> = option_env!("REB2_CONTENT_PACK_BASE_URL");
 
 const CONTENT_VERSION_FILE: &str = ".content-version";
 const CONTENT_MANIFEST_FILE: &str = ".manifest.json";
@@ -114,10 +116,6 @@ static PENDING_LAUNCHER_UPDATE: Mutex<Option<LauncherUpdate>> = Mutex::new(None)
 static PENDING_GAME_UPDATE: Mutex<Option<GameUpdate>> = Mutex::new(None);
 /// The last validated optional-pack catalog shown by the launcher.
 static CONTENT_PACK_CATALOG: Mutex<Option<ContentPackCatalog>> = Mutex::new(None);
-/// A protected pack install waiting for ownership verification.
-static PENDING_CONTENT_PACK_INSTALL: Mutex<Option<ContentPackRelease>> = Mutex::new(None);
-/// Set while ownership verification is being completed for a pack download.
-static CONTENT_PACK_AUTH_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set after this launcher session downloads an update for its next start.
 static LAUNCHER_UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
 /// A newer application release waiting for the user to approve its installation.
@@ -534,7 +532,6 @@ fn on_gate_result(
     if pending_update.is_none()
         && !APPLICATION_UPDATE_AUTH_PENDING.load(Ordering::Relaxed)
         && !GAME_UPDATE_AUTH_PENDING.load(Ordering::Relaxed)
-        && !CONTENT_PACK_AUTH_PENDING.load(Ordering::Relaxed)
     {
         if let Some(url) = presigned {
             *PENDING.lock().unwrap() = Some(Pending::FirstInstall { url });
@@ -555,10 +552,6 @@ fn on_gate_result(
 
 /// Continues the first install or content update that requested ownership verification.
 fn resume_after_gate(handle: &tauri::AppHandle) {
-    if CONTENT_PACK_AUTH_PENDING.swap(false, Ordering::Relaxed) {
-        start_pending_content_pack_install(handle);
-        return;
-    }
     if GAME_UPDATE_AUTH_PENDING.swap(false, Ordering::Relaxed) {
         start_game_update(handle);
         return;
@@ -2913,16 +2906,21 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 fn content_base() -> Option<String> {
-    CONTENT_BASE
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            if v.ends_with('/') {
-                v.to_string()
-            } else {
-                format!("{v}/")
-            }
-        })
+    normalized_base(CONTENT_BASE)
+}
+
+fn content_pack_base() -> Option<String> {
+    normalized_base(CONTENT_PACK_BASE)
+}
+
+fn normalized_base(value: Option<&str>) -> Option<String> {
+    value.map(str::trim).filter(|v| !v.is_empty()).map(|v| {
+        if v.ends_with('/') {
+            v.to_string()
+        } else {
+            format!("{v}/")
+        }
+    })
 }
 
 fn auth_base() -> String {
@@ -3236,7 +3234,7 @@ fn show_content_pack_manager(handle: &tauri::AppHandle) {
 }
 
 fn fetch_content_pack_catalog() -> Result<ContentPackCatalog, Box<dyn std::error::Error>> {
-    let base = content_base().ok_or("content channel is not configured")?;
+    let base = content_pack_base().ok_or("content-pack channel is not configured")?;
     let catalog: ContentPackCatalog =
         fetch_json(&format!("{base}{}", content_packs::CATALOG_PATH), None)?;
     content_packs::validate_catalog(&catalog)?;
@@ -3323,29 +3321,6 @@ fn start_content_pack_install(handle: &tauri::AppHandle, id: &str) {
         );
         return;
     };
-    *PENDING_CONTENT_PACK_INSTALL.lock().unwrap() = Some(pack);
-    start_pending_content_pack_install(handle);
-}
-
-fn start_pending_content_pack_install(handle: &tauri::AppHandle) {
-    let pack = PENDING_CONTENT_PACK_INSTALL.lock().unwrap().clone();
-    let Some(pack) = pack else {
-        show_content_pack_manager(handle);
-        return;
-    };
-    if SESSION.lock().unwrap().is_none() {
-        CONTENT_PACK_AUTH_PENDING.store(true, Ordering::Relaxed);
-        write_screen(
-            handle,
-            &render(
-                "Ownership required",
-                false,
-                "Sign in to download this content pack.",
-                &button("Sign in", "signin"),
-            ),
-        );
-        return;
-    }
     show_progress_ui(handle);
     update_progress(handle, 0, &format!("Preparing {}\u{2026}", pack.name));
     let handle = handle.clone();
@@ -3355,7 +3330,6 @@ fn start_pending_content_pack_install(handle: &tauri::AppHandle) {
 fn run_content_pack_install(handle: &tauri::AppHandle, pack: &ContentPackRelease) {
     match install_content_pack(handle, pack) {
         Ok(changed) => {
-            *PENDING_CONTENT_PACK_INSTALL.lock().unwrap() = None;
             log_line(&format!(
                 "[launcher] content pack {} {} installed ({changed} files).",
                 pack.id, pack.version
@@ -3363,19 +3337,6 @@ fn run_content_pack_install(handle: &tauri::AppHandle, pack: &ContentPackRelease
             update_progress(handle, 100, "Content pack installed.");
             thread::sleep(Duration::from_millis(500));
             show_content_pack_manager(handle);
-        }
-        Err(error) if is_authorization_required(error.as_ref()) => {
-            clear_token();
-            CONTENT_PACK_AUTH_PENDING.store(true, Ordering::Relaxed);
-            write_screen(
-                handle,
-                &render(
-                    "Ownership required",
-                    false,
-                    "Sign in to continue the content-pack download.",
-                    &button("Sign in", "signin"),
-                ),
-            );
         }
         Err(error) => {
             log_line(&format!("[launcher] content-pack install failed: {error}"));
@@ -3389,9 +3350,8 @@ fn install_content_pack(
     pack: &ContentPackRelease,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     content_packs::validate_release(pack)?;
-    let base = content_base().ok_or("content channel is not configured")?;
-    let token = SESSION.lock().unwrap().clone();
-    let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), token.as_deref())?;
+    let base = content_pack_base().ok_or("content-pack channel is not configured")?;
+    let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), None)?;
     content_packs::validate_pack_manifest(&remote, pack)?;
     let install_root = install_dir()?;
     if let Some(base_pack_id) = pack.base_pack_id.as_deref() {
@@ -3435,7 +3395,7 @@ fn install_content_pack(
     );
     let blobs = HttpBlobs {
         base: format!("{base}{}", pack.blobs),
-        token,
+        token: None,
         handle: handle.clone(),
         total: bytes,
         done: AtomicU64::new(0),
@@ -4124,6 +4084,24 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_base_trims_and_appends_separator() {
+        assert_eq!(
+            normalized_base(Some("  https://packs.example.test  ")),
+            Some("https://packs.example.test/".to_string())
+        );
+        assert_eq!(
+            normalized_base(Some("https://packs.example.test/")),
+            Some("https://packs.example.test/".to_string())
+        );
+    }
+
+    #[test]
+    fn normalized_base_rejects_missing_or_empty_values() {
+        assert_eq!(normalized_base(None), None);
+        assert_eq!(normalized_base(Some("   ")), None);
+    }
 
     fn application_manifest(version: &str, paths: &[&str]) -> Manifest {
         Manifest {

@@ -194,12 +194,16 @@ jobs:
         env:
           AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          REB2_CONTENT_PACK_BASE_URL: ${{ secrets.REB2_CONTENT_PACK_BASE_URL }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:AUTH_BASE_URL)) {
             throw "The ownership service is not configured."
           }
           if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_BASE_URL)) {
             throw "The update channel is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_PACK_BASE_URL)) {
+            throw "The content-pack channel is not configured."
           }
           $baseUrl = $env:REB2_CONTENT_BASE_URL.TrimEnd("/")
           $pointer = Invoke-RestMethod "$baseUrl/dist/latest.json"
@@ -217,6 +221,7 @@ jobs:
           # patches from. Endpoints stay in repository secrets.
           REB2_AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          REB2_CONTENT_PACK_BASE_URL: ${{ secrets.REB2_CONTENT_PACK_BASE_URL }}
         run: cargo build --release
 
       - name: Stamp game exe icon
