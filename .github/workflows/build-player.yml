@@ -95,7 +95,7 @@ jobs:
           git config lfs.concurrenttransfers 4
           max_attempts=6
           for attempt in $(seq 1 "$max_attempts"); do
-            if git lfs pull --include="Content/**,Models/MainMenu/**" --exclude=""; then
+            if git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**,Models/MainMenu/**" --exclude=""; then
               break
             fi
             if [ "$attempt" -eq "$max_attempts" ]; then
@@ -109,7 +109,10 @@ jobs:
             echo "Asset fetch attempt ${attempt}/${max_attempts} failed; retrying in ${delay} seconds."
             sleep "$delay"
           done
-          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content Models/MainMenu; then
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' \
+            Content/Application \
+            Content/Packs/ClassicGalacticCivilWar \
+            Models/MainMenu; then
             echo "Asset checkout still contains Git LFS pointers."
             exit 1
           fi
@@ -117,9 +120,14 @@ jobs:
       - name: Install build assets
         working-directory: game
         run: |
-          mkdir -p Assets/Content Assets/Art/Models/MainMenu
+          rm -rf Assets/Content
+          mkdir -p Assets/Content/Packs Assets/Art/Models/MainMenu
           test -f .ci/assets/Content/Application/Schemas/game-config.xsd
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Content/ Assets/Content/
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Content/Application/ Assets/Content/Application/
+          cp .ci/assets/Content/catalog.xml Assets/Content/catalog.xml
+          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' \
+            .ci/assets/Content/Packs/ClassicGalacticCivilWar/ \
+            Assets/Content/Packs/ClassicGalacticCivilWar/
           rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Models/MainMenu/ Assets/Art/Models/MainMenu/
           rm -rf .ci
 

@@ -46,6 +46,28 @@ impl Manifest {
     }
 }
 
+/// Rejects manifest paths that could escape the directory owned by an update layer.
+/// Update manifests always use non-empty, relative POSIX paths.
+pub fn validate_manifest_paths(manifest: &Manifest) -> io::Result<()> {
+    let mut paths = BTreeSet::new();
+    for entry in &manifest.files {
+        if !is_safe_manifest_path(&entry.path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest contains an unsafe path: {}", entry.path),
+            ));
+        }
+        let key = manifest_path_key(&entry.path);
+        if !paths.insert(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest contains a duplicate path: {}", entry.path),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Match manifest paths using the rules of the platform receiving the update.
 fn manifest_path_key(path: &str) -> String {
     #[cfg(target_os = "windows")]
@@ -126,6 +148,7 @@ pub trait BlobSource {
 ///
 /// Returns the number of files written.
 pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Result<usize> {
+    validate_plan_paths(plan)?;
     for entry in &plan.changed {
         let bytes = blobs.fetch(&entry.sha256)?;
         let actual = sha256_hex(&bytes);
@@ -163,6 +186,32 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
     }
 
     Ok(plan.changed.len())
+}
+
+fn validate_plan_paths(plan: &Plan) -> io::Result<()> {
+    let manifest = Manifest {
+        version: String::new(),
+        files: plan.changed.clone(),
+    };
+    validate_manifest_paths(&manifest)?;
+    for path in &plan.removed {
+        if !is_safe_manifest_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("update plan contains an unsafe removal path: {path}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_manifest_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains(['\\', ':'])
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 #[cfg(target_os = "windows")]
@@ -333,6 +382,38 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // nothing partial left behind
         assert!(!dir.path().join("a").exists());
+    }
+
+    #[test]
+    fn manifest_rejects_paths_outside_its_install_root() {
+        for path in [
+            "../outside",
+            "/absolute",
+            "nested\\windows",
+            "C:/absolute",
+            "nested//file",
+            "nested/./file",
+            "nested/../outside",
+        ] {
+            let manifest = manifest("1", &[(path, b"data")]);
+            assert!(
+                validate_manifest_paths(&manifest).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_rejects_unsafe_removal_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = Plan {
+            changed: Vec::new(),
+            removed: vec!["../outside".to_string()],
+        };
+
+        let error = apply(&plan, directory.path(), &store(&[])).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     /// THE invariant, in the real engine: patch a v1 install to v2 by fetching

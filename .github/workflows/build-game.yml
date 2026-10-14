@@ -143,8 +143,10 @@ jobs:
           storage_host="${STORAGE_ENDPOINT#https://}"
           git config lfs.url "https://${STORAGE_ACCESS_KEY_ID}:${STORAGE_SECRET_ACCESS_KEY}@${proxy_host}/${storage_host}/${STORAGE_BUCKET}"
           git config lfs.concurrenttransfers 4
-          git lfs pull --include="Content/**" --exclude=""
-          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content; then
+          git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**" --exclude=""
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' \
+            Content/Application \
+            Content/Packs/ClassicGalacticCivilWar; then
             echo "Media checkout still contains Git LFS pointers." >&2
             exit 1
           fi
@@ -164,9 +166,20 @@ jobs:
       - name: Verify staged content publication support
         run: grep -q 'legacy latest.json unchanged' support/content/package.sh
 
+      - name: Stage base content only
+        run: |
+          set -euo pipefail
+          mkdir -p base-assets/Content/Packs
+          cp -a assets/Content/Application base-assets/Content/Application
+          cp -a assets/Content/catalog.xml base-assets/Content/catalog.xml
+          cp -a \
+            assets/Content/Packs/ClassicGalacticCivilWar \
+            base-assets/Content/Packs/ClassicGalacticCivilWar
+          test "$(find base-assets/Content/Packs -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1
+
       - name: Package immutable content
         env:
-          MEDIA_DIR: ${{ github.workspace }}/assets
+          MEDIA_DIR: ${{ github.workspace }}/base-assets
           VERSION: ${{ needs.prepare.outputs.version }}
           OUT_DIR: ${{ runner.temp }}/content-package
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
