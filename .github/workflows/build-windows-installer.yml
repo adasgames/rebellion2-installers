@@ -106,7 +106,7 @@ jobs:
           git config lfs.concurrenttransfers 4
           max_attempts=6
           for attempt in $(seq 1 "$max_attempts"); do
-            if git lfs pull --include="Content/**" --exclude=""; then
+            if git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**" --exclude=""; then
               break
             fi
             if [ "$attempt" -eq "$max_attempts" ]; then
@@ -120,7 +120,9 @@ jobs:
             echo "Asset fetch attempt ${attempt}/${max_attempts} failed; retrying in ${delay} seconds."
             sleep "$delay"
           done
-          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' Content; then
+          if grep -RIl '^version https://git-lfs.github.com/spec/v1$' \
+            Content/Application \
+            Content/Packs/ClassicGalacticCivilWar; then
             echo "Asset checkout still contains Git LFS pointers."; exit 1
           fi
 
@@ -139,12 +141,22 @@ jobs:
       - name: Verify staged-publication support
         run: grep -q 'legacy latest.json unchanged' support/content/package.sh
 
+      - name: Stage base content only
+        run: |
+          set -euo pipefail
+          mkdir -p base-assets/Content/Packs
+          cp -a assets/Content/Application base-assets/Content/Application
+          cp -a assets/Content/catalog.xml base-assets/Content/catalog.xml
+          cp -a \
+            assets/Content/Packs/ClassicGalacticCivilWar \
+            base-assets/Content/Packs/ClassicGalacticCivilWar
+
       # Uploads dist/content-<ver>.zip (first-install), plus the incremental
       # manifest and blobs. The generated latest.json remains staged until the
       # final release job succeeds, so incomplete releases never become live.
       - name: Stage content archive + manifest + blobs
         env:
-          MEDIA_DIR: ${{ github.workspace }}/assets
+          MEDIA_DIR: ${{ github.workspace }}/base-assets
           VERSION: ${{ needs.prepare.outputs.version }}
           OUT_DIR: ${{ runner.temp }}/content-package
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -182,12 +194,16 @@ jobs:
         env:
           AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          REB2_CONTENT_PACK_BASE_URL: ${{ secrets.REB2_CONTENT_PACK_BASE_URL }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:AUTH_BASE_URL)) {
             throw "The ownership service is not configured."
           }
           if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_BASE_URL)) {
             throw "The update channel is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_PACK_BASE_URL)) {
+            throw "The content-pack channel is not configured."
           }
           $baseUrl = $env:REB2_CONTENT_BASE_URL.TrimEnd("/")
           $pointer = Invoke-RestMethod "$baseUrl/dist/latest.json"
@@ -205,6 +221,7 @@ jobs:
           # patches from. Endpoints stay in repository secrets.
           REB2_AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          REB2_CONTENT_PACK_BASE_URL: ${{ secrets.REB2_CONTENT_PACK_BASE_URL }}
         run: cargo build --release
 
       - name: Stamp game exe icon

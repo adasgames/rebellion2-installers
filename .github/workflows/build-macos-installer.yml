@@ -130,11 +130,13 @@ jobs:
           REB2_AUTH_BASE_URL: ${{ secrets.AUTH_BASE_URL }}
           REB2_CONTENT_VERSION: ${{ needs.prepare.outputs.version }}
           REB2_CONTENT_BASE_URL: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          REB2_CONTENT_PACK_BASE_URL: ${{ secrets.REB2_CONTENT_PACK_BASE_URL }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           GAME_APP: ${{ steps.player.outputs.game-app }}
         run: |
           set -euo pipefail
           test -n "$REB2_AUTH_BASE_URL"
+          test -n "$REB2_CONTENT_PACK_BASE_URL"
           test -n "$TAURI_SIGNING_PRIVATE_KEY"
           test -d "$GAME_APP"
           # GitHub secrets copied from UTF-8 files can retain a leading byte-order
