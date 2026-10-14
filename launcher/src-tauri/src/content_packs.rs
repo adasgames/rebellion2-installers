@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::parse_semantic_version;
+
 pub const CATALOG_PATH: &str = "dist/catalogue.json";
 const METADATA_DIRECTORY: &str = ".content-packs";
 const INSTALL_RECORD_FILE: &str = "install.json";
@@ -86,8 +88,13 @@ pub fn validate_release(pack: &ContentPackRelease) -> io::Result<()> {
     if !is_safe_id(&pack.id) {
         return Err(invalid_data("content-pack id must be a lowercase slug"));
     }
-    if pack.name.trim().is_empty() || pack.version.trim().is_empty() {
-        return Err(invalid_data("content-pack name and version are required"));
+    if pack.name.trim().is_empty() {
+        return Err(invalid_data("content-pack name is required"));
+    }
+    if parse_semantic_version(&pack.version).is_none() {
+        return Err(invalid_data(
+            "content-pack version must be a semantic version",
+        ));
     }
     if !is_single_path_component(&pack.directory) {
         return Err(invalid_data(
@@ -117,7 +124,7 @@ pub fn validate_release(pack: &ContentPackRelease) -> io::Result<()> {
     if pack
         .base_pack_version
         .as_deref()
-        .is_some_and(|version| !is_semantic_version(version))
+        .is_some_and(|version| parse_semantic_version(version).is_none())
     {
         return Err(invalid_data(
             "base content-pack version must be a semantic version",
@@ -130,7 +137,7 @@ pub fn validate_release(pack: &ContentPackRelease) -> io::Result<()> {
     }
     let mut compatible_versions = BTreeSet::new();
     for version in &pack.compatible_game_versions {
-        if !is_semantic_version(version) {
+        if parse_semantic_version(version).is_none() {
             return Err(invalid_data(
                 "compatible game versions must be semantic versions",
             ));
@@ -288,38 +295,6 @@ fn xml_element(xml: &str, element: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn is_semantic_version(value: &str) -> bool {
-    let core = value.split_once('+').map_or(value, |(version, metadata)| {
-        if is_version_suffix(metadata) {
-            version
-        } else {
-            ""
-        }
-    });
-    let core = core.split_once('-').map_or(core, |(version, prerelease)| {
-        if is_version_suffix(prerelease) {
-            version
-        } else {
-            ""
-        }
-    });
-    let parts = core.split('.').collect::<Vec<_>>();
-    parts.len() == 3
-        && parts.iter().all(|part| {
-            !part.is_empty() && part.bytes().all(|character| character.is_ascii_digit())
-        })
-}
-
-fn is_version_suffix(value: &str) -> bool {
-    !value.is_empty()
-        && value.split('.').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|character| character.is_ascii_alphanumeric() || character == b'-')
-        })
-}
-
 fn validate_channel_path(value: &str) -> io::Result<()> {
     let path = value.trim_end_matches('/');
     if path.is_empty()
@@ -421,10 +396,22 @@ mod tests {
 
     #[test]
     fn release_with_invalid_compatible_game_version_is_rejected() {
-        let mut pack = release();
-        pack.compatible_game_versions = vec!["next".to_string()];
+        for version in ["next", "01.0.0", "1.0.0-beta.01"] {
+            let mut pack = release();
+            pack.compatible_game_versions = vec![version.to_string()];
 
-        assert!(validate_release(&pack).is_err());
+            assert!(validate_release(&pack).is_err());
+        }
+    }
+
+    #[test]
+    fn release_with_invalid_pack_version_is_rejected() {
+        for version in ["next", "01.0.0", "1.0.0-beta.01"] {
+            let mut pack = release();
+            pack.version = version.to_string();
+
+            assert!(validate_release(&pack).is_err());
+        }
     }
 
     #[test]

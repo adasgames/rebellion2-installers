@@ -3244,22 +3244,34 @@ fn fetch_content_pack_catalog() -> Result<ContentPackCatalog, Box<dyn std::error
 fn content_pack_manager_screen(catalog: &ContentPackCatalog) -> io::Result<String> {
     let install_root = install_dir()?;
     let game_version = current_game_version();
+    Ok(content_pack_manager_screen_for(
+        catalog,
+        &install_root,
+        game_version.as_deref(),
+    ))
+}
+
+/// Renders content-pack actions against an explicit installation and game version.
+fn content_pack_manager_screen_for(
+    catalog: &ContentPackCatalog,
+    install_root: &Path,
+    game_version: Option<&str>,
+) -> String {
     let mut packs = String::from("<div class=\"pack-list\">");
     if catalog.packs.is_empty() {
         packs.push_str("<p>No optional content packs are currently available.</p>");
     }
     for pack in &catalog.packs {
-        let installed = content_packs::read_installed(&install_root, &pack.id);
-        let game_compatible = content_packs::supports_game_version(pack, game_version.as_deref());
+        let installed = content_packs::read_installed(install_root, &pack.id);
+        let game_compatible = content_packs::supports_game_version(pack, game_version);
         let installed_base_version = pack
             .base_pack_id
             .as_deref()
-            .and_then(|id| installed_content_pack_version(&install_root, id));
+            .and_then(|id| installed_content_pack_version(install_root, id));
         let base_compatible = pack
             .base_pack_version
             .as_deref()
             .is_none_or(|required| installed_base_version.as_deref() == Some(required));
-        let compatible = game_compatible && base_compatible;
         let compatibility = format!(
             "Compatible with game {}",
             pack.compatible_game_versions.join(", ")
@@ -3275,19 +3287,44 @@ fn content_pack_manager_screen(catalog: &ContentPackCatalog) -> io::Result<Strin
             pack.description.trim()
         };
         let (release_status, action_label) = match installed.as_ref() {
+            Some(installed) if !game_compatible => (
+                match game_version {
+                    Some(version) => format!(
+                        "Installed {} · Incompatible with game {version}",
+                        installed.version
+                    ),
+                    None => format!(
+                        "Installed {} · Install the game to verify compatibility",
+                        installed.version
+                    ),
+                },
+                None,
+            ),
+            Some(installed) if !base_compatible => (
+                match installed_base_version.as_deref() {
+                    Some(version) => format!(
+                        "Installed {} · Incompatible with base pack {version}",
+                        installed.version
+                    ),
+                    None => format!(
+                        "Installed {} · Required base pack is missing",
+                        installed.version
+                    ),
+                },
+                None,
+            ),
             Some(installed) if installed.version == pack.version => {
                 (format!("Installed {}", installed.version), None)
             }
-            Some(installed) if compatible => (
+            Some(installed) => (
                 format!(
                     "Installed {} · Update {} available",
                     installed.version, pack.version
                 ),
                 Some("Update"),
             ),
-            Some(installed) => (format!("Installed {}", installed.version), None),
             None if !game_compatible => (
-                match game_version.as_deref() {
+                match game_version {
                     Some(version) => {
                         format!("Requires a compatible game version · Installed {version}")
                     }
@@ -3339,13 +3376,13 @@ fn content_pack_manager_screen(catalog: &ContentPackCatalog) -> io::Result<Strin
         ));
     }
     packs.push_str("</div>");
-    Ok(render_with_content(
+    render_with_content(
         "Content packs",
         false,
         "Install, update, or remove optional game content.",
         &packs,
         &secondary_button("Back", "back-to-ready"),
-    ))
+    )
 }
 
 fn start_content_pack_install(handle: &tauri::AppHandle, id: &str) {
@@ -3482,7 +3519,13 @@ fn installed_content_pack_version(install_root: &Path, id: &str) -> Option<Strin
             id,
         );
     }
-    content_packs::read_installed(install_root, id).map(|installed| installed.version)
+    let installed = content_packs::read_installed(install_root, id)?;
+    let definition_path = install_root
+        .join("Content")
+        .join("Packs")
+        .join(&installed.directory)
+        .join("pack.xml");
+    content_packs::read_pack_version(&definition_path, id)
 }
 
 fn start_content_pack_remove(handle: &tauri::AppHandle, id: &str) {
@@ -4177,6 +4220,73 @@ mod tests {
         assert_eq!(normalized_base(Some("   ")), None);
     }
 
+    #[test]
+    fn content_pack_manager_with_incompatible_game_keeps_only_remove_action() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = content_pack_release("1.0.1");
+        let manifest = application_manifest("1.0.1", &["pack.xml"]);
+        content_packs::write_install(root.path(), &pack, &manifest).unwrap();
+        let catalog = ContentPackCatalog {
+            schema_version: 1,
+            packs: vec![pack],
+        };
+
+        let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.30"));
+
+        assert!(screen.contains("Incompatible with game 0.0.30"));
+        assert!(screen.contains("choice=content-pack-remove:sample-pack"));
+        assert!(!screen.contains("choice=content-pack-install:sample-pack"));
+    }
+
+    #[test]
+    fn content_pack_manager_with_incompatible_base_keeps_only_remove_action() {
+        let root = tempfile::tempdir().unwrap();
+        let installed_pack = content_pack_release("1.0.0");
+        let manifest = application_manifest("1.0.0", &["pack.xml"]);
+        content_packs::write_install(root.path(), &installed_pack, &manifest).unwrap();
+        write_pack_definition(
+            root.path(),
+            "ClassicGalacticCivilWar",
+            "classic-galactic-civil-war",
+            "0.9.0",
+        );
+        let catalog = ContentPackCatalog {
+            schema_version: 1,
+            packs: vec![content_pack_release("1.0.1")],
+        };
+
+        let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.31"));
+
+        assert!(screen.contains("Incompatible with base pack 0.9.0"));
+        assert!(screen.contains("choice=content-pack-remove:sample-pack"));
+        assert!(!screen.contains("choice=content-pack-install:sample-pack"));
+    }
+
+    #[test]
+    fn installed_optional_base_version_uses_actual_pack_definition() {
+        let root = tempfile::tempdir().unwrap();
+        let mut base_pack = content_pack_release("2.0.0");
+        base_pack.id = "foundation-pack".to_string();
+        base_pack.directory = "FoundationPack".to_string();
+        base_pack.base_pack_id = None;
+        base_pack.base_pack_version = None;
+        let manifest = application_manifest("2.0.0", &["pack.xml"]);
+        content_packs::write_install(root.path(), &base_pack, &manifest).unwrap();
+        write_pack_definition(root.path(), "FoundationPack", "foundation-pack", "1.0.0");
+
+        assert_eq!(
+            installed_content_pack_version(root.path(), "foundation-pack").as_deref(),
+            Some("1.0.0")
+        );
+
+        write_pack_definition(root.path(), "FoundationPack", "foundation-pack", "2.0.0");
+
+        assert_eq!(
+            installed_content_pack_version(root.path(), "foundation-pack").as_deref(),
+            Some("2.0.0")
+        );
+    }
+
     fn application_manifest(version: &str, paths: &[&str]) -> Manifest {
         Manifest {
             version: version.to_string(),
@@ -4189,6 +4299,32 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn content_pack_release(version: &str) -> ContentPackRelease {
+        ContentPackRelease {
+            id: "sample-pack".to_string(),
+            name: "Sample Pack".to_string(),
+            description: "Sample content.".to_string(),
+            version: version.to_string(),
+            directory: "SamplePack".to_string(),
+            manifest: format!("dist/content-packs/sample-pack/manifest-{version}.json"),
+            blobs: "content-pack-blobs/".to_string(),
+            download_size: 100,
+            base_pack_id: Some("classic-galactic-civil-war".to_string()),
+            base_pack_version: Some("1.0.0".to_string()),
+            compatible_game_versions: vec!["0.0.31".to_string()],
+        }
+    }
+
+    fn write_pack_definition(root: &Path, directory: &str, id: &str, version: &str) {
+        let pack_root = root.join("Content").join("Packs").join(directory);
+        fs::create_dir_all(&pack_root).unwrap();
+        fs::write(
+            pack_root.join("pack.xml"),
+            format!("<ContentPack><ID>{id}</ID><Version>{version}</Version></ContentPack>"),
+        )
+        .unwrap();
     }
 
     fn signed_launcher_layer(manifest: &str) -> SignedLauncherLayer {
