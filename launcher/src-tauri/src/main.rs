@@ -4374,7 +4374,9 @@ mod tests {
         fs::create_dir_all(&pack_root).unwrap();
         fs::write(
             pack_root.join("pack.xml"),
-            format!("<ContentPack><ID>{id}</ID><Version>{version}</Version></ContentPack>"),
+            format!(
+                "<ContentPack><ID>{id}</ID><Version>{version}</Version><Preloads><Preload><ID>main-menu</ID><Path>Preload/main-menu.xml</Path></Preload><Preload><ID>strategy</ID><Path>Preload/strategy.xml</Path></Preload></Preloads></ContentPack>"
+            ),
         )
         .unwrap();
     }

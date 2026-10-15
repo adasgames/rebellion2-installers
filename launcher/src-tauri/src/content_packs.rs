@@ -58,6 +58,15 @@ pub struct InstalledContentPack {
     pub directory: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename = "ContentPack")]
+struct ContentPackIdentity {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "Version")]
+    version: String,
+}
+
 fn default_blobs() -> String {
     "content-pack-blobs/".to_string()
 }
@@ -360,10 +369,12 @@ pub fn read_manifest(install_root: &Path, id: &str) -> Option<Manifest> {
 /// Reads a pack definition's version after verifying its declared identity.
 pub fn read_pack_version(definition_path: &Path, expected_id: &str) -> Option<String> {
     let xml = fs::read_to_string(definition_path).ok()?;
-    if xml_element(&xml, "ID")? != expected_id {
+    let identity: ContentPackIdentity = quick_xml::de::from_str(&xml).ok()?;
+    if identity.id.trim() != expected_id {
         return None;
     }
-    xml_element(&xml, "Version")
+    let version = identity.version.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 pub fn write_install(
@@ -472,18 +483,6 @@ fn is_single_path_component(value: &str) -> bool {
         && !value.contains('/')
         && !value.contains('\\')
         && !value.contains(':')
-}
-
-fn xml_element(xml: &str, element: &str) -> Option<String> {
-    let open = format!("<{element}>");
-    let close = format!("</{element}>");
-    let (_, remainder) = xml.split_once(&open)?;
-    let (value, trailing) = remainder.split_once(&close)?;
-    if trailing.contains(&open) || value.contains('<') {
-        return None;
-    }
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn validate_channel_path(value: &str) -> io::Result<()> {
@@ -838,7 +837,21 @@ mod tests {
         let definition = root.path().join("pack.xml");
         fs::write(
             &definition,
-            "<ContentPack><ID>base-pack</ID><Version>1.0.0</Version></ContentPack>",
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<ContentPack>
+  <ID>base-pack</ID>
+  <Version>1.0.0</Version>
+  <Preloads>
+    <Preload>
+      <ID>main-menu</ID>
+      <Path>Preload/main-menu.xml</Path>
+    </Preload>
+    <Preload>
+      <ID>strategy</ID>
+      <Path>Preload/strategy.xml</Path>
+    </Preload>
+  </Preloads>
+</ContentPack>"#,
         )
         .unwrap();
 
@@ -847,5 +860,18 @@ mod tests {
             Some("1.0.0")
         );
         assert_eq!(read_pack_version(&definition, "other-pack"), None);
+    }
+
+    #[test]
+    fn read_pack_version_rejects_nested_identity_without_root_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let definition = root.path().join("pack.xml");
+        fs::write(
+            &definition,
+            "<ContentPack><Preloads><Preload><ID>base-pack</ID><Version>1.0.0</Version></Preload></Preloads></ContentPack>",
+        )
+        .unwrap();
+
+        assert_eq!(read_pack_version(&definition, "base-pack"), None);
     }
 }
