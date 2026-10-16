@@ -313,6 +313,11 @@ fn default_blobs() -> String {
 }
 
 fn main() {
+    log_line(&format!(
+        "[launcher] Session started (version {}, process {}).",
+        LAUNCHER_VERSION.unwrap_or(env!("CARGO_PKG_VERSION")),
+        std::process::id()
+    ));
     #[cfg(debug_assertions)]
     PREVIEW_UPDATE_FLOW.store(
         std::env::args().any(|argument| argument == "--preview-update-flow"),
@@ -2666,19 +2671,31 @@ struct HttpBlobs {
 }
 impl BlobSource for HttpBlobs {
     fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
-        let mut request = ureq::get(&format!("{}{sha256}", self.base));
+        let url = format!("{}{sha256}", self.base);
+        let mut request = ureq::get(&url);
         if let Some(token) = &self.token {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
         let response = match request.call() {
             Ok(response) => response,
-            Err(ureq::Error::Status(401 | 403, _)) => {
+            Err(ureq::Error::Status(status @ (401 | 403), _)) => {
+                log_line(&download_failure_log_message(
+                    &url,
+                    &format!("HTTP {status}"),
+                ));
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     AuthorizationRequired,
-                ))
+                ));
             }
-            Err(other) => return Err(io::Error::other(other.to_string())),
+            Err(other) => {
+                let reason = match &other {
+                    ureq::Error::Status(status, _) => format!("HTTP {status}"),
+                    _ => "connection failed".to_string(),
+                };
+                log_line(&download_failure_log_message(&url, &reason));
+                return Err(io::Error::other(other.to_string()));
+            }
         };
         // Stream in chunks so the progress bar fills smoothly through a large
         // file, updating only when the whole-percent changes (≈90 evals total).
@@ -2968,12 +2985,21 @@ fn fetch_channel_bytes(
     if let Some(token) = token {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
-    let response = request.call().map_err(|err| match err {
-        ureq::Error::Status(404, _) => Box::new(ContentUnavailable) as Box<dyn std::error::Error>,
-        ureq::Error::Status(401 | 403, _) => {
-            Box::new(AuthorizationRequired) as Box<dyn std::error::Error>
+    let response = request.call().map_err(|err| {
+        let reason = match &err {
+            ureq::Error::Status(status, _) => format!("HTTP {status}"),
+            _ => "connection failed".to_string(),
+        };
+        log_line(&download_failure_log_message(url, &reason));
+        match err {
+            ureq::Error::Status(404, _) => {
+                Box::new(ContentUnavailable) as Box<dyn std::error::Error>
+            }
+            ureq::Error::Status(401 | 403, _) => {
+                Box::new(AuthorizationRequired) as Box<dyn std::error::Error>
+            }
+            other => Box::new(other),
         }
-        other => Box::new(other),
     })?;
     let mut body = Vec::new();
     response.into_reader().read_to_end(&mut body)?;
@@ -3236,7 +3262,8 @@ fn show_content_pack_manager(handle: &tauri::AppHandle) {
 fn fetch_content_pack_catalog() -> Result<ContentPackCatalog, Box<dyn std::error::Error>> {
     let base = content_pack_base().ok_or("content-pack channel is not configured")?;
     let catalog: ContentPackCatalog =
-        fetch_json(&format!("{base}{}", content_packs::CATALOG_PATH), None)?;
+        fetch_json(&format!("{base}{}", content_packs::CATALOG_PATH), None)
+            .map_err(|error| content_pack_download_error("content-pack list", error))?;
     content_packs::validate_catalog(&catalog)?;
     Ok(catalog)
 }
@@ -3453,7 +3480,8 @@ fn install_content_pack(
         .into());
     }
     let base = content_pack_base().ok_or("content-pack channel is not configured")?;
-    let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), None)?;
+    let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), None)
+        .map_err(|error| content_pack_download_error("content-pack manifest", error))?;
     content_packs::validate_pack_manifest(&remote, pack)?;
     let install_root = install_dir()?;
     for (dependency_id, requirement) in pack
@@ -3644,12 +3672,50 @@ fn show_content_pack_error(
     title: &str,
     error: &(dyn std::error::Error + 'static),
 ) {
-    show_message(
+    write_screen(
         handle,
-        title,
-        &format!("{} See launcher.log for details.", error),
-        Some(("Back", "content-packs")),
+        &content_pack_error_screen(title, &error.to_string()),
     );
+}
+
+fn content_pack_error_screen(title: &str, error: &str) -> String {
+    let buttons = format!(
+        "{}{}",
+        button("Retry", "content-packs"),
+        secondary_button("Back", "back-to-ready")
+    );
+    render(
+        title,
+        false,
+        &format!("{error} See launcher.log for details."),
+        &buttons,
+    )
+}
+
+fn content_pack_download_error(
+    resource: &str,
+    error: Box<dyn std::error::Error>,
+) -> Box<dyn std::error::Error> {
+    if error.downcast_ref::<ContentUnavailable>().is_some() {
+        format!("The {resource} could not be found on the server (HTTP 404). Try again later.")
+            .into()
+    } else {
+        format!("Could not download the {resource}: {error}").into()
+    }
+}
+
+fn download_failure_log_message(url: &str, reason: &str) -> String {
+    let resource = tauri::Url::parse(url)
+        .ok()
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|| "invalid download URL".to_string());
+    format!("[launcher] Download failed: {resource} ({reason}).")
 }
 
 /// Builds the ready screen after staging a launcher update and checking the game.
@@ -4046,16 +4112,24 @@ fn game_path() -> io::Result<PathBuf> {
 }
 
 fn log_line(message: &str) {
-    println!("{message}");
+    let entry = format_log_entry(message, chrono::Utc::now());
+    println!("{entry}");
     if let Ok(base) = install_dir() {
         if let Ok(mut file) = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(base.join("launcher.log"))
         {
-            let _ = writeln!(file, "{message}");
+            let _ = writeln!(file, "{entry}");
         }
     }
+}
+
+fn format_log_entry(message: &str, timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "{} {message}",
+        timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    )
 }
 
 fn install_content(
@@ -4222,6 +4296,64 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_pack_error_screen_separates_back_from_retry() {
+        let screen = content_pack_error_screen("Installation failed", "Missing manifest");
+
+        assert!(screen.contains("choice=back-to-ready\">Back</a>"));
+        assert!(screen.contains("choice=content-packs\">Retry</a>"));
+        assert!(!screen.contains("choice=content-packs\">Back</a>"));
+        assert!(screen.contains("Missing manifest"));
+    }
+
+    #[test]
+    fn content_pack_download_error_identifies_missing_resource() {
+        for resource in ["content-pack list", "content-pack manifest"] {
+            let error = content_pack_download_error(resource, Box::new(ContentUnavailable));
+
+            assert!(error.to_string().contains(resource));
+            assert!(error.to_string().contains("HTTP 404"));
+            assert!(!error.to_string().contains("launcher version"));
+        }
+    }
+
+    #[test]
+    fn content_pack_download_error_preserves_other_failure_details() {
+        let error = content_pack_download_error(
+            "content-pack list",
+            Box::new(io::Error::new(io::ErrorKind::TimedOut, "request timed out")),
+        );
+
+        assert!(error.to_string().contains("content-pack list"));
+        assert!(error.to_string().contains("request timed out"));
+        assert!(!error.to_string().contains("HTTP 404"));
+    }
+
+    #[test]
+    fn download_failure_log_records_resource_without_credentials_or_query() {
+        let message = download_failure_log_message(
+            "https://user:secret@packs.example.test/dist/catalogue.json?token=private#secret",
+            "HTTP 404",
+        );
+
+        assert!(message.contains("https://packs.example.test/dist/catalogue.json"));
+        assert!(message.contains("HTTP 404"));
+        for secret in ["user:", "secret", "token=", "private"] {
+            assert!(!message.contains(secret));
+        }
+    }
+
+    #[test]
+    fn log_entry_includes_utc_timestamp_and_message() {
+        let timestamp = chrono::DateTime::from_timestamp(1_792_152_000, 123_000_000).unwrap();
+        let entry = format_log_entry("[launcher] Session started.", timestamp);
+
+        assert_eq!(
+            entry,
+            "2026-10-16T12:00:00.123Z [launcher] Session started."
+        );
+    }
 
     #[test]
     fn normalized_base_trims_and_appends_separator() {
