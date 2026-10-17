@@ -5177,6 +5177,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_release_notes_with_versioned_document_preserves_current_and_historical_sections() {
+        let bytes = br#"{
+            "version":"1.2.3",
+            "sections":[{"title":"Fixes","items":["Fixed current issue."]}],
+            "releases":[
+                {"version":"1.2.2","sections":[{"title":"Changes","items":["Improved previous behavior."]}]},
+                {"version":"1.2.3","sections":[{"title":"Fixes","items":["Fixed current issue."]}]}
+            ]
+        }"#;
+
+        let notes = parse_release_notes(bytes, "1.2.3", &sha256_hex(bytes))
+            .expect("versioned release notes should remain readable");
+
+        assert_eq!(notes.sections[0].items, vec!["Fixed current issue."]);
+        assert_eq!(notes.releases.len(), 2);
+        assert_eq!(notes.releases[0].version, "1.2.2");
+        assert_eq!(
+            notes.releases[0].sections[0].items,
+            vec!["Improved previous behavior."]
+        );
+        assert_eq!(notes.releases[1].version, notes.version);
+        assert_eq!(notes.releases[1].sections[0].items, notes.sections[0].items);
+    }
+
+    #[test]
     fn aggregate_release_notes_with_lagging_install_merges_intermediate_releases() {
         let notes = cumulative_release_notes();
 
