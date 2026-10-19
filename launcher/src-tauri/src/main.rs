@@ -3131,11 +3131,16 @@ fn steam_signin_url(base: &str, version: Option<&str>) -> String {
 }
 
 /// Maps explicit Steam visibility outcomes to wording that does not infer private settings.
-fn steam_verification_status(reason: Option<&str>) -> Option<&'static str> {
+fn steam_verification_status(
+    reason: Option<&str>,
+    profile_visibility: Option<&str>,
+) -> Option<&'static str> {
     match reason {
-        Some("steam_library_unavailable") => {
-            Some("Your Steam game list is not visible to the launcher.")
-        }
+        Some("steam_library_unavailable") => Some(match profile_visibility {
+            Some("public") => "Your Steam profile is public, but your game list is hidden.",
+            Some("not_public") => "Your Steam profile is not public, and your game list is hidden.",
+            _ => "Your Steam game list is hidden. Profile visibility could not be checked.",
+        }),
         Some("steam_game_not_found") => {
             Some("Neither eligible game appeared in the list Steam shared.")
         }
@@ -3149,8 +3154,8 @@ fn verification_failure_screen(
     reason: Option<&str>,
     profile_visibility: Option<&str>,
 ) -> String {
-    if let Some(status) = steam_verification_status(reason) {
-        return steam_verification_help_screen(status, reason, profile_visibility);
+    if let Some(status) = steam_verification_status(reason, profile_visibility) {
+        return steam_verification_help_screen(status);
     }
     let status = message
         .filter(|message| !message.trim().is_empty())
@@ -3164,51 +3169,26 @@ fn verification_failure_screen(
 }
 
 /// Presents Steam privacy instructions while keeping the pending installation or update intact.
-fn steam_verification_help_screen(
-    status: &str,
-    reason: Option<&str>,
-    profile_visibility: Option<&str>,
-) -> String {
-    let (profile, profile_state) = match profile_visibility {
-        Some("public") => ("Public", "visible"),
-        Some("not_public") => ("Not public", "hidden"),
-        _ => ("Unavailable", "unknown"),
-    };
-    let (game_list, game_list_state) = match reason {
-        Some("steam_library_unavailable") => ("Not visible", "hidden"),
-        Some("steam_game_not_found") => ("Visible", "visible"),
-        _ => ("Unavailable", "unknown"),
-    };
-    let (guidance_title, guidance) = if reason == Some("steam_game_not_found") {
-        (
-            "Check your Steam account",
-            "Sign in with the account that owns the game. If the game is marked private, make it public for verification.",
-        )
-    } else {
-        (
-            "Update your privacy settings",
-            "Set <b>My profile</b> and <b>Game details</b> to <b>Public</b> in Steam.",
-        )
-    };
+fn steam_verification_help_screen(status: &str) -> String {
+    let content = r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
+        <ol style="padding-left:20px">
+          <li>Open <b>Steam privacy settings</b> using the button below.</li>
+          <li>Set <b>My profile</b> and <b>Game details</b> to <b>Public</b>.</li>
+          <li>Use the account that owns the game. If the game itself is marked private, make it public for verification.</li>
+          <li>Return here and choose <b>Retry</b>.</li>
+        </ol>
+        </section>"#;
     let buttons = button("Open Steam privacy settings", "steam-privacy")
-        + "<div class=\"recovery-navigation\">"
         + &secondary_button("Retry", "steam-retry")
-        + &secondary_button("Back", "signin")
-        + "</div>";
-    include_str!("../../ui/steam-verification.html")
-        .replace("{{shared_styles}}", include_str!("../../ui/launcher.css"))
-        .replace(
-            "{{screen_styles}}",
-            include_str!("../../ui/steam-verification.css"),
-        )
-        .replace("{{profile}}", profile)
-        .replace("{{profile_state}}", profile_state)
-        .replace("{{game_list}}", game_list)
-        .replace("{{game_list_state}}", game_list_state)
-        .replace("{{guidance_title}}", guidance_title)
-        .replace("{{guidance}}", guidance)
-        .replace("{{buttons}}", &buttons)
-        .replace("{{status}}", &html_escape(status))
+        + &secondary_button("Back", "signin");
+    render_card(
+        "Steam verification",
+        false,
+        status,
+        "sub failure-error",
+        content,
+        &buttons,
+    )
 }
 
 /// Returns the game version whose protected content this installation requires.
@@ -3281,8 +3261,7 @@ fn render_card(
         "card has-content"
     };
     format!(
-        r##"<!doctype html><html><head><meta charset="utf-8"><style>{styles}</style></head><body><main class="{card_class}"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="{status_class}" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div>{content}<div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
-        styles = include_str!("../../ui/launcher.css"),
+        r##"<!doctype html><html><head><meta charset="utf-8"><style>*{{box-sizing:border-box}}html,body{{height:100%;margin:0}}body{{font-family:"Segoe UI",system-ui,sans-serif;color:#e8ecf6;background:radial-gradient(1200px 800px at 70% -10%,#1a2547 0%,transparent 55%),radial-gradient(900px 700px at 10% 110%,#241238 0%,transparent 50%),linear-gradient(180deg,#0b1226,#05070f);display:flex;overflow:hidden;user-select:none}}body::before{{content:"";position:fixed;inset:0;background-image:radial-gradient(1.5px 1.5px at 20% 30%,#fff 50%,transparent),radial-gradient(1px 1px at 80% 20%,#cdd 50%,transparent),radial-gradient(1.5px 1.5px at 60% 70%,#fff 50%,transparent),radial-gradient(1px 1px at 35% 80%,#bcd 50%,transparent),radial-gradient(1px 1px at 90% 60%,#fff 50%,transparent),radial-gradient(1.5px 1.5px at 12% 65%,#eef 50%,transparent);opacity:.5;pointer-events:none}}.card{{position:relative;width:100%;height:100%;overflow:hidden;padding:40px 34px 30px;display:flex;flex-direction:column;text-align:center}}.kicker{{letter-spacing:.42em;font-size:11px;color:#ffcf4d;text-transform:uppercase;margin:0 0 12px;opacity:.9}}h1{{margin:0;font-size:clamp(24px,8vw,40px);font-weight:800;letter-spacing:.1em;line-height:1.05}}h1 .two{{color:#ffcf4d}}.sub{{margin:16px auto 18px;max-width:34ch;color:#8a93ad;font-size:14.5px;line-height:1.6;min-height:20px}}.has-content .sub{{margin-bottom:0}}.failure-error{{margin:10px auto 0;max-width:34ch;color:#ff6b73;font-size:14.5px;font-weight:700;line-height:1.6}}.spin{{width:28px;height:28px;border:2.5px solid rgba(255,255,255,.14);border-top-color:#ffcf4d;border-radius:50%;animation:sp .8s linear infinite;margin:4px auto}}@keyframes sp{{to{{transform:rotate(360deg)}}}}.bar{{width:100%;height:7px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;display:none;margin-top:4px}}.f{{height:100%;width:0%;background:linear-gradient(90deg,#ffcf4d,#ffb43d);transition:width .3s}}.p{{font-size:11.5px;color:#8a93ad;min-height:0;margin-top:8px}}.has-content .p:empty{{margin:0}}.release-changes{{min-height:0;overflow-y:auto;padding-right:8px;text-align:left;scrollbar-color:#59637b rgba(255,255,255,.06);scrollbar-width:thin}}.release-changes::-webkit-scrollbar{{width:7px}}.release-changes::-webkit-scrollbar-track{{background:rgba(255,255,255,.06);border-radius:4px}}.release-changes::-webkit-scrollbar-thumb{{background:#59637b;border-radius:4px}}.patch-title{{margin:0 0 9px;color:#e8ecf6;font-size:13px}}.save-warning{{margin:0 0 16px;color:#ff3434;font-size:12px;font-weight:900;line-height:1.25;text-align:center;text-transform:uppercase;letter-spacing:.025em}}.changes+.changes{{margin-top:9px}}.changes h2{{margin:0 0 3px;color:#b9c2da;font-size:9px;text-transform:uppercase}}.changes ul{{margin:0;padding-left:18px;color:#cbd2e3;font-size:11px;line-height:1.45}}.changes li+li{{margin-top:5px}}.pack-list{{min-height:0;overflow-y:auto;margin:14px 0 4px;padding-right:7px;text-align:left}}.pack{{padding:13px;margin-bottom:10px;border:1px solid rgba(255,255,255,.13);border-radius:10px;background:rgba(255,255,255,.045)}}.pack h2{{margin:0 0 5px;font-size:14px;color:#e8ecf6}}.pack p{{margin:0 0 7px;font-size:11px;line-height:1.4;color:#9ca6bd}}.pack .meta{{color:#ffcf4d}}.pack-actions{{display:flex;gap:8px}}.pack-actions .b{{padding:8px 10px;margin:2px 0 0;font-size:11px}}.btns{{flex:none;margin-top:auto}}.b{{display:flex;align-items:center;justify-content:center;width:100%;padding:14px 18px;margin:11px 0 0;border-radius:11px;font-size:15px;font-weight:700;text-decoration:none;transition:transform .08s ease,filter .15s ease}}.b.primary{{background:#ffcf4d;color:#0a0e1a;box-shadow:0 8px 22px rgba(255,207,77,.22)}}.b.primary:hover{{filter:brightness(1.06);transform:translateY(-1px)}}.b.secondary{{background:rgba(255,255,255,.06);color:#c9d1e6;border:1px solid rgba(255,255,255,.14)}}.b.secondary:hover{{filter:brightness(1.18);transform:translateY(-1px)}}.b.disabled{{background:rgba(255,255,255,.06);color:#5b6479;cursor:default}}</style></head><body><main class="{card_class}"><p class="kicker">{kicker}</p><h1>REBELLION <span class="two">II</span></h1><p class="{status_class}" id="s">{status}</p>{spin}<div class="bar" id="bar"><div class="f" id="f"></div></div><div class="p" id="p"></div>{content}<div class="btns">{buttons}</div></main><script>window.rebSetProgress=function(p,l){{var b=document.getElementById("bar");if(b)b.style.display="block";var f=document.getElementById("f");if(f)f.style.width=p+"%";var pe=document.getElementById("p");if(pe)pe.textContent=p>0?p+"%":"";if(l){{var s=document.getElementById("s");if(s)s.textContent=l;}}}};window.rebSetStatus=function(l){{var s=document.getElementById("s");if(s)s.textContent=l;}};</script></body></html>"##,
         kicker = kicker,
         status = status,
         spin = spin,
@@ -3311,12 +3290,11 @@ fn disabled_button(label: &str) -> String {
     format!("<span class=\"b disabled\">{}</span>", label)
 }
 
-/// Replaces the webview document, preserving template whitespace and script characters.
 fn write_screen(handle: &tauri::AppHandle, html: &str) {
-    let encoded = serde_json::to_string(html).unwrap();
+    let esc = js_escape(html);
     window_eval(
         handle,
-        &format!("document.open();document.write({encoded});document.close();"),
+        &format!("document.open();document.write('{esc}');document.close();"),
     );
 }
 
@@ -4451,13 +4429,11 @@ mod tests {
     fn unreadable_steam_library_offers_privacy_settings_and_fresh_verification() {
         let screen =
             verification_failure_screen(None, Some("steam_library_unavailable"), Some("public"));
-        assert!(screen.contains("Your Steam game list is not visible to the launcher."));
+        assert!(screen.contains("Your Steam profile is public, but your game list is hidden."));
         assert!(screen.contains("choice=steam-privacy"));
         assert!(screen.contains("choice=steam-retry"));
         assert!(screen.contains("My profile</b> and <b>Game details"));
         assert!(screen.contains(r#"choice=steam-retry">Retry</a>"#));
-        assert!(screen.contains("<dt>Profile</dt><dd class=\"visible\">Public</dd>"));
-        assert!(screen.contains("<dt>Game list</dt><dd class=\"hidden\">Not visible</dd>"));
         assert!(!screen.contains("your games are private"));
     }
 
@@ -4467,8 +4443,7 @@ mod tests {
             verification_failure_screen(None, Some("steam_game_not_found"), Some("public"));
         assert!(screen.contains("Neither eligible game appeared"));
         assert!(screen.contains("account that owns the game"));
-        assert!(screen.contains("<dt>Game list</dt><dd class=\"visible\">Visible</dd>"));
-        assert!(!screen.contains("Your Steam game list is not visible to the launcher."));
+        assert!(!screen.contains("Your Steam profile is public, but your game list is hidden."));
     }
 
     #[test]
@@ -4493,15 +4468,15 @@ mod tests {
             Some("steam_library_unavailable"),
             Some("not_public"),
         );
-        assert!(screen.contains("<dt>Profile</dt><dd class=\"hidden\">Not public</dd>"));
-        assert!(screen.contains("<dt>Game list</dt><dd class=\"hidden\">Not visible</dd>"));
+        assert!(screen.contains("Your Steam profile is not public, and your game list is hidden."));
     }
 
     #[test]
     fn unavailable_profile_visibility_does_not_guess_the_profile_setting() {
         let screen = verification_failure_screen(None, Some("steam_library_unavailable"), None);
-        assert!(screen.contains("<dt>Profile</dt><dd class=\"unknown\">Unavailable</dd>"));
-        assert!(screen.contains("<dt>Game list</dt><dd class=\"hidden\">Not visible</dd>"));
+        assert!(screen
+            .contains("Your Steam game list is hidden. Profile visibility could not be checked."));
+        assert!(!screen.contains("Your Steam profile is not public"));
     }
 
     #[test]
@@ -5476,19 +5451,16 @@ mod tests {
 
     #[test]
     fn render_with_full_window_layout_omits_inner_frame() {
-        let screen: String = render("Status", false, "Ready.", "")
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
+        let screen = render("Status", false, "Ready.", "");
         let initial_screen = include_str!("../../ui/index.html");
 
         assert!(screen.contains(".card{position:relative;width:100%;height:100%"));
         assert!(!screen.contains("width:min(94vw,440px)"));
         assert!(!screen.contains("background:rgba(16,22,43,.72)"));
-        assert!(!screen.contains("border:1pxsolidrgba(120,160,255,.18)"));
+        assert!(!screen.contains("border:1px solid rgba(120,160,255,.18)"));
         assert!(!screen.contains("border-radius:18px"));
         assert!(!screen.contains("backdrop-filter:blur(14px)"));
-        assert!(!screen.contains("box-shadow:030px80px"));
+        assert!(!screen.contains("box-shadow:0 30px 80px"));
         assert!(initial_screen.contains("width: 100%; height: 100%"));
         assert!(!initial_screen.contains("width: min(94vw, 440px)"));
         assert!(!initial_screen.contains("background: rgba(16, 22, 43, 0.72)"));
