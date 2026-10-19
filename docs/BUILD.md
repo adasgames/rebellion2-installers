@@ -158,8 +158,8 @@ An unreadable list does not expose the account's exact privacy setting.
 
 The recovery screen returns to bundled launcher content before displaying its actions.
 **Open Steam privacy settings** opens `https://steamcommunity.com/my/edit/settings` in the
-system browser. If opening fails, the screen retains the address and retry controls. The player
-must sign in to the owning account in that browser. **Try Steam again** starts a fresh Steam
+system browser. If opening fails, the screen explains how to reach privacy settings in Steam.
+The player must sign in to the owning account in that browser. **Retry** starts a fresh Steam
 sign-in while retaining the requested content version and pending download or update.
 
 The companion ownership-service change must be deployed for these reason-specific screens to

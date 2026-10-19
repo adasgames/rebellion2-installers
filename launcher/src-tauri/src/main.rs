@@ -753,7 +753,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             thread::spawn(move || {
                 if open::that(STEAM_PRIVACY_URL).is_err() {
                     write_screen(&handle, &steam_verification_help_screen(
-                        "Could not open your browser. Open the address below to check your settings.",
+                        "Could not open your browser. In Steam, go to Edit Profile > Privacy Settings.",
                     ));
                 }
             });
@@ -3147,28 +3147,24 @@ fn verification_failure_screen(message: Option<&str>, reason: Option<&str>) -> S
 
 /// Presents Steam privacy instructions while keeping the pending installation or update intact.
 fn steam_verification_help_screen(status: &str) -> String {
-    let content = format!(
-        r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
+    let content = r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
         <p>A public profile alone does not make your game list public.</p>
         <ol style="padding-left:20px">
           <li>Open Steam &gt; <b>Edit Profile &gt; Privacy Settings</b>.</li>
           <li>Set <b>My profile</b> and <b>Game details</b> to <b>Public</b>.</li>
           <li>Check that you are signing in with the account that owns the game. If the game is marked private, make it public for verification too.</li>
-          <li>Return here and choose <b>Try Steam again</b>.</li>
+          <li>Return here and choose <b>Retry</b>.</li>
         </ol>
-        <p style="overflow-wrap:anywhere">{STEAM_PRIVACY_URL}</p>
-        <p>You can restore your privacy settings after verification succeeds.</p>
-        </section>"#,
-    );
+        </section>"#;
     let buttons = button("Open Steam privacy settings", "steam-privacy")
-        + &secondary_button("Try Steam again", "steam-retry")
+        + &secondary_button("Retry", "steam-retry")
         + &secondary_button("Use another sign-in", "signin");
     render_card(
         "Steam verification",
         false,
         status,
         "sub failure-error steam-error",
-        &content,
+        content,
         &buttons,
     )
 }
@@ -4414,7 +4410,7 @@ mod tests {
         assert!(screen.contains("choice=steam-privacy"));
         assert!(screen.contains("choice=steam-retry"));
         assert!(screen.contains("My profile</b> and <b>Game details"));
-        assert!(screen.contains(STEAM_PRIVACY_URL));
+        assert!(screen.contains(r#"choice=steam-retry">Retry</a>"#));
         assert!(!screen.contains("your games are private"));
     }
 
