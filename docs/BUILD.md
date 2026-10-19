@@ -154,7 +154,10 @@ update with separate game notes, and finishes on the ready-to-play screen.
 Steam visibility failures use the ownership service's `reason` query parameter on `/done`:
 `steam_library_unavailable` opens privacy recovery, and `steam_game_not_found` explains that
 neither eligible game appeared in the shared list. Other failures retain the service's message.
-An unreadable list does not expose the account's exact privacy setting.
+The service also checks profile visibility after these failures and returns it separately as
+`profile_visibility=public`, `not_public`, or `unknown`. The screen displays profile visibility and
+game-list visibility independently. A failed profile lookup is shown as unavailable, and an
+unreadable game list does not expose its exact Private or Friends Only setting.
 
 The recovery screen returns to bundled launcher content before displaying its actions.
 **Open Steam privacy settings** opens `https://steamcommunity.com/my/edit/settings` in the

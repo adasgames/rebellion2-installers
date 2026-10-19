@@ -440,7 +440,16 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
         let presigned = query(url, "url");
         let token = query(url, "token");
         let reason = query(url, "reason");
-        on_gate_result(handle, ok, message, presigned, token, reason);
+        let profile_visibility = query(url, "profile_visibility");
+        on_gate_result(
+            handle,
+            ok,
+            message,
+            presigned,
+            token,
+            reason,
+            profile_visibility,
+        );
         return false;
     }
 
@@ -503,10 +512,15 @@ fn on_gate_result(
     presigned: Option<String>,
     token: Option<String>,
     reason: Option<String>,
+    profile_visibility: Option<String>,
 ) {
     if !ok {
         log_line("[launcher] Ownership verification was not completed.");
-        let screen = verification_failure_screen(message.as_deref(), reason.as_deref());
+        let screen = verification_failure_screen(
+            message.as_deref(),
+            reason.as_deref(),
+            profile_visibility.as_deref(),
+        );
         *GATE_FAILURE_PENDING.lock().unwrap() = Some(screen);
         let handle = handle.clone();
         thread::spawn(move || {
@@ -752,9 +766,9 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             let handle = handle.clone();
             thread::spawn(move || {
                 if open::that(STEAM_PRIVACY_URL).is_err() {
-                    write_screen(&handle, &steam_verification_help_screen(
+                    update_status(&handle,
                         "Could not open your browser. In Steam, go to Edit Profile > Privacy Settings.",
-                    ));
+                    );
                 }
             });
         }
@@ -3130,9 +3144,13 @@ fn steam_verification_status(reason: Option<&str>) -> Option<&'static str> {
 }
 
 /// Builds a provider-specific recovery screen from the ownership service's explicit outcome.
-fn verification_failure_screen(message: Option<&str>, reason: Option<&str>) -> String {
+fn verification_failure_screen(
+    message: Option<&str>,
+    reason: Option<&str>,
+    profile_visibility: Option<&str>,
+) -> String {
     if let Some(status) = steam_verification_status(reason) {
-        return steam_verification_help_screen(status);
+        return steam_verification_help_screen(status, reason, profile_visibility);
     }
     let status = message
         .filter(|message| !message.trim().is_empty())
@@ -3146,16 +3164,32 @@ fn verification_failure_screen(message: Option<&str>, reason: Option<&str>) -> S
 }
 
 /// Presents Steam privacy instructions while keeping the pending installation or update intact.
-fn steam_verification_help_screen(status: &str) -> String {
-    let content = r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
-        <p>A public profile alone does not make your game list public.</p>
+fn steam_verification_help_screen(
+    status: &str,
+    reason: Option<&str>,
+    profile_visibility: Option<&str>,
+) -> String {
+    let profile = match profile_visibility {
+        Some("public") => "Public",
+        Some("not_public") => "Not public",
+        _ => "Unavailable",
+    };
+    let game_list = match reason {
+        Some("steam_library_unavailable") => "Not visible",
+        Some("steam_game_not_found") => "Visible",
+        _ => "Unavailable",
+    };
+    let content = format!(
+        r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
+        <p>Profile: <b>{profile}</b><br>Game list: <b>{game_list}</b></p>
         <ol style="padding-left:20px">
           <li>Open Steam &gt; <b>Edit Profile &gt; Privacy Settings</b>.</li>
           <li>Set <b>My profile</b> and <b>Game details</b> to <b>Public</b>.</li>
           <li>Check that you are signing in with the account that owns the game. If the game is marked private, make it public for verification too.</li>
           <li>Return here and choose <b>Retry</b>.</li>
         </ol>
-        </section>"#;
+        </section>"#
+    );
     let buttons = button("Open Steam privacy settings", "steam-privacy")
         + &secondary_button("Retry", "steam-retry")
         + &secondary_button("Back", "signin");
@@ -3164,7 +3198,7 @@ fn steam_verification_help_screen(status: &str) -> String {
         false,
         status,
         "sub failure-error",
-        content,
+        &content,
         &buttons,
     )
 }
@@ -4405,26 +4439,31 @@ mod tests {
 
     #[test]
     fn unreadable_steam_library_offers_privacy_settings_and_fresh_verification() {
-        let screen = verification_failure_screen(None, Some("steam_library_unavailable"));
+        let screen =
+            verification_failure_screen(None, Some("steam_library_unavailable"), Some("public"));
         assert!(screen.contains("Your Steam game list is not visible to the launcher."));
         assert!(screen.contains("choice=steam-privacy"));
         assert!(screen.contains("choice=steam-retry"));
         assert!(screen.contains("My profile</b> and <b>Game details"));
         assert!(screen.contains(r#"choice=steam-retry">Retry</a>"#));
+        assert!(screen.contains("Profile: <b>Public</b>"));
+        assert!(screen.contains("Game list: <b>Not visible</b>"));
         assert!(!screen.contains("your games are private"));
     }
 
     #[test]
     fn visible_library_without_eligible_game_keeps_a_distinct_explanation() {
-        let screen = verification_failure_screen(None, Some("steam_game_not_found"));
+        let screen =
+            verification_failure_screen(None, Some("steam_game_not_found"), Some("public"));
         assert!(screen.contains("Neither eligible game appeared"));
         assert!(screen.contains("account that owns the game"));
+        assert!(screen.contains("Game list: <b>Visible</b>"));
         assert!(!screen.contains("Your Steam game list is not visible to the launcher."));
     }
 
     #[test]
     fn other_verification_failures_keep_the_service_message_without_steam_privacy_actions() {
-        let screen = verification_failure_screen(Some("Service unavailable <retry>"), None);
+        let screen = verification_failure_screen(Some("Service unavailable <retry>"), None, None);
         assert!(screen.contains("Service unavailable &lt;retry&gt;"));
         assert!(screen.contains("choice=signin"));
         assert!(!screen.contains("choice=steam-privacy"));
@@ -4432,9 +4471,27 @@ mod tests {
 
     #[test]
     fn unknown_verification_reason_does_not_infer_a_privacy_failure() {
-        let screen = verification_failure_screen(None, Some("unknown"));
+        let screen = verification_failure_screen(None, Some("unknown"), None);
         assert!(screen.contains("Ownership could not be verified."));
         assert!(!screen.contains("choice=steam-privacy"));
+    }
+
+    #[test]
+    fn non_public_profile_is_reported_separately_from_unavailable_game_list() {
+        let screen = verification_failure_screen(
+            None,
+            Some("steam_library_unavailable"),
+            Some("not_public"),
+        );
+        assert!(screen.contains("Profile: <b>Not public</b>"));
+        assert!(screen.contains("Game list: <b>Not visible</b>"));
+    }
+
+    #[test]
+    fn unavailable_profile_visibility_does_not_guess_the_profile_setting() {
+        let screen = verification_failure_screen(None, Some("steam_library_unavailable"), None);
+        assert!(screen.contains("Profile: <b>Unavailable</b>"));
+        assert!(screen.contains("Game list: <b>Not visible</b>"));
     }
 
     #[test]
