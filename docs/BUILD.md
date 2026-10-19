@@ -149,6 +149,26 @@ cargo run --manifest-path launcher/src-tauri/Cargo.toml -- --preview-update-flow
 The walkthrough shows a launcher update and launcher notes, simulates staging it, proceeds to a game
 update with separate game notes, and finishes on the ready-to-play screen.
 
+## Steam verification recovery
+
+Steam visibility failures use the ownership service's `reason` query parameter on `/done`:
+`steam_library_unavailable` opens privacy recovery, and `steam_game_not_found` explains that
+neither eligible game appeared in the shared list. Other failures retain the service's message.
+The service also checks profile visibility after these failures and returns it separately as
+`profile_visibility=public`, `not_public`, or `unknown`. The screen displays profile visibility and
+game-list visibility independently. A failed profile lookup is shown as unavailable, and an
+unreadable game list does not expose its exact Private or Friends Only setting.
+
+The recovery screen returns to bundled launcher content before displaying its actions.
+**Open Steam privacy settings** opens `https://steamcommunity.com/my/edit/settings` in the
+system browser. If opening fails, the screen explains how to reach privacy settings in Steam.
+The player must sign in to the owning account in that browser. **Retry** starts a fresh Steam
+sign-in while retaining the requested content version and pending download or update.
+
+The companion ownership-service change must be deployed for these reason-specific screens to
+appear. Existing service responses continue using the generic failure screen. No launcher
+release or ownership-service deployment is performed by opening a pull request.
+
 ## Legacy transition
 
 `build-windows-installer.yml` and `build-macos-installer.yml` remain temporarily available only to

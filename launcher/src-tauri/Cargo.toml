@@ -9,6 +9,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+open = "5"
 urlencoding = "2"
 ureq = "2"
 zip = "2"
