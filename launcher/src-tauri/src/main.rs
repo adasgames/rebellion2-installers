@@ -3131,16 +3131,11 @@ fn steam_signin_url(base: &str, version: Option<&str>) -> String {
 }
 
 /// Maps explicit Steam visibility outcomes to wording that does not infer private settings.
-fn steam_verification_status(
-    reason: Option<&str>,
-    profile_visibility: Option<&str>,
-) -> Option<&'static str> {
+fn steam_verification_status(reason: Option<&str>) -> Option<&'static str> {
     match reason {
-        Some("steam_library_unavailable") => Some(match profile_visibility {
-            Some("public") => "Your Steam profile is public, but your game list is hidden.",
-            Some("not_public") => "Your Steam profile is not public, and your game list is hidden.",
-            _ => "Your Steam game list is hidden. Profile visibility could not be checked.",
-        }),
+        Some("steam_library_unavailable") => {
+            Some("Your Steam game list is not visible to the launcher.")
+        }
         Some("steam_game_not_found") => {
             Some("Neither eligible game appeared in the list Steam shared.")
         }
@@ -3154,8 +3149,8 @@ fn verification_failure_screen(
     reason: Option<&str>,
     profile_visibility: Option<&str>,
 ) -> String {
-    if let Some(status) = steam_verification_status(reason, profile_visibility) {
-        return steam_verification_help_screen(status);
+    if let Some(status) = steam_verification_status(reason) {
+        return steam_verification_help_screen(status, reason, profile_visibility);
     }
     let status = message
         .filter(|message| !message.trim().is_empty())
@@ -3169,15 +3164,32 @@ fn verification_failure_screen(
 }
 
 /// Presents Steam privacy instructions while keeping the pending installation or update intact.
-fn steam_verification_help_screen(status: &str) -> String {
-    let content = r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
+fn steam_verification_help_screen(
+    status: &str,
+    reason: Option<&str>,
+    profile_visibility: Option<&str>,
+) -> String {
+    let profile = match profile_visibility {
+        Some("public") => "Public",
+        Some("not_public") => "Not public",
+        _ => "Unavailable",
+    };
+    let game_list = match reason {
+        Some("steam_library_unavailable") => "Not visible",
+        Some("steam_game_not_found") => "Visible",
+        _ => "Unavailable",
+    };
+    let content = format!(
+        r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
+        <p>Profile: <b>{profile}</b><br>Game list: <b>{game_list}</b></p>
         <ol style="padding-left:20px">
           <li>Open <b>Steam privacy settings</b> using the button below.</li>
           <li>Set <b>My profile</b> and <b>Game details</b> to <b>Public</b>.</li>
           <li>Use the account that owns the game. If the game itself is marked private, make it public for verification.</li>
           <li>Return here and choose <b>Retry</b>.</li>
         </ol>
-        </section>"#;
+        </section>"#
+    );
     let buttons = button("Open Steam privacy settings", "steam-privacy")
         + &secondary_button("Retry", "steam-retry")
         + &secondary_button("Back", "signin");
@@ -3186,7 +3198,7 @@ fn steam_verification_help_screen(status: &str) -> String {
         false,
         status,
         "sub failure-error",
-        content,
+        &content,
         &buttons,
     )
 }
@@ -4429,11 +4441,13 @@ mod tests {
     fn unreadable_steam_library_offers_privacy_settings_and_fresh_verification() {
         let screen =
             verification_failure_screen(None, Some("steam_library_unavailable"), Some("public"));
-        assert!(screen.contains("Your Steam profile is public, but your game list is hidden."));
+        assert!(screen.contains("Your Steam game list is not visible to the launcher."));
         assert!(screen.contains("choice=steam-privacy"));
         assert!(screen.contains("choice=steam-retry"));
         assert!(screen.contains("My profile</b> and <b>Game details"));
         assert!(screen.contains(r#"choice=steam-retry">Retry</a>"#));
+        assert!(screen.contains("Profile: <b>Public</b>"));
+        assert!(screen.contains("Game list: <b>Not visible</b>"));
         assert!(!screen.contains("your games are private"));
     }
 
@@ -4443,7 +4457,8 @@ mod tests {
             verification_failure_screen(None, Some("steam_game_not_found"), Some("public"));
         assert!(screen.contains("Neither eligible game appeared"));
         assert!(screen.contains("account that owns the game"));
-        assert!(!screen.contains("Your Steam profile is public, but your game list is hidden."));
+        assert!(screen.contains("Game list: <b>Visible</b>"));
+        assert!(!screen.contains("Your Steam game list is not visible to the launcher."));
     }
 
     #[test]
@@ -4468,15 +4483,15 @@ mod tests {
             Some("steam_library_unavailable"),
             Some("not_public"),
         );
-        assert!(screen.contains("Your Steam profile is not public, and your game list is hidden."));
+        assert!(screen.contains("Profile: <b>Not public</b>"));
+        assert!(screen.contains("Game list: <b>Not visible</b>"));
     }
 
     #[test]
     fn unavailable_profile_visibility_does_not_guess_the_profile_setting() {
         let screen = verification_failure_screen(None, Some("steam_library_unavailable"), None);
-        assert!(screen
-            .contains("Your Steam game list is hidden. Profile visibility could not be checked."));
-        assert!(!screen.contains("Your Steam profile is not public"));
+        assert!(screen.contains("Profile: <b>Unavailable</b>"));
+        assert!(screen.contains("Game list: <b>Not visible</b>"));
     }
 
     #[test]
