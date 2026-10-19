@@ -3163,7 +3163,14 @@ fn steam_verification_help_screen(status: &str) -> String {
     let buttons = button("Open Steam privacy settings", "steam-privacy")
         + &secondary_button("Try Steam again", "steam-retry")
         + &secondary_button("Use another sign-in", "signin");
-    render_with_content("Steam verification", false, status, &content, &buttons)
+    render_card(
+        "Steam verification",
+        false,
+        status,
+        "sub failure-error",
+        &content,
+        &buttons,
+    )
 }
 
 /// Returns the game version whose protected content this installation requires.
