@@ -101,6 +101,8 @@ const UNITY_CRASH_HANDLER_EXE: &str = "UnityCrashHandler64";
 const MACOS_GAME_APP_NAME: &str = "Rebellion2 Game.app";
 
 const RELEASES_URL: &str = "https://github.com/adasgames/rebellion2-installers/releases/latest";
+/// Steam's settings page for the account signed in to the player's browser.
+const STEAM_PRIVACY_URL: &str = "https://steamcommunity.com/my/edit/settings";
 
 /// Internal URL scheme the in-window buttons navigate to; intercepted in on_nav so
 /// the HTML can drive Rust without extra IPC wiring.
@@ -136,6 +138,8 @@ static APPLICATION_UPDATE_AUTH_PENDING: AtomicBool = AtomicBool::new(false);
 static GAME_UPDATE_AUTH_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set while ownership verification returns the remote webview to bundled launcher content.
 static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
+/// The failure screen waiting for the ownership webview to return to bundled content.
+static GATE_FAILURE_PENDING: Mutex<Option<String>> = Mutex::new(None);
 /// Set until the bundled launcher page is ready for its first channel scan.
 static INITIAL_SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 /// Enables the local, network-free split-update walkthrough in debug builds.
@@ -435,7 +439,8 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
         let message = query(url, "msg");
         let presigned = query(url, "url");
         let token = query(url, "token");
-        on_gate_result(handle, ok, message, presigned, token);
+        let reason = query(url, "reason");
+        on_gate_result(handle, ok, message, presigned, token, reason);
         return false;
     }
 
@@ -463,7 +468,9 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
         return;
     }
 
-    if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
+    if let Some(screen) = GATE_FAILURE_PENDING.lock().unwrap().take() {
+        write_screen(handle, &screen);
+    } else if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
         resume_after_gate(handle);
     } else if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
         let handle = handle.clone();
@@ -495,19 +502,20 @@ fn on_gate_result(
     message: Option<String>,
     presigned: Option<String>,
     token: Option<String>,
+    reason: Option<String>,
 ) {
     if !ok {
-        let message = message
-            .as_deref()
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or("This account does not own either eligible game.");
         log_line("[launcher] Ownership verification was not completed.");
-        show_message(
-            handle,
-            "Not verified",
-            message,
-            Some(("Try Again", "signin")),
-        );
+        let screen = verification_failure_screen(message.as_deref(), reason.as_deref());
+        *GATE_FAILURE_PENDING.lock().unwrap() = Some(screen);
+        let handle = handle.clone();
+        thread::spawn(move || {
+            if !navigate_to_local_app(&handle) {
+                if let Some(screen) = GATE_FAILURE_PENDING.lock().unwrap().take() {
+                    write_screen(&handle, &screen);
+                }
+            }
+        });
         return;
     }
     log_line("[launcher] VERIFIED via the ownership service.");
@@ -738,6 +746,24 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                     "Sign in to verify ownership and download the game.",
                     Some(("Sign in", "signin")),
                 );
+            }
+        }
+        "steam-privacy" => {
+            let handle = handle.clone();
+            thread::spawn(move || {
+                if open::that(STEAM_PRIVACY_URL).is_err() {
+                    write_screen(&handle, &steam_verification_help_screen(
+                        "Could not open your browser. Open the address below to check your settings.",
+                    ));
+                }
+            });
+        }
+        "steam-retry" => {
+            if let Some(window) = handle.get_webview_window("main") {
+                let target = steam_signin_url(&auth_base(), requested_content_version().as_deref());
+                if let Ok(url) = target.parse() {
+                    let _ = window.navigate(url);
+                }
             }
         }
         // Reopen the ownership gate (sign-in screens).
@@ -3081,6 +3107,65 @@ fn gate_landing() -> String {
     }
 }
 
+/// Builds a fresh Steam verification request while preserving the required content version.
+fn steam_signin_url(base: &str, version: Option<&str>) -> String {
+    let mut url = format!("{base}start?provider=steam");
+    if let Some(version) = version {
+        url.push_str(&format!("&v={}", urlencoding::encode(version)));
+    }
+    url
+}
+
+/// Maps explicit Steam visibility outcomes to wording that does not infer private settings.
+fn steam_verification_status(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("steam_library_unavailable") => {
+            Some("Your Steam game list is not visible to the launcher.")
+        }
+        Some("steam_game_not_found") => {
+            Some("Neither eligible game appeared in the list Steam shared.")
+        }
+        _ => None,
+    }
+}
+
+/// Builds a provider-specific recovery screen from the ownership service's explicit outcome.
+fn verification_failure_screen(message: Option<&str>, reason: Option<&str>) -> String {
+    if let Some(status) = steam_verification_status(reason) {
+        return steam_verification_help_screen(status);
+    }
+    let status = message
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("Ownership could not be verified. Please try again.");
+    render(
+        "Not verified",
+        false,
+        status,
+        &button("Try Again", "signin"),
+    )
+}
+
+/// Presents Steam privacy instructions while keeping the pending installation or update intact.
+fn steam_verification_help_screen(status: &str) -> String {
+    let content = format!(
+        r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
+        <p>A public profile alone does not make your game list public.</p>
+        <ol style="padding-left:20px">
+          <li>Open Steam &gt; <b>Edit Profile &gt; Privacy Settings</b>.</li>
+          <li>Set <b>My profile</b> and <b>Game details</b> to <b>Public</b>.</li>
+          <li>Check that you are signing in with the account that owns the game. If the game is marked private, make it public for verification too.</li>
+          <li>Return here and choose <b>Try Steam again</b>.</li>
+        </ol>
+        <p style="overflow-wrap:anywhere">{STEAM_PRIVACY_URL}</p>
+        <p>You can restore your privacy settings after verification succeeds.</p>
+        </section>"#,
+    );
+    let buttons = button("Open Steam privacy settings", "steam-privacy")
+        + &secondary_button("Try Steam again", "steam-retry")
+        + &secondary_button("Use another sign-in", "signin");
+    render_with_content("Steam verification", false, status, &content, &buttons)
+}
+
 /// Returns the game version whose protected content this installation requires.
 fn requested_content_version() -> Option<String> {
     current_game_version().or_else(|| {
@@ -4296,6 +4381,58 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steam_retry_preserves_the_required_content_version() {
+        let url: tauri::Url = steam_signin_url("https://gate.example/", Some("0.0.33+test"))
+            .parse()
+            .unwrap();
+        assert_eq!(url.path(), "/start");
+        assert_eq!(query(&url, "provider").as_deref(), Some("steam"));
+        assert_eq!(query(&url, "v").as_deref(), Some("0.0.33+test"));
+    }
+
+    #[test]
+    fn steam_retry_without_a_content_version_starts_steam_verification() {
+        assert_eq!(
+            steam_signin_url("https://gate.example/", None),
+            "https://gate.example/start?provider=steam"
+        );
+    }
+
+    #[test]
+    fn unreadable_steam_library_offers_privacy_settings_and_fresh_verification() {
+        let screen = verification_failure_screen(None, Some("steam_library_unavailable"));
+        assert!(screen.contains("Your Steam game list is not visible to the launcher."));
+        assert!(screen.contains("choice=steam-privacy"));
+        assert!(screen.contains("choice=steam-retry"));
+        assert!(screen.contains("My profile</b> and <b>Game details"));
+        assert!(screen.contains(STEAM_PRIVACY_URL));
+        assert!(!screen.contains("your games are private"));
+    }
+
+    #[test]
+    fn visible_library_without_eligible_game_keeps_a_distinct_explanation() {
+        let screen = verification_failure_screen(None, Some("steam_game_not_found"));
+        assert!(screen.contains("Neither eligible game appeared"));
+        assert!(screen.contains("account that owns the game"));
+        assert!(!screen.contains("Your Steam game list is not visible to the launcher."));
+    }
+
+    #[test]
+    fn other_verification_failures_keep_the_service_message_without_steam_privacy_actions() {
+        let screen = verification_failure_screen(Some("Service unavailable <retry>"), None);
+        assert!(screen.contains("Service unavailable &lt;retry&gt;"));
+        assert!(screen.contains("choice=signin"));
+        assert!(!screen.contains("choice=steam-privacy"));
+    }
+
+    #[test]
+    fn unknown_verification_reason_does_not_infer_a_privacy_failure() {
+        let screen = verification_failure_screen(None, Some("unknown"));
+        assert!(screen.contains("Ownership could not be verified."));
+        assert!(!screen.contains("choice=steam-privacy"));
+    }
 
     #[test]
     fn content_pack_error_screen_separates_back_from_retry() {
