@@ -1,0 +1,186 @@
+.card.steam-verification {
+  padding: 30px 36px 28px;
+  text-align: left;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #59637b transparent;
+}
+
+.steam-verification .launcher-brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  padding-bottom: 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, .1);
+}
+
+.steam-verification h1 {
+  font-size: 20px;
+  letter-spacing: .12em;
+}
+
+.steam-verification .launcher-brand > span {
+  color: #8a93ad;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+}
+
+.steam-verification .recovery-content {
+  flex: none;
+  padding: 30px 0 24px;
+}
+
+.steam-verification .kicker {
+  margin-bottom: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .18em;
+}
+
+.steam-verification h2 {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: -.025em;
+  line-height: 1.2;
+}
+
+.steam-verification .failure-error {
+  margin: 12px 0 0;
+  max-width: none;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.55;
+}
+
+.steam-verification .visibility-panel {
+  margin-top: 24px;
+  padding: 18px 20px 4px;
+  background: linear-gradient(120deg, rgba(255, 255, 255, .045), rgba(255, 255, 255, .015));
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .12);
+}
+
+.steam-verification .panel-label {
+  margin: 0 0 7px;
+  color: #8a93ad;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.steam-verification dl {
+  margin: 0;
+}
+
+.steam-verification dl > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 44px;
+  font-size: 14px;
+}
+
+.steam-verification dl > div + div {
+  border-top: 1px solid rgba(255, 255, 255, .07);
+}
+
+.steam-verification dt {
+  color: #cbd2e3;
+}
+
+.steam-verification dd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.steam-verification dd::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.steam-verification .visible { color: #9ad5b9; }
+.steam-verification .hidden { color: #ff6b73; }
+.steam-verification .unknown { color: #a6afc4; }
+
+.steam-verification .recovery-guidance {
+  padding-top: 24px;
+}
+
+.steam-verification h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.steam-verification .recovery-guidance p {
+  margin: 0;
+  color: #a6afc4;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.steam-verification b {
+  color: #dce2f0;
+  font-weight: 600;
+}
+
+.steam-verification .recovery-actions > p {
+  margin: 0 0 14px;
+  color: #8a93ad;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.steam-verification .b {
+  min-height: 48px;
+  margin: 0;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.steam-verification .b.primary {
+  box-shadow: 0 4px 18px rgba(255, 207, 77, .12);
+}
+
+.steam-verification .recovery-navigation {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.steam-verification .recovery-navigation .b:last-child {
+  background: transparent;
+  border-color: transparent;
+  color: #a6afc4;
+}
+
+.steam-verification a:focus-visible {
+  outline: 2px solid #ffcf4d;
+  outline-offset: 4px;
+}
+
+@media (max-width: 420px) {
+  .card.steam-verification { padding-right: 24px; padding-left: 24px; }
+  .steam-verification h2 { font-size: 27px; }
+  .steam-verification .launcher-brand > span { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .steam-verification .b { transition: none; }
+}
