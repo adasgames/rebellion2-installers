@@ -3169,30 +3169,36 @@ fn steam_verification_help_screen(
     reason: Option<&str>,
     profile_visibility: Option<&str>,
 ) -> String {
-    let profile = match profile_visibility {
-        Some("public") => "Public",
-        Some("not_public") => "Not public",
-        _ => "Unavailable",
-    };
-    let game_list = match reason {
-        Some("steam_library_unavailable") => "Not visible",
-        Some("steam_game_not_found") => "Visible",
-        _ => "Unavailable",
+    let visibility = match (reason, profile_visibility) {
+        (Some("steam_library_unavailable"), Some("public")) => {
+            "Your profile is public, but your games list is hidden."
+        }
+        (Some("steam_library_unavailable"), Some("not_public")) => {
+            "Your profile is not public, and your games list is hidden."
+        }
+        (Some("steam_library_unavailable"), _) => {
+            "Your games list is hidden. Steam did not provide your profile visibility."
+        }
+        (Some("steam_game_not_found"), Some("public")) => {
+            "Your profile is public and your games list is visible."
+        }
+        (Some("steam_game_not_found"), Some("not_public")) => {
+            "Your profile is not public, but your games list is visible."
+        }
+        _ => "Your games list is visible. Steam did not provide your profile visibility.",
     };
     let content = format!(
         r#"<section class="release-changes" style="margin:16px 0;color:#cbd2e3;font-size:12px;line-height:1.6">
-        <p>Profile: <b>{profile}</b><br>Game list: <b>{game_list}</b></p>
+        <p>{visibility}</p>
         <ol style="padding-left:20px">
-          <li>Open <b>Steam privacy settings</b> using the button below.</li>
+          <li><a href="{ACT}?choice=steam-privacy" style="color:#ffcf4d;text-underline-offset:3px">Open Steam privacy settings</a>.</li>
           <li>Set <b>My profile</b> and <b>Game details</b> to <b>Public</b>.</li>
           <li>Use the account that owns the game. If the game itself is marked private, make it public for verification.</li>
           <li>Return here and choose <b>Retry</b>.</li>
         </ol>
         </section>"#
     );
-    let buttons = button("Open Steam privacy settings", "steam-privacy")
-        + &secondary_button("Retry", "steam-retry")
-        + &secondary_button("Back", "signin");
+    let buttons = button("Retry", "steam-retry") + &secondary_button("Back", "signin");
     render_card(
         "Steam verification",
         false,
@@ -4446,8 +4452,7 @@ mod tests {
         assert!(screen.contains("choice=steam-retry"));
         assert!(screen.contains("My profile</b> and <b>Game details"));
         assert!(screen.contains(r#"choice=steam-retry">Retry</a>"#));
-        assert!(screen.contains("Profile: <b>Public</b>"));
-        assert!(screen.contains("Game list: <b>Not visible</b>"));
+        assert!(screen.contains("Your profile is public, but your games list is hidden."));
         assert!(!screen.contains("your games are private"));
     }
 
@@ -4457,7 +4462,7 @@ mod tests {
             verification_failure_screen(None, Some("steam_game_not_found"), Some("public"));
         assert!(screen.contains("Neither eligible game appeared"));
         assert!(screen.contains("account that owns the game"));
-        assert!(screen.contains("Game list: <b>Visible</b>"));
+        assert!(screen.contains("Your profile is public and your games list is visible."));
         assert!(!screen.contains("Your Steam game list is not visible to the launcher."));
     }
 
@@ -4483,15 +4488,14 @@ mod tests {
             Some("steam_library_unavailable"),
             Some("not_public"),
         );
-        assert!(screen.contains("Profile: <b>Not public</b>"));
-        assert!(screen.contains("Game list: <b>Not visible</b>"));
+        assert!(screen.contains("Your profile is not public, and your games list is hidden."));
     }
 
     #[test]
     fn unavailable_profile_visibility_does_not_guess_the_profile_setting() {
         let screen = verification_failure_screen(None, Some("steam_library_unavailable"), None);
-        assert!(screen.contains("Profile: <b>Unavailable</b>"));
-        assert!(screen.contains("Game list: <b>Not visible</b>"));
+        assert!(screen
+            .contains("Your games list is hidden. Steam did not provide your profile visibility."));
     }
 
     #[test]
