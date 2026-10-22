@@ -95,7 +95,7 @@ jobs:
           git config lfs.concurrenttransfers 4
           max_attempts=6
           for attempt in $(seq 1 "$max_attempts"); do
-            if git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**,Models/MainMenu/**" --exclude=""; then
+            if git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**,Models/MainMenu/**,UnityAssets/**" --exclude=""; then
               break
             fi
             if [ "$attempt" -eq "$max_attempts" ]; then
@@ -112,7 +112,8 @@ jobs:
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' \
             Content/Application \
             Content/Packs/ClassicGalacticCivilWar \
-            Models/MainMenu; then
+            Models/MainMenu \
+            UnityAssets; then
             echo "Asset checkout still contains Git LFS pointers."
             exit 1
           fi
@@ -129,6 +130,8 @@ jobs:
             .ci/assets/Content/Packs/ClassicGalacticCivilWar/ \
             Assets/Content/Packs/ClassicGalacticCivilWar/
           rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Models/MainMenu/ Assets/Art/Models/MainMenu/
+          rsync -a --exclude=.DS_Store .ci/assets/UnityAssets/ Assets/
+          test -f Assets/Art/MainMenu/Planet/Flare/PurpleFlareMesh.asset
           rm -rf .ci
 
       - name: Cache Library
