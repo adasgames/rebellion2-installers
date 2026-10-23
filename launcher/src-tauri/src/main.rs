@@ -655,6 +655,9 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
+            if show_required_content_pack_update(handle) {
+                return;
+            }
             log_line("[launcher] Play clicked.");
             match launch_game() {
                 Ok(true) => handle.exit(0),
@@ -2309,7 +2312,7 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
             } else if installed_version.as_deref() == Some(latest.version.as_str()) {
                 clear_approved_content_update();
                 log_line(&format!("[launcher] up to date ({}).", latest.version));
-                show_up_to_date(handle, &latest.version);
+                refresh_content_pack_catalog_and_show_ready(handle, &latest.version);
             } else {
                 log_line(&format!(
                     "[launcher] update available: {} -> {}",
@@ -2593,7 +2596,7 @@ fn run_update(
                 update_progress(handle, 100, "Update complete.");
                 // Let the filled bar sit a beat, then land on the up-to-date screen.
                 thread::sleep(Duration::from_millis(900));
-                show_up_to_date(handle, &latest.version);
+                refresh_content_pack_catalog_and_show_ready(handle, &latest.version);
             }
         }
         Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
@@ -2635,7 +2638,7 @@ fn finish_application_update(handle: &tauri::AppHandle, version: &str) {
     clear_approved_content_update();
     update_progress(handle, 100, "Update complete.");
     thread::sleep(Duration::from_millis(900));
-    show_up_to_date(handle, version);
+    refresh_content_pack_catalog_and_show_ready(handle, version);
 }
 
 fn do_update(
@@ -3338,12 +3341,95 @@ fn show_result(handle: &tauri::AppHandle, kicker: &str, status: &str, label: &st
 }
 
 fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
+    if show_required_content_pack_update(handle) {
+        return;
+    }
+
     let screen = if launcher_update_was_staged() {
         launcher_staged_ready_screen(version)
     } else {
         up_to_date_screen(version)
     };
     write_screen(handle, &screen);
+}
+
+/// Refreshes optional content metadata before exposing the launch action.
+fn refresh_content_pack_catalog_and_show_ready(handle: &tauri::AppHandle, version: &str) {
+    match fetch_content_pack_catalog() {
+        Ok(catalog) => *CONTENT_PACK_CATALOG.lock().unwrap() = Some(catalog),
+        Err(error) => log_line(&format!(
+            "[launcher] optional content-pack update check failed: {error}"
+        )),
+    }
+    show_up_to_date(handle, version);
+}
+
+/// Shows a blocking update action when installed optional content is behind its compatible release.
+fn show_required_content_pack_update(handle: &tauri::AppHandle) -> bool {
+    let Some(catalog) = CONTENT_PACK_CATALOG.lock().unwrap().clone() else {
+        return false;
+    };
+    let Ok(install_root) = install_dir() else {
+        return false;
+    };
+    let game_version = current_game_version();
+    let Some((release, installed)) =
+        pending_installed_content_pack_update(&catalog, &install_root, game_version.as_deref())
+    else {
+        return false;
+    };
+
+    write_screen(
+        handle,
+        &required_content_pack_update_screen(&release, &installed),
+    );
+    true
+}
+
+/// Finds the first installed optional pack with a newer compatible release.
+fn pending_installed_content_pack_update(
+    catalog: &ContentPackCatalog,
+    install_root: &Path,
+    game_version: Option<&str>,
+) -> Option<(ContentPackRelease, content_packs::InstalledContentPack)> {
+    catalog.packs.iter().find_map(|release| {
+        let installed = content_packs::read_installed(install_root, &release.id)?;
+        let minimum_supported_version = release.minimum_supported_version.as_deref()?;
+        if !version_gt(minimum_supported_version, &installed.version)
+            || !content_packs::supports_dependency_version(
+                release,
+                GAME_DEPENDENCY_ID,
+                game_version,
+            )
+        {
+            return None;
+        }
+        Some((release.clone(), installed))
+    })
+}
+
+/// Renders the required optional-content update without offering a launch bypass.
+fn required_content_pack_update_screen(
+    release: &ContentPackRelease,
+    installed: &content_packs::InstalledContentPack,
+) -> String {
+    let buttons = format!(
+        "{}{}",
+        button(
+            "Update content pack",
+            &format!("content-pack-install:{}", release.id)
+        ),
+        secondary_button("Manage content packs", "content-packs")
+    );
+    render(
+        "Content pack update required",
+        false,
+        &format!(
+            "{} must be updated from {} to {} before launching this game version.",
+            release.name, installed.version, release.version
+        ),
+        &buttons,
+    )
 }
 
 fn up_to_date_screen(version: &str) -> String {
@@ -4642,6 +4728,96 @@ mod tests {
     }
 
     #[test]
+    fn pending_installed_content_pack_update_finds_newer_compatible_release() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = content_pack_release("1.0.1");
+        let manifest = application_manifest("1.0.1", &["pack.xml"]);
+        content_packs::write_install(root.path(), &installed, &manifest).unwrap();
+        write_pack_definition(
+            root.path(),
+            "ClassicGalacticCivilWar",
+            "classic-galactic-civil-war",
+            "1.0.0",
+        );
+        let mut current = content_pack_release("1.0.3");
+        current.minimum_supported_version = Some("1.0.3".to_string());
+        let catalog = ContentPackCatalog {
+            schema_version: 2,
+            packs: vec![current],
+        };
+
+        let (release, installed) =
+            pending_installed_content_pack_update(&catalog, root.path(), Some("0.0.34"))
+                .expect("a compatible update should be required");
+
+        assert_eq!(release.version, "1.0.3");
+        assert_eq!(installed.version, "1.0.1");
+    }
+
+    #[test]
+    fn pending_installed_content_pack_update_current_release_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = content_pack_release("1.0.3");
+        let manifest = application_manifest("1.0.3", &["pack.xml"]);
+        content_packs::write_install(root.path(), &installed, &manifest).unwrap();
+        write_pack_definition(
+            root.path(),
+            "ClassicGalacticCivilWar",
+            "classic-galactic-civil-war",
+            "1.0.0",
+        );
+        let mut current = content_pack_release("1.0.3");
+        current.minimum_supported_version = Some("1.0.3".to_string());
+        let catalog = ContentPackCatalog {
+            schema_version: 2,
+            packs: vec![current],
+        };
+
+        assert!(
+            pending_installed_content_pack_update(&catalog, root.path(), Some("0.0.34")).is_none()
+        );
+    }
+
+    #[test]
+    fn pending_installed_content_pack_update_optional_release_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = content_pack_release("1.0.1");
+        let manifest = application_manifest("1.0.1", &["pack.xml"]);
+        content_packs::write_install(root.path(), &installed, &manifest).unwrap();
+        write_pack_definition(
+            root.path(),
+            "ClassicGalacticCivilWar",
+            "classic-galactic-civil-war",
+            "1.0.0",
+        );
+        let catalog = ContentPackCatalog {
+            schema_version: 2,
+            packs: vec![content_pack_release("1.0.3")],
+        };
+
+        assert!(
+            pending_installed_content_pack_update(&catalog, root.path(), Some("0.0.34")).is_none()
+        );
+    }
+
+    #[test]
+    fn required_content_pack_update_screen_omits_launch_bypass() {
+        let release = content_pack_release("1.0.3");
+        let installed = content_packs::InstalledContentPack {
+            id: release.id.clone(),
+            name: release.name.clone(),
+            version: "1.0.1".to_string(),
+            directory: release.directory.clone(),
+        };
+
+        let screen = required_content_pack_update_screen(&release, &installed);
+
+        assert!(screen.contains("Content pack update required"));
+        assert!(screen.contains("Update content pack"));
+        assert!(!screen.contains("choice=play"));
+    }
+
+    #[test]
     fn installed_optional_base_version_uses_actual_pack_definition() {
         let root = tempfile::tempdir().unwrap();
         let mut base_pack = content_pack_release("2.0.0");
@@ -4689,6 +4865,7 @@ mod tests {
             manifest: format!("dist/content-packs/sample-pack/manifest-{version}.json"),
             blobs: "content-pack-blobs/".to_string(),
             download_size: 100,
+            minimum_supported_version: None,
             depends: std::collections::BTreeMap::from([
                 (
                     GAME_DEPENDENCY_ID.to_string(),
