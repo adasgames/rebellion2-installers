@@ -39,6 +39,8 @@ pub struct ContentPackRelease {
     pub blobs: String,
     #[serde(default)]
     pub download_size: u64,
+    #[serde(default)]
+    pub minimum_supported_version: Option<String>,
     pub depends: BTreeMap<String, VersionRequirement>,
 }
 
@@ -112,6 +114,18 @@ pub fn validate_release(pack: &ContentPackRelease) -> io::Result<()> {
     if parse_semantic_version(&pack.version).is_none() {
         return Err(invalid_data(
             "content-pack version must be a semantic version",
+        ));
+    }
+    if pack
+        .minimum_supported_version
+        .as_deref()
+        .is_some_and(|version| {
+            parse_semantic_version(version).is_none()
+                || compare_versions(version, &pack.version).is_gt()
+        })
+    {
+        return Err(invalid_data(
+            "content-pack minimum supported version is invalid",
         ));
     }
     if !is_single_path_component(&pack.directory) {
@@ -529,6 +543,7 @@ mod tests {
             manifest: "dist/content-packs/sample-pack/manifest-1.2.3.json".to_string(),
             blobs: "content-pack-blobs/".to_string(),
             download_size: 4,
+            minimum_supported_version: None,
             depends: BTreeMap::from([
                 (
                     GAME_DEPENDENCY_ID.to_string(),
@@ -663,6 +678,16 @@ mod tests {
         for version in ["next", "01.0.0", "1.0.0-beta.01"] {
             let mut pack = release();
             pack.version = version.to_string();
+
+            assert!(validate_release(&pack).is_err());
+        }
+    }
+
+    #[test]
+    fn release_with_invalid_minimum_supported_version_is_rejected() {
+        for version in ["next", "1.2.4"] {
+            let mut pack = release();
+            pack.minimum_supported_version = Some(version.to_string());
 
             assert!(validate_release(&pack).is_err());
         }
