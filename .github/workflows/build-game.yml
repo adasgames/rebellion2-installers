@@ -143,7 +143,22 @@ jobs:
           storage_host="${STORAGE_ENDPOINT#https://}"
           git config lfs.url "https://${STORAGE_ACCESS_KEY_ID}:${STORAGE_SECRET_ACCESS_KEY}@${proxy_host}/${storage_host}/${STORAGE_BUCKET}"
           git config lfs.concurrenttransfers 4
-          git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**" --exclude=""
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            if git lfs pull --include="Content/Application/**,Content/Packs/ClassicGalacticCivilWar/**" --exclude=""; then
+              break
+            fi
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "Media fetch failed after ${max_attempts} attempts." >&2
+              exit 1
+            fi
+            delay=$((30 * (2 ** (attempt - 1))))
+            if [ "$delay" -gt 300 ]; then
+              delay=300
+            fi
+            echo "Media fetch attempt ${attempt}/${max_attempts} failed; retrying in ${delay} seconds."
+            sleep "$delay"
+          done
           if grep -RIl '^version https://git-lfs.github.com/spec/v1$' \
             Content/Application \
             Content/Packs/ClassicGalacticCivilWar; then
