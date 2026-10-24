@@ -92,6 +92,17 @@ const SESSION_FILE: &str = ".session";
 
 #[cfg(target_os = "windows")]
 const GAME_EXE: &str = "Rebellion2.exe";
+#[cfg(any(target_os = "windows", test))]
+const RETIRED_WINDOWS_GAME_FILES: [&str; 8] = [
+    "Rebellion2_Data/Plugins/x86_64/DLSSFrameGenPluginD3D.dll",
+    "Rebellion2_Data/Plugins/x86_64/FrameGenPluginD3D.dll",
+    "Rebellion2_Data/Plugins/x86_64/nvngx_dlssg.dll",
+    "Rebellion2_Data/Plugins/x86_64/sl.common.dll",
+    "Rebellion2_Data/Plugins/x86_64/sl.dlss_g.dll",
+    "Rebellion2_Data/Plugins/x86_64/sl.interposer.dll",
+    "Rebellion2_Data/Plugins/x86_64/sl.pcl.dll",
+    "Rebellion2_Data/Plugins/x86_64/sl.reflex.dll",
+];
 #[cfg(target_os = "linux")]
 const GAME_EXE: &str = "Rebellion2.x86_64";
 #[cfg(target_os = "linux")]
@@ -4455,8 +4466,40 @@ fn remove_path_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Removes native game plugins retired from the Windows player before it starts.
+#[cfg(any(target_os = "windows", test))]
+fn remove_retired_windows_game_files(install_dir: &Path) -> io::Result<usize> {
+    let mut removed = 0;
+    for relative_path in RETIRED_WINDOWS_GAME_FILES {
+        let path = install_dir.join(relative_path);
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not remove retired game file {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn launch_game() -> io::Result<bool> {
     let base = install_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        let removed = remove_retired_windows_game_files(&base)?;
+        if removed > 0 {
+            log_line(&format!(
+                "[launcher] removed {removed} retired native game file(s)."
+            ));
+        }
+    }
     let exe = game_path()?;
     if !exe.exists() {
         log_line(&format!(
@@ -4510,6 +4553,37 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_retired_windows_game_files_with_retired_plugins_removes_only_retired_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for relative_path in RETIRED_WINDOWS_GAME_FILES {
+            let path = directory.path().join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"retired").unwrap();
+        }
+        let retained = directory
+            .path()
+            .join("Rebellion2_Data/Plugins/x86_64/retained.dll");
+        fs::write(&retained, b"retained").unwrap();
+
+        let removed = remove_retired_windows_game_files(directory.path()).unwrap();
+
+        assert_eq!(removed, RETIRED_WINDOWS_GAME_FILES.len());
+        for relative_path in RETIRED_WINDOWS_GAME_FILES {
+            assert!(!directory.path().join(relative_path).exists());
+        }
+        assert!(retained.exists());
+    }
+
+    #[test]
+    fn remove_retired_windows_game_files_without_retired_plugins_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let removed = remove_retired_windows_game_files(directory.path()).unwrap();
+
+        assert_eq!(removed, 0);
+    }
 
     #[test]
     fn steam_retry_preserves_the_required_content_version() {
