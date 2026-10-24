@@ -65,15 +65,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Add &Rebellion 2 to the desktop"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [InstallDelete]
-; Remove native plugins retired from the game player before an existing installation is updated.
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\DLSSFrameGenPluginD3D.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\FrameGenPluginD3D.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\nvngx_dlssg.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\sl.common.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\sl.dlss_g.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\sl.interposer.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\sl.pcl.dll"
-Type: files; Name: "{app}\Rebellion2_Data\Plugins\x86_64\sl.reflex.dll"
+; Rebuild the game-owned native plugin directory instead of retaining obsolete plugins.
+Type: filesandordirs; Name: "{app}\Rebellion2_Data\Plugins\x86_64"
 
 [Files]
 ; Asset-free game player (no baked art — Content is downloaded by the launcher).

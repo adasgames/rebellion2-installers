@@ -93,16 +93,7 @@ const SESSION_FILE: &str = ".session";
 #[cfg(target_os = "windows")]
 const GAME_EXE: &str = "Rebellion2.exe";
 #[cfg(any(target_os = "windows", test))]
-const RETIRED_WINDOWS_GAME_FILES: [&str; 8] = [
-    "Rebellion2_Data/Plugins/x86_64/DLSSFrameGenPluginD3D.dll",
-    "Rebellion2_Data/Plugins/x86_64/FrameGenPluginD3D.dll",
-    "Rebellion2_Data/Plugins/x86_64/nvngx_dlssg.dll",
-    "Rebellion2_Data/Plugins/x86_64/sl.common.dll",
-    "Rebellion2_Data/Plugins/x86_64/sl.dlss_g.dll",
-    "Rebellion2_Data/Plugins/x86_64/sl.interposer.dll",
-    "Rebellion2_Data/Plugins/x86_64/sl.pcl.dll",
-    "Rebellion2_Data/Plugins/x86_64/sl.reflex.dll",
-];
+const WINDOWS_NATIVE_PLUGIN_DIRECTORY: &str = "Rebellion2_Data/Plugins/x86_64";
 #[cfg(target_os = "linux")]
 const GAME_EXE: &str = "Rebellion2.x86_64";
 #[cfg(target_os = "linux")]
@@ -4466,25 +4457,35 @@ fn remove_path_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Removes native game plugins retired from the Windows player before it starts.
+/// Removes native Windows plugins that are not owned by the installed game manifest.
 #[cfg(any(target_os = "windows", test))]
-fn remove_retired_windows_game_files(install_dir: &Path) -> io::Result<usize> {
+fn reconcile_windows_native_plugins(install_dir: &Path, manifest: &Manifest) -> io::Result<usize> {
+    let plugin_directory = install_dir.join(WINDOWS_NATIVE_PLUGIN_DIRECTORY);
+    let entries = match fs::read_dir(&plugin_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+
     let mut removed = 0;
-    for relative_path in RETIRED_WINDOWS_GAME_FILES {
-        let path = install_dir.join(relative_path);
-        match fs::remove_file(&path) {
-            Ok(()) => removed += 1,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "could not remove retired game file {}: {error}",
-                        path.display()
-                    ),
-                ));
-            }
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
         }
+        let relative_path = format!(
+            "{WINDOWS_NATIVE_PLUGIN_DIRECTORY}/{}",
+            entry.file_name().to_string_lossy()
+        );
+        if manifest
+            .files
+            .iter()
+            .any(|file| file.path.eq_ignore_ascii_case(&relative_path))
+        {
+            continue;
+        }
+        fs::remove_file(entry.path())?;
+        removed += 1;
     }
     Ok(removed)
 }
@@ -4492,11 +4493,11 @@ fn remove_retired_windows_game_files(install_dir: &Path) -> io::Result<usize> {
 fn launch_game() -> io::Result<bool> {
     let base = install_dir()?;
     #[cfg(target_os = "windows")]
-    {
-        let removed = remove_retired_windows_game_files(&base)?;
+    if let Some(manifest) = read_game_manifest(&base) {
+        let removed = reconcile_windows_native_plugins(&base, &manifest)?;
         if removed > 0 {
             log_line(&format!(
-                "[launcher] removed {removed} retired native game file(s)."
+                "[launcher] removed {removed} unlisted native game plugin(s)."
             ));
         }
     }
@@ -4555,32 +4556,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remove_retired_windows_game_files_with_retired_plugins_removes_only_retired_files() {
+    fn reconcile_windows_native_plugins_with_unlisted_plugins_removes_only_unlisted_files() {
         let directory = tempfile::tempdir().unwrap();
-        for relative_path in RETIRED_WINDOWS_GAME_FILES {
-            let path = directory.path().join(relative_path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, b"retired").unwrap();
-        }
-        let retained = directory
-            .path()
-            .join("Rebellion2_Data/Plugins/x86_64/retained.dll");
+        let plugin_directory = directory.path().join(WINDOWS_NATIVE_PLUGIN_DIRECTORY);
+        fs::create_dir_all(&plugin_directory).unwrap();
+        let retained = plugin_directory.join("retained.dll");
+        let retired = plugin_directory.join("retired.dll");
         fs::write(&retained, b"retained").unwrap();
+        fs::write(&retired, b"retired").unwrap();
+        fs::create_dir(plugin_directory.join("nested")).unwrap();
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            files: vec![FileEntry {
+                path: format!("{WINDOWS_NATIVE_PLUGIN_DIRECTORY}/RETAINED.dll"),
+                sha256: "hash".to_string(),
+                size: 8,
+            }],
+        };
 
-        let removed = remove_retired_windows_game_files(directory.path()).unwrap();
+        let removed = reconcile_windows_native_plugins(directory.path(), &manifest).unwrap();
 
-        assert_eq!(removed, RETIRED_WINDOWS_GAME_FILES.len());
-        for relative_path in RETIRED_WINDOWS_GAME_FILES {
-            assert!(!directory.path().join(relative_path).exists());
-        }
+        assert_eq!(removed, 1);
         assert!(retained.exists());
+        assert!(!retired.exists());
+        assert!(plugin_directory.join("nested").exists());
     }
 
     #[test]
-    fn remove_retired_windows_game_files_without_retired_plugins_succeeds() {
+    fn reconcile_windows_native_plugins_without_plugin_directory_succeeds() {
         let directory = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            files: Vec::new(),
+        };
 
-        let removed = remove_retired_windows_game_files(directory.path()).unwrap();
+        let removed = reconcile_windows_native_plugins(directory.path(), &manifest).unwrap();
 
         assert_eq!(removed, 0);
     }
