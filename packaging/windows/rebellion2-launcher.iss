@@ -64,6 +64,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Add &Rebellion 2 to the desktop"; GroupDescription: "Additional icons:"; Flags: unchecked
 
+[InstallDelete]
+; Rebuild the game-owned native plugin directory instead of retaining obsolete plugins.
+Type: filesandordirs; Name: "{app}\Rebellion2_Data\Plugins\x86_64"
+
 [Files]
 ; Asset-free game player (no baked art — Content is downloaded by the launcher).
 Source: "{#GameDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion

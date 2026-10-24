@@ -92,6 +92,8 @@ const SESSION_FILE: &str = ".session";
 
 #[cfg(target_os = "windows")]
 const GAME_EXE: &str = "Rebellion2.exe";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_NATIVE_PLUGIN_DIRECTORY: &str = "Rebellion2_Data/Plugins/x86_64";
 #[cfg(target_os = "linux")]
 const GAME_EXE: &str = "Rebellion2.x86_64";
 #[cfg(target_os = "linux")]
@@ -1208,6 +1210,15 @@ fn do_game_update(
         );
         let changed = plan.changed.len();
         apply(&plan, &game_dir, &blobs)?;
+        #[cfg(target_os = "windows")]
+        {
+            let removed = reconcile_windows_native_plugins(&game_dir, &remote)?;
+            if removed > 0 {
+                log_line(&format!(
+                    "[launcher] removed {removed} unlisted native game plugin(s)."
+                ));
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             ensure_executable(&game_dir.join(GAME_EXE))?;
@@ -4455,6 +4466,39 @@ fn remove_path_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Removes native Windows plugins that are not owned by the installed game manifest.
+#[cfg(any(target_os = "windows", test))]
+fn reconcile_windows_native_plugins(install_dir: &Path, manifest: &Manifest) -> io::Result<usize> {
+    let plugin_directory = install_dir.join(WINDOWS_NATIVE_PLUGIN_DIRECTORY);
+    let entries = match fs::read_dir(&plugin_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let relative_path = format!(
+            "{WINDOWS_NATIVE_PLUGIN_DIRECTORY}/{}",
+            entry.file_name().to_string_lossy()
+        );
+        if manifest
+            .files
+            .iter()
+            .any(|file| file.path.eq_ignore_ascii_case(&relative_path))
+        {
+            continue;
+        }
+        fs::remove_file(entry.path())?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn launch_game() -> io::Result<bool> {
     let base = install_dir()?;
     let exe = game_path()?;
@@ -4510,6 +4554,46 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_windows_native_plugins_with_unlisted_plugins_removes_only_unlisted_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin_directory = directory.path().join(WINDOWS_NATIVE_PLUGIN_DIRECTORY);
+        fs::create_dir_all(&plugin_directory).unwrap();
+        let retained = plugin_directory.join("retained.dll");
+        let retired = plugin_directory.join("retired.dll");
+        fs::write(&retained, b"retained").unwrap();
+        fs::write(&retired, b"retired").unwrap();
+        fs::create_dir(plugin_directory.join("nested")).unwrap();
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            files: vec![FileEntry {
+                path: format!("{WINDOWS_NATIVE_PLUGIN_DIRECTORY}/RETAINED.dll"),
+                sha256: "hash".to_string(),
+                size: 8,
+            }],
+        };
+
+        let removed = reconcile_windows_native_plugins(directory.path(), &manifest).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(retained.exists());
+        assert!(!retired.exists());
+        assert!(plugin_directory.join("nested").exists());
+    }
+
+    #[test]
+    fn reconcile_windows_native_plugins_without_plugin_directory_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            files: Vec::new(),
+        };
+
+        let removed = reconcile_windows_native_plugins(directory.path(), &manifest).unwrap();
+
+        assert_eq!(removed, 0);
+    }
 
     #[test]
     fn steam_retry_preserves_the_required_content_version() {
