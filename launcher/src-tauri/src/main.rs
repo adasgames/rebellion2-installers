@@ -1210,6 +1210,15 @@ fn do_game_update(
         );
         let changed = plan.changed.len();
         apply(&plan, &game_dir, &blobs)?;
+        #[cfg(target_os = "windows")]
+        {
+            let removed = reconcile_windows_native_plugins(&game_dir, &remote)?;
+            if removed > 0 {
+                log_line(&format!(
+                    "[launcher] removed {removed} unlisted native game plugin(s)."
+                ));
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             ensure_executable(&game_dir.join(GAME_EXE))?;
@@ -4492,15 +4501,6 @@ fn reconcile_windows_native_plugins(install_dir: &Path, manifest: &Manifest) -> 
 
 fn launch_game() -> io::Result<bool> {
     let base = install_dir()?;
-    #[cfg(target_os = "windows")]
-    if let Some(manifest) = read_game_manifest(&base) {
-        let removed = reconcile_windows_native_plugins(&base, &manifest)?;
-        if removed > 0 {
-            log_line(&format!(
-                "[launcher] removed {removed} unlisted native game plugin(s)."
-            ));
-        }
-    }
     let exe = game_path()?;
     if !exe.exists() {
         log_line(&format!(
