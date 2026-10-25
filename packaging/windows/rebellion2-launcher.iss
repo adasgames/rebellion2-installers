@@ -115,8 +115,12 @@ Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName}"; Flags: nowa
 ; {app} at runtime, so Inno's install log doesn't track them. Remove them explicitly
 ; on uninstall, then drop {app} if nothing else remains.
 Type: filesandordirs; Name: "{app}\Content"
+Type: filesandordirs; Name: "{app}\.download-cache"
 Type: files; Name: "{app}\launcher.log"
+Type: files; Name: "{app}\content.zip"
 Type: files; Name: "{app}\content.zip.part"
+Type: files; Name: "{app}\content.zip.part.etag"
+Type: files; Name: "{app}\content.zip.part.size"
 Type: files; Name: "{app}\.approved-content-update"
 Type: files; Name: "{app}\.launcher-manifest.pending.json"
 Type: files; Name: "{app}\.launcher-version.pending"

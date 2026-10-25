@@ -14,9 +14,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod content_packs;
+mod downloads;
 
 use std::cmp::Ordering as VersionOrdering;
 use std::io::{Read, Write};
+use std::ops::RangeInclusive;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,6 +27,9 @@ use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
 use content_packs::{ContentPackCatalog, ContentPackRelease, GAME_DEPENDENCY_ID};
+use downloads::{
+    clear_cache, clear_download_metadata, download_to_path, known_download_size, DownloadSpec,
+};
 use rebellion2_update_core::FileEntry;
 #[cfg(target_os = "windows")]
 use rebellion2_update_core::Plan;
@@ -249,6 +254,7 @@ enum Pending {
         base: String,
         latest: Latest,
         finishes_application_update: bool,
+        progress_start: u8,
         release_notes: Option<ReleaseNotes>,
     },
 }
@@ -546,11 +552,13 @@ fn on_gate_result(
                 base,
                 latest,
                 finishes_application_update,
+                progress_start,
                 release_notes,
             }) => Some((
                 base.clone(),
                 latest.clone(),
                 *finishes_application_update,
+                *progress_start,
                 release_notes.clone(),
             )),
             _ => None,
@@ -597,21 +605,33 @@ fn resume_after_gate(handle: &tauri::AppHandle) {
                 base,
                 latest,
                 finishes_application_update,
+                progress_start,
                 release_notes,
             }) => Some((
                 base.clone(),
                 latest.clone(),
                 *finishes_application_update,
+                *progress_start,
                 release_notes.clone(),
             )),
             _ => None,
         }
     };
 
-    if let Some((base, latest, finishes_application_update, release_notes)) = pending_update {
+    if let Some((base, latest, finishes_application_update, progress_start, release_notes)) =
+        pending_update
+    {
         show_progress_ui_with_release_notes(handle, release_notes.as_ref());
         let handle = handle.clone();
-        thread::spawn(move || run_update(&handle, &base, &latest, finishes_application_update));
+        thread::spawn(move || {
+            run_update(
+                &handle,
+                &base,
+                &latest,
+                finishes_application_update,
+                progress_start,
+            )
+        });
     } else {
         show_status_page(handle);
         let handle = handle.clone();
@@ -737,13 +757,20 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 base,
                 latest,
                 finishes_application_update,
+                progress_start,
                 release_notes,
             }) = pending
             {
                 show_progress_ui_with_release_notes(handle, release_notes.as_ref());
                 let handle = handle.clone();
                 thread::spawn(move || {
-                    run_update(&handle, &base, &latest, finishes_application_update)
+                    run_update(
+                        &handle,
+                        &base,
+                        &latest,
+                        finishes_application_update,
+                        progress_start,
+                    )
                 });
             }
         }
@@ -937,10 +964,11 @@ fn start_launcher_update(handle: &tauri::AppHandle) {
         }
         Err(error) => {
             log_line(&format!("[launcher] launcher update failed: {error}"));
-            show_message(
+            show_retryable_failure(
                 &handle,
                 "Update failed",
-                "The launcher update failed — see launcher.log.",
+                "The launcher update was interrupted. Any download progress was saved.",
+                "launcher-update",
                 Some(("Continue", "skip-launcher-update")),
             );
         }
@@ -958,12 +986,17 @@ fn do_launcher_update(
     verify_signed_manifest(&manifest_bytes, &layer.signature)?;
     let manifest = Manifest::from_json(&manifest_bytes)?;
     let (launcher_entry, helper_entry) = validate_launcher_manifest(&manifest, &update.version)?;
-    let blobs = PublicHttpBlobs {
-        base: format!("{base}{}", layer.blobs),
-    };
+    let blobs = HttpBlobs::new(
+        format!("{base}{}", layer.blobs),
+        None,
+        handle,
+        launcher_entry.size.saturating_add(helper_entry.size),
+        10..=95,
+        "Downloading launcher update",
+        "launcher",
+    )?;
     update_progress(handle, 10, "Downloading launcher update…");
     let launcher = fetch_verified_blob(&blobs, launcher_entry)?;
-    update_progress(handle, 60, "Downloading launcher helper…");
     let helper = fetch_verified_blob(&blobs, helper_entry)?;
     let metadata_dir = install_dir()?;
     write_executable(&metadata_dir.join(UPDATE_HELPER_FILE_NAME), &helper)?;
@@ -976,15 +1009,16 @@ fn do_launcher_update(
         metadata_dir.join(PENDING_LAUNCHER_VERSION_FILE),
         &update.version,
     )?;
+    blobs.clear_cache();
     Ok(())
 }
 
 /// Fetches one content-addressed executable and verifies its declared hash.
 fn fetch_verified_blob(
-    blobs: &PublicHttpBlobs,
+    blobs: &HttpBlobs,
     entry: &FileEntry,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let bytes = blobs.fetch(&entry.sha256)?;
+    let bytes = blobs.fetch(entry)?;
     if sha256_hex(&bytes) != entry.sha256 {
         return Err(format!("{} does not match its signed hash", entry.path).into());
     }
@@ -1152,16 +1186,18 @@ fn run_game_update(handle: &tauri::AppHandle, update: &GameUpdate) {
                 base: base.clone(),
                 latest: update.content.clone(),
                 finishes_application_update: false,
+                progress_start: 50,
                 release_notes,
             });
-            run_update(handle, &base, &update.content, false);
+            run_update(handle, &base, &update.content, false, 50);
         }
         Err(error) => {
             log_line(&format!("[launcher] game update failed: {error}"));
-            show_message(
+            show_retryable_failure(
                 handle,
                 "Update failed",
-                "The game update failed — see launcher.log.",
+                "The game update was interrupted. Any download progress was saved.",
+                "game-update",
                 Some(("Continue", "skip-game-update")),
             );
         }
@@ -1180,9 +1216,6 @@ fn do_game_update(
     let remote = Manifest::from_json(&manifest_bytes)?;
     validate_game_manifest(&remote, &update.version)?;
     let metadata_dir = install_dir()?;
-    let blobs = PublicHttpBlobs {
-        base: format!("{base}{}", layer.blobs),
-    };
 
     #[cfg(target_os = "macos")]
     let changed = {
@@ -1192,6 +1225,15 @@ fn do_game_update(
             5,
             &format!("Updating game… {}", human_bytes(archive.size)),
         );
+        let blobs = HttpBlobs::new(
+            format!("{base}{}", layer.blobs),
+            None,
+            handle,
+            archive.size,
+            5..=48,
+            "Updating game",
+            "game",
+        )?;
         let bytes = fetch_verified_blob(&blobs, archive)?;
         install_macos_game_archive(&bytes)?;
         1
@@ -1209,6 +1251,15 @@ fn do_game_update(
             &format!("Updating game… {}", human_bytes(plan.download_size())),
         );
         let changed = plan.changed.len();
+        let blobs = HttpBlobs::new(
+            format!("{base}{}", layer.blobs),
+            None,
+            handle,
+            plan.download_size(),
+            5..=48,
+            "Updating game",
+            "game",
+        )?;
         apply(&plan, &game_dir, &blobs)?;
         #[cfg(target_os = "windows")]
         {
@@ -1232,6 +1283,7 @@ fn do_game_update(
 
     fs::write(metadata_dir.join(GAME_MANIFEST_FILE), manifest_bytes)?;
     fs::write(metadata_dir.join(GAME_VERSION_FILE), &update.version)?;
+    clear_download_cache("game");
     Ok(changed)
 }
 
@@ -1389,6 +1441,7 @@ fn is_launcher_metadata_path(path: &Path) -> bool {
             | ".rebellion2-launcher.next.exe"
             | ".rebellion2-launcher.next"
             | ".rebellion2-launcher.next.appimage"
+            | ".download-cache"
             | ".session"
             | "launcher.log"
     )
@@ -1631,9 +1684,10 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
                 base: base.clone(),
                 latest: latest.clone(),
                 finishes_application_update: true,
+                progress_start: 50,
                 release_notes,
             });
-            run_update(handle, &base, &latest, true);
+            run_update(handle, &base, &latest, true, 50);
         }
         Err(error) => {
             clear_approved_content_update();
@@ -1840,17 +1894,19 @@ fn run_windows_application_update(handle: &tauri::AppHandle, update: &Applicatio
                 base: base.clone(),
                 latest: latest.clone(),
                 finishes_application_update: true,
+                progress_start: 50,
                 release_notes,
             });
-            run_update(handle, &base, &latest, true);
+            run_update(handle, &base, &latest, true, 50);
         }
         Err(error) => {
             clear_approved_content_update();
             log_line(&format!("[launcher] application update failed: {error}"));
-            show_message(
+            show_retryable_failure(
                 handle,
                 "Update failed",
-                "The application update failed — see launcher.log.",
+                "The application update was interrupted. Any download progress was saved.",
+                "application-update",
                 Some(("Continue", "skip-application-update")),
             );
         }
@@ -1884,9 +1940,15 @@ fn do_application_update(
         ),
     );
 
-    let blobs = PublicHttpBlobs {
-        base: format!("{base}{}", update.blobs),
-    };
+    let blobs = HttpBlobs::new(
+        format!("{base}{}", update.blobs),
+        None,
+        handle,
+        plan.download_size(),
+        5..=48,
+        "Updating application",
+        "application",
+    )?;
     let launcher_entry = plan
         .changed
         .iter()
@@ -1910,7 +1972,7 @@ fn do_application_update(
 
     let launcher_changed = launcher_entry.is_some();
     if let Some(entry) = launcher_entry {
-        let bytes = blobs.fetch(&entry.sha256)?;
+        let bytes = blobs.fetch(&entry)?;
         if sha256_hex(&bytes) != entry.sha256 {
             return Err("staged launcher hash does not match the manifest".into());
         }
@@ -1924,6 +1986,7 @@ fn do_application_update(
         install_dir.join(PENDING_APPLICATION_VERSION_FILE),
         &update.version,
     )?;
+    blobs.clear_cache();
     update_progress(
         handle,
         48,
@@ -2116,23 +2179,6 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .into_reader()
         .read_to_end(&mut bytes)?;
     Ok(bytes)
-}
-
-/// Public application blob source. Manifest signatures authenticate every expected
-/// blob hash before this source is used.
-struct PublicHttpBlobs {
-    base: String,
-}
-
-impl BlobSource for PublicHttpBlobs {
-    fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
-        let response = ureq::get(&format!("{}{}", self.base, sha256))
-            .call()
-            .map_err(io::Error::other)?;
-        let mut bytes = Vec::new();
-        response.into_reader().read_to_end(&mut bytes)?;
-        Ok(bytes)
-    }
 }
 
 /// Starts the installed helper outside the launcher process so it can promote the
@@ -2358,6 +2404,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
         base: base.to_string(),
         latest: latest.clone(),
         finishes_application_update: false,
+        progress_start: 5,
         release_notes: release_notes.clone(),
     });
 
@@ -2370,7 +2417,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
     let handle = handle.clone();
     let base = base.to_string();
     let latest = latest.clone();
-    thread::spawn(move || run_update(&handle, &base, &latest, false));
+    thread::spawn(move || run_update(&handle, &base, &latest, false, 5));
 }
 
 /// Requests authorization when necessary, then computes the update size and prompts.
@@ -2381,6 +2428,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
         base: base.to_string(),
         latest: latest.clone(),
         finishes_application_update: false,
+        progress_start: 5,
         release_notes: release_notes.clone(),
     });
 
@@ -2593,8 +2641,15 @@ fn run_update(
     base: &str,
     latest: &Latest,
     finishes_application_update: bool,
+    progress_start: u8,
 ) {
-    match do_update(handle, base, latest, finishes_application_update) {
+    match do_update(
+        handle,
+        base,
+        latest,
+        finishes_application_update,
+        u64::from(progress_start),
+    ) {
         Ok(fetched) => {
             log_line(&format!(
                 "[launcher] update to {} complete ({fetched} files).",
@@ -2617,10 +2672,12 @@ fn run_update(
             // A missing manifest/blob during an update means the channel is
             // unreachable or misconfigured — NOT that this version is retired.
             log_line("[launcher] update content unavailable (404 from channel).");
-            update_progress(
+            show_retryable_failure(
                 handle,
-                0,
-                "Update failed — content unavailable. Please try again later.",
+                "Update unavailable",
+                "The update could not be downloaded. Please try again later.",
+                "update",
+                None,
             );
         }
         Err(err) if is_authorization_required(err.as_ref()) => {
@@ -2638,7 +2695,13 @@ fn run_update(
                 clear_approved_content_update();
             }
             log_line(&format!("[launcher] update failed: {err}"));
-            update_progress(handle, 0, "Update failed — see launcher.log");
+            show_retryable_failure(
+                handle,
+                "Update interrupted",
+                "Download progress was saved. Check your connection, then retry.",
+                "update",
+                None,
+            );
         }
     }
 }
@@ -2657,6 +2720,7 @@ fn do_update(
     base: &str,
     latest: &Latest,
     finishes_application_update: bool,
+    progress_start: u64,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let content_dir = install_dir()?.join("Content");
     let token = SESSION.lock().unwrap().clone();
@@ -2665,7 +2729,6 @@ fn do_update(
     } else {
         "Checking what changed…"
     };
-    let progress_start = if finishes_application_update { 50 } else { 5 };
     update_progress(handle, progress_start, checking_label);
 
     let remote: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
@@ -2695,24 +2758,29 @@ fn do_update(
     } else {
         format!("Downloading {changed} files, {}", human_bytes(bytes))
     };
-    update_progress(handle, 5, &download_label);
+    update_progress(handle, progress_start, &download_label);
 
-    let blobs = HttpBlobs {
-        base: format!("{base}{}", latest.blobs),
-        token,
-        handle: handle.clone(),
-        total: bytes,
-        done: AtomicU64::new(0),
-        progress_start,
-        progress_end: 95,
-        application_update: finishes_application_update,
+    let progress_label = if finishes_application_update {
+        "Updating game content"
+    } else {
+        "Downloading update"
     };
+    let blobs = HttpBlobs::new(
+        format!("{base}{}", latest.blobs),
+        token,
+        handle,
+        bytes,
+        progress_start..=95,
+        progress_label,
+        "content",
+    )?;
     apply(&plan, &content_dir, &blobs)?;
     store_manifest_and_version(&content_dir, &remote, &latest.version)?;
+    blobs.clear_cache();
     Ok(changed)
 }
 
-/// Token-authenticated blob source with cumulative download progress.
+/// HTTP blob source with persistent partial files and cumulative download progress.
 struct HttpBlobs {
     base: String,
     token: Option<String>,
@@ -2721,73 +2789,103 @@ struct HttpBlobs {
     done: AtomicU64,
     progress_start: u64,
     progress_end: u64,
-    application_update: bool,
+    progress_label: String,
+    cache_dir: PathBuf,
 }
+
+impl HttpBlobs {
+    /// Creates one resumable source for a signed update layer.
+    fn new(
+        base: String,
+        token: Option<String>,
+        handle: &tauri::AppHandle,
+        total: u64,
+        progress_range: RangeInclusive<u64>,
+        progress_label: &str,
+        cache_name: &str,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            base,
+            token,
+            handle: handle.clone(),
+            total,
+            done: AtomicU64::new(0),
+            progress_start: *progress_range.start(),
+            progress_end: *progress_range.end(),
+            progress_label: progress_label.to_string(),
+            cache_dir: download_cache_dir(cache_name)?,
+        })
+    }
+
+    /// Removes cached blobs only after the complete layer is committed.
+    fn clear_cache(&self) {
+        clear_committed_download_cache(&self.cache_dir);
+    }
+}
+
 impl BlobSource for HttpBlobs {
-    fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
-        let url = format!("{}{sha256}", self.base);
-        let mut request = ureq::get(&url);
-        if let Some(token) = &self.token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
-        }
-        let response = match request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status @ (401 | 403), _)) => {
-                log_line(&download_failure_log_message(
-                    &url,
-                    &format!("HTTP {status}"),
+    fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
+        let url = format!("{}{}", self.base, entry.sha256);
+        let authorization = self.token.as_ref().map(|token| format!("Bearer {token}"));
+        let destination = self.cache_dir.join(&entry.sha256);
+        let mut reported = 0_u64;
+        let mut last_percent = u64::MAX;
+        let result = download_to_path(
+            &DownloadSpec {
+                url: &url,
+                authorization: authorization.as_deref(),
+                destination: &destination,
+                expected_size: Some(entry.size),
+                expected_sha256: Some(&entry.sha256),
+            },
+            |downloaded| {
+                let added = downloaded.saturating_sub(reported);
+                reported = reported.max(downloaded);
+                let done = self.done.fetch_add(added, Ordering::Relaxed) + added;
+                let percent = done
+                    .saturating_mul(self.progress_end.saturating_sub(self.progress_start))
+                    .checked_div(self.total)
+                    .map(|percent| (self.progress_start + percent).min(self.progress_end))
+                    .unwrap_or(self.progress_start);
+                if percent != last_percent {
+                    last_percent = percent;
+                    update_progress(
+                        &self.handle,
+                        percent,
+                        &format!(
+                            "{}… {} / {}",
+                            self.progress_label,
+                            human_bytes(done),
+                            human_bytes(self.total)
+                        ),
+                    );
+                }
+            },
+            |attempt, delay, error| {
+                log_line(&format!(
+                    "[launcher] download interrupted ({error}); retrying attempt {attempt} in {}s.",
+                    delay.as_secs()
                 ));
+                update_status(
+                    &self.handle,
+                    &format!(
+                        "Connection interrupted. Resuming in {} seconds…",
+                        delay.as_secs()
+                    ),
+                );
+            },
+        );
+        if let Err(error) = result {
+            log_line(&download_failure_log_message(&url, &error.to_string()));
+            if matches!(error.status(), Some(401 | 403)) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     AuthorizationRequired,
                 ));
             }
-            Err(other) => {
-                let reason = match &other {
-                    ureq::Error::Status(status, _) => format!("HTTP {status}"),
-                    _ => "connection failed".to_string(),
-                };
-                log_line(&download_failure_log_message(&url, &reason));
-                return Err(io::Error::other(other.to_string()));
-            }
-        };
-        // Stream in chunks so the progress bar fills smoothly through a large
-        // file, updating only when the whole-percent changes (≈90 evals total).
-        let mut reader = response.into_reader();
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 65536];
-        let mut last_percent = u64::MAX;
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buf[..n]);
-            let done = self.done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-            let percent = done
-                .saturating_mul(self.progress_end.saturating_sub(self.progress_start))
-                .checked_div(self.total)
-                .map(|percent| (self.progress_start + percent).min(self.progress_end))
-                .unwrap_or(self.progress_start);
-            if percent != last_percent {
-                last_percent = percent;
-                let label = if self.application_update {
-                    format!(
-                        "Updating game content… {} / {}",
-                        human_bytes(done),
-                        human_bytes(self.total)
-                    )
-                } else {
-                    format!(
-                        "Downloading update… {} / {}",
-                        human_bytes(done),
-                        human_bytes(self.total)
-                    )
-                };
-                update_progress(&self.handle, percent, &label);
-            }
+            return Err(error.into_io_error());
         }
-        Ok(bytes)
+        fs::read(destination)
     }
 }
 
@@ -2829,7 +2927,12 @@ fn start_install(handle: tauri::AppHandle, url: String) {
         }
         Err(err) => {
             log_line(&format!("[launcher] failed to install Content: {err}"));
-            update_progress(&handle, 0, "Download failed — see launcher.log");
+            show_message(
+                &handle,
+                "Download interrupted",
+                "Your download progress was saved. Check your connection, then retry.",
+                Some(("Retry", "signin")),
+            );
         }
     });
 }
@@ -3755,29 +3858,27 @@ fn install_content_pack(
         5,
         &format!("Downloading {} · {}", pack.name, human_bytes(bytes)),
     );
-    let blobs = HttpBlobs {
-        base: format!("{base}{}", pack.blobs),
-        token: None,
-        handle: handle.clone(),
-        total: bytes,
-        done: AtomicU64::new(0),
-        progress_start: 5,
-        progress_end: 95,
-        application_update: false,
-    };
+    let progress_label = format!("Downloading {}", pack.name);
+    let blobs = HttpBlobs::new(
+        format!("{base}{}", pack.blobs),
+        None,
+        handle,
+        bytes,
+        5..=95,
+        &progress_label,
+        "content-packs",
+    )?;
     if installed.is_none() {
-        return Ok(content_packs::install_fresh(
-            &install_root,
-            pack,
-            &remote,
-            &blobs,
-        )?);
+        let changed = content_packs::install_fresh(&install_root, pack, &remote, &blobs)?;
+        blobs.clear_cache();
+        return Ok(changed);
     }
     apply(&plan, &pack_directory, &blobs)?;
     if !verify_install(&pack_directory, &remote)? {
         return Err("content-pack verification failed after installation".into());
     }
     content_packs::write_install(&install_root, pack, &remote)?;
+    blobs.clear_cache();
     Ok(changed)
 }
 
@@ -3884,7 +3985,7 @@ fn remove_empty_directories(directory: &Path) -> io::Result<bool> {
 struct EmptyBlobs;
 
 impl BlobSource for EmptyBlobs {
-    fn fetch(&self, _sha256: &str) -> io::Result<Vec<u8>> {
+    fn fetch(&self, _entry: &FileEntry) -> io::Result<Vec<u8>> {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             "a removal plan cannot download files",
@@ -4195,6 +4296,34 @@ fn show_message(
     write_screen(handle, &render(kicker, false, status, &btn));
 }
 
+/// Shows a failed operation with a primary retry and an optional secondary action.
+fn show_retryable_failure(
+    handle: &tauri::AppHandle,
+    kicker: &str,
+    status: &str,
+    retry_choice: &str,
+    secondary_action: Option<(&str, &str)>,
+) {
+    write_screen(
+        handle,
+        &retryable_failure_screen(kicker, status, retry_choice, secondary_action),
+    );
+}
+
+/// Builds a failed-operation screen with a primary retry and optional secondary action.
+fn retryable_failure_screen(
+    kicker: &str,
+    status: &str,
+    retry_choice: &str,
+    secondary_action: Option<(&str, &str)>,
+) -> String {
+    let mut actions = button("Retry", retry_choice);
+    if let Some((label, choice)) = secondary_action {
+        actions.push_str(&secondary_button(label, choice));
+    }
+    render(kicker, false, status, &actions)
+}
+
 fn show_progress_ui(handle: &tauri::AppHandle) {
     write_screen(handle, &progress_screen(None));
     update_progress(handle, 0, "Preparing update\u{2026}");
@@ -4281,6 +4410,31 @@ fn install_dir() -> io::Result<PathBuf> {
     Ok(directory)
 }
 
+/// Returns one layer-specific directory for verified resumable downloads.
+fn download_cache_dir(layer: &str) -> io::Result<PathBuf> {
+    Ok(install_dir()?.join(".download-cache").join(layer))
+}
+
+/// Removes one committed layer's download cache without invalidating the completed update.
+fn clear_download_cache(layer: &str) {
+    match download_cache_dir(layer) {
+        Ok(directory) => clear_committed_download_cache(&directory),
+        Err(error) => log_line(&format!(
+            "[launcher] unable to locate committed {layer} download cache: {error}"
+        )),
+    }
+}
+
+/// Removes expendable cached downloads after their update layer has committed.
+fn clear_committed_download_cache(directory: &Path) {
+    if let Err(error) = clear_cache(directory) {
+        log_line(&format!(
+            "[launcher] unable to clear committed download cache {}: {error}",
+            directory.display()
+        ));
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn macos_data_dir(home: &Path) -> PathBuf {
     home.join("Library")
@@ -4362,55 +4516,72 @@ fn install_content(
     url: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let base = install_dir()?;
-    let archive_path = base.join("content.zip.part");
+    let archive_path = base.join("content.zip");
     let content_dir = base.join("Content");
 
     log_line("[launcher] downloading Content…");
-    let response = match ureq::get(url).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Err(Box::new(ContentUnavailable)),
-        Err(other) => return Err(Box::new(other)),
-    };
-    let total: u64 = response
-        .header("Content-Length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(&archive_path)?;
-    let mut buffer = vec![0u8; 1 << 20];
     let gib = (1u64 << 30) as f64;
     let mib = (1u64 << 20) as f64;
-    let total_gb = total as f64 / gib;
     let mut downloaded: u64 = 0;
     let mut last_report: u64 = 0;
     let mut last_time = Instant::now();
     let mut last_bytes: u64 = 0;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read])?;
-        downloaded += read as u64;
-        if downloaded - last_report >= 20 * (1 << 20) {
+    let mut progress_initialized = false;
+    let result = download_to_path(
+        &DownloadSpec {
+            url,
+            authorization: None,
+            destination: &archive_path,
+            expected_size: None,
+            expected_sha256: None,
+        },
+        |current| {
+            if !progress_initialized {
+                progress_initialized = true;
+                downloaded = current;
+                last_report = current;
+                last_bytes = current;
+                last_time = Instant::now();
+                let total = known_download_size(&archive_path).unwrap_or(0);
+                let percent = current.saturating_mul(100).checked_div(total).unwrap_or(0);
+                if current > 0 {
+                    update_progress(
+                        handle,
+                        percent,
+                        &format!("Resuming Content… {:.2} GB", current as f64 / gib),
+                    );
+                }
+                return;
+            }
+            if current < downloaded {
+                downloaded = current;
+                last_report = current;
+                last_bytes = current;
+                last_time = Instant::now();
+                return;
+            }
+            downloaded = current;
+            if downloaded.saturating_sub(last_report) < 20 * (1 << 20) {
+                return;
+            }
             last_report = downloaded;
             let now = Instant::now();
             let elapsed = now.duration_since(last_time).as_secs_f64();
             let speed = if elapsed > 0.0 {
-                (downloaded - last_bytes) as f64 / mib / elapsed
+                downloaded.saturating_sub(last_bytes) as f64 / mib / elapsed
             } else {
                 0.0
             };
             last_time = now;
             last_bytes = downloaded;
+            let total = known_download_size(&archive_path).unwrap_or(0);
             let gb = downloaded as f64 / gib;
             let pct = downloaded
                 .saturating_mul(100)
                 .checked_div(total)
                 .unwrap_or(0);
             let amount = if total > 0 {
-                format!("{gb:.2} / {total_gb:.2} GB")
+                format!("{gb:.2} / {:.2} GB", total as f64 / gib)
             } else {
                 format!("{gb:.2} GB")
             };
@@ -4419,10 +4590,27 @@ fn install_content(
                 pct,
                 &format!("Downloading Content… {amount} — {speed:.1} MB/s"),
             );
+        },
+        |attempt, delay, error| {
+            log_line(&format!(
+                "[launcher] Content download interrupted ({error}); retrying attempt {attempt} in {}s.",
+                delay.as_secs()
+            ));
+            update_status(
+                handle,
+                &format!(
+                    "Connection interrupted. Resuming in {} seconds…",
+                    delay.as_secs()
+                ),
+            );
+        },
+    );
+    if let Err(error) = result {
+        if error.status() == Some(404) {
+            return Err(Box::new(ContentUnavailable));
         }
+        return Err(Box::new(error));
     }
-    file.sync_all()?;
-    drop(file);
     update_progress(handle, 100, "Extracting Content…");
 
     prepare_content_directory_for_install(&content_dir)?;
@@ -4433,6 +4621,11 @@ fn install_content(
         fs::write(content_dir.join(CONTENT_VERSION_FILE), version)?;
     }
     let _ = fs::remove_file(&archive_path);
+    if let Err(error) = clear_download_metadata(&archive_path) {
+        log_line(&format!(
+            "[launcher] unable to clear completed Content download metadata: {error}"
+        ));
+    }
     Ok(content_dir)
 }
 
@@ -4676,6 +4869,20 @@ mod tests {
         assert!(screen.contains("choice=content-packs\">Retry</a>"));
         assert!(!screen.contains("choice=content-packs\">Back</a>"));
         assert!(screen.contains("Missing manifest"));
+    }
+
+    #[test]
+    fn retryable_failure_screen_separates_retry_from_continue() {
+        let screen = retryable_failure_screen(
+            "Update failed",
+            "Any download progress was saved.",
+            "game-update",
+            Some(("Continue", "skip-game-update")),
+        );
+
+        assert!(screen.contains("choice=game-update\">Retry</a>"));
+        assert!(screen.contains("choice=skip-game-update\">Continue</a>"));
+        assert!(!screen.contains("choice=skip-game-update\">Retry</a>"));
     }
 
     #[test]
@@ -5166,6 +5373,13 @@ mod tests {
     #[test]
     fn game_manifest_with_launcher_metadata_returns_error() {
         let manifest = application_manifest("0.0.26", &[".launcher-version"]);
+
+        assert!(validate_game_manifest(&manifest, "0.0.26").is_err());
+    }
+
+    #[test]
+    fn game_manifest_with_download_cache_returns_error() {
+        let manifest = application_manifest("0.0.26", &[".download-cache/game/blob"]);
 
         assert!(validate_game_manifest(&manifest, "0.0.26").is_err());
     }

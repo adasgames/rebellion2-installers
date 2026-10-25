@@ -139,7 +139,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Where blob bytes come from, keyed by their SHA-256. The launcher supplies an
 /// HTTP-backed impl; tests supply an in-memory or local-dir impl.
 pub trait BlobSource {
-    fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>>;
+    fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>>;
 }
 
 /// Apply a plan under `install_dir`. Every fetched blob is hash-checked before
@@ -150,7 +150,7 @@ pub trait BlobSource {
 pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Result<usize> {
     validate_plan_paths(plan)?;
     for entry in &plan.changed {
-        let bytes = blobs.fetch(&entry.sha256)?;
+        let bytes = blobs.fetch(entry)?;
         let actual = sha256_hex(&bytes);
         if actual != entry.sha256 {
             return Err(io::Error::new(
@@ -272,11 +272,11 @@ mod tests {
     /// In-memory blob store keyed by hash — stands in for remote/local blobs.
     struct MemBlobs(HashMap<String, Vec<u8>>);
     impl BlobSource for MemBlobs {
-        fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
+        fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
             self.0
-                .get(sha256)
+                .get(&entry.sha256)
                 .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, sha256.to_string()))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, entry.sha256.clone()))
         }
     }
 

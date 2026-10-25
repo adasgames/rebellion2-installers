@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 /// Blobs read from a local `blobs/<sha256>` directory (stands in for remote object storage).
 struct DirBlobs(PathBuf);
 impl BlobSource for DirBlobs {
-    fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
-        fs::read(self.0.join(sha256))
+    fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
+        fs::read(self.0.join(&entry.sha256))
     }
 }
 

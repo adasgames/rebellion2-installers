@@ -574,15 +574,15 @@ mod tests {
     }
 
     impl BlobSource for TestBlobs {
-        fn fetch(&self, sha256: &str) -> io::Result<Vec<u8>> {
-            if self.fail_on.as_deref() == Some(sha256) {
+        fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
+            if self.fail_on.as_deref() == Some(entry.sha256.as_str()) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     "interrupted",
                 ));
             }
             self.values
-                .get(sha256)
+                .get(&entry.sha256)
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing blob"))
         }
