@@ -991,11 +991,11 @@ fn do_launcher_update(
         None,
         handle,
         launcher_entry.size.saturating_add(helper_entry.size),
-        10..=95,
+        0..=95,
         "Downloading launcher update",
         "launcher",
     )?;
-    update_progress(handle, 10, "Downloading launcher update…");
+    update_status(handle, "Downloading launcher update…");
     let launcher = fetch_verified_blob(&blobs, launcher_entry)?;
     let helper = fetch_verified_blob(&blobs, helper_entry)?;
     let metadata_dir = install_dir()?;
@@ -1167,11 +1167,12 @@ fn start_game_update(handle: &tauri::AppHandle) {
 /// Applies a signed game-player layer before updating its matching protected content.
 fn run_game_update(handle: &tauri::AppHandle, update: &GameUpdate) {
     match do_game_update(handle, update) {
-        Ok(changed) => {
+        Ok((changed, download_size)) => {
             log_line(&format!(
                 "[launcher] game update to {} complete ({changed} files).",
                 update.version
             ));
+            let progress_start = if download_size > 0 { 48 } else { 0 };
             let Some(base) = content_base() else {
                 show_message(
                     handle,
@@ -1186,10 +1187,10 @@ fn run_game_update(handle: &tauri::AppHandle, update: &GameUpdate) {
                 base: base.clone(),
                 latest: update.content.clone(),
                 finishes_application_update: false,
-                progress_start: 50,
+                progress_start,
                 release_notes,
             });
-            run_update(handle, &base, &update.content, false, 50);
+            run_update(handle, &base, &update.content, false, progress_start);
         }
         Err(error) => {
             log_line(&format!("[launcher] game update failed: {error}"));
@@ -1208,7 +1209,7 @@ fn run_game_update(handle: &tauri::AppHandle, update: &GameUpdate) {
 fn do_game_update(
     handle: &tauri::AppHandle,
     update: &GameUpdate,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
     let layer = game_layer(update).ok_or("game release does not support this platform")?;
     let base = content_base().ok_or("game update channel is not configured")?;
     let manifest_bytes = fetch_bytes(&format!("{base}{}", layer.manifest))?;
@@ -1218,11 +1219,10 @@ fn do_game_update(
     let metadata_dir = install_dir()?;
 
     #[cfg(target_os = "macos")]
-    let changed = {
+    let (changed, download_size) = {
         let archive = validate_macos_game_archive_manifest(&remote)?;
-        update_progress(
+        update_status(
             handle,
-            5,
             &format!("Updating game… {}", human_bytes(archive.size)),
         );
         let blobs = HttpBlobs::new(
@@ -1230,33 +1230,33 @@ fn do_game_update(
             None,
             handle,
             archive.size,
-            5..=48,
+            0..=48,
             "Updating game",
             "game",
         )?;
         let bytes = fetch_verified_blob(&blobs, archive)?;
         install_macos_game_archive(&bytes)?;
-        1
+        (1, archive.size)
     };
 
     #[cfg(not(target_os = "macos"))]
-    let changed = {
+    let (changed, download_size) = {
         let game_dir = install_dir()?;
         let local = read_game_manifest(&metadata_dir)
             .unwrap_or(snapshot_application_files(&game_dir, &remote)?);
         let plan = diff(Some(&local), &remote);
-        update_progress(
+        let download_size = plan.download_size();
+        update_status(
             handle,
-            5,
-            &format!("Updating game… {}", human_bytes(plan.download_size())),
+            &format!("Updating game… {}", human_bytes(download_size)),
         );
         let changed = plan.changed.len();
         let blobs = HttpBlobs::new(
             format!("{base}{}", layer.blobs),
             None,
             handle,
-            plan.download_size(),
-            5..=48,
+            download_size,
+            0..=48,
             "Updating game",
             "game",
         )?;
@@ -1278,13 +1278,13 @@ fn do_game_update(
                 ensure_executable(&crash_handler)?;
             }
         }
-        changed
+        (changed, download_size)
     };
 
     fs::write(metadata_dir.join(GAME_MANIFEST_FILE), manifest_bytes)?;
     fs::write(metadata_dir.join(GAME_VERSION_FILE), &update.version)?;
     clear_download_cache("game");
-    Ok(changed)
+    Ok((changed, download_size))
 }
 
 /// Validates the single signed archive used for macOS game replacement.
@@ -1660,9 +1660,8 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
                 downloaded = downloaded.saturating_add(chunk_size as u64);
                 let percent = content_length
                     .filter(|total| *total > 0)
-                    .map(|total| 5 + downloaded.saturating_mul(40) / total)
-                    .unwrap_or(5)
-                    .min(45);
+                    .map(|total| scaled_download_percent(downloaded, total, 0, 48))
+                    .unwrap_or(0);
                 update_progress(
                     &progress_handle,
                     percent,
@@ -1684,10 +1683,10 @@ async fn run_macos_application_update(handle: &tauri::AppHandle) {
                 base: base.clone(),
                 latest: latest.clone(),
                 finishes_application_update: true,
-                progress_start: 50,
+                progress_start: 48,
                 release_notes,
             });
-            run_update(handle, &base, &latest, true, 50);
+            run_update(handle, &base, &latest, true, 48);
         }
         Err(error) => {
             clear_approved_content_update();
@@ -1884,20 +1883,21 @@ fn run_windows_application_update(handle: &tauri::AppHandle, update: &Applicatio
     };
 
     match do_application_update(handle, update) {
-        Ok(changed) => {
+        Ok((changed, download_size)) => {
             log_line(&format!(
                 "[launcher] application update to {} staged ({changed} files).",
                 update.version
             ));
+            let progress_start = if download_size > 0 { 48 } else { 0 };
             let release_notes = fetch_release_notes(&base, &latest);
             *PENDING.lock().unwrap() = Some(Pending::Update {
                 base: base.clone(),
                 latest: latest.clone(),
                 finishes_application_update: true,
-                progress_start: 50,
+                progress_start,
                 release_notes,
             });
-            run_update(handle, &base, &latest, true, 50);
+            run_update(handle, &base, &latest, true, progress_start);
         }
         Err(error) => {
             clear_approved_content_update();
@@ -1919,7 +1919,7 @@ fn run_windows_application_update(handle: &tauri::AppHandle, update: &Applicatio
 fn do_application_update(
     handle: &tauri::AppHandle,
     update: &ApplicationUpdate,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
     let base = content_base().ok_or("application update channel is not configured")?;
     let manifest_bytes = fetch_bytes(&format!("{base}{}", update.manifest))?;
     verify_signed_manifest(&manifest_bytes, &update.signature)?;
@@ -1931,21 +1931,18 @@ fn do_application_update(
     let local = read_application_manifest(&install_dir)
         .unwrap_or(snapshot_application_files(&install_dir, &remote)?);
     let plan = diff(Some(&local), &remote);
-    update_progress(
+    let download_size = plan.download_size();
+    update_status(
         handle,
-        5,
-        &format!(
-            "Updating application… {}",
-            human_bytes(plan.download_size())
-        ),
+        &format!("Updating application… {}", human_bytes(download_size)),
     );
 
     let blobs = HttpBlobs::new(
         format!("{base}{}", update.blobs),
         None,
         handle,
-        plan.download_size(),
-        5..=48,
+        download_size,
+        0..=48,
         "Updating application",
         "application",
     )?;
@@ -1987,12 +1984,8 @@ fn do_application_update(
         &update.version,
     )?;
     blobs.clear_cache();
-    update_progress(
-        handle,
-        48,
-        "Application files ready. Updating game content…",
-    );
-    Ok(changed + usize::from(launcher_changed))
+    update_status(handle, "Application files ready. Updating game content…");
+    Ok((changed + usize::from(launcher_changed), download_size))
 }
 
 /// Verifies that an executable-update manifest was signed by the release pipeline.
@@ -2404,7 +2397,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
         base: base.to_string(),
         latest: latest.clone(),
         finishes_application_update: false,
-        progress_start: 5,
+        progress_start: 0,
         release_notes: release_notes.clone(),
     });
 
@@ -2417,7 +2410,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
     let handle = handle.clone();
     let base = base.to_string();
     let latest = latest.clone();
-    thread::spawn(move || run_update(&handle, &base, &latest, false, 5));
+    thread::spawn(move || run_update(&handle, &base, &latest, false, 0));
 }
 
 /// Requests authorization when necessary, then computes the update size and prompts.
@@ -2428,7 +2421,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
         base: base.to_string(),
         latest: latest.clone(),
         finishes_application_update: false,
-        progress_start: 5,
+        progress_start: 0,
         release_notes: release_notes.clone(),
     });
 
@@ -2729,7 +2722,7 @@ fn do_update(
     } else {
         "Checking what changed…"
     };
-    update_progress(handle, progress_start, checking_label);
+    update_status(handle, checking_label);
 
     let remote: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
     validate_base_content_manifest(&remote)?;
@@ -2758,7 +2751,7 @@ fn do_update(
     } else {
         format!("Downloading {changed} files, {}", human_bytes(bytes))
     };
-    update_progress(handle, progress_start, &download_label);
+    update_status(handle, &download_label);
 
     let progress_label = if finishes_application_update {
         "Updating game content"
@@ -2778,6 +2771,20 @@ fn do_update(
     store_manifest_and_version(&content_dir, &remote, &latest.version)?;
     blobs.clear_cache();
     Ok(changed)
+}
+
+/// Maps transferred bytes into one overall-update phase without inventing progress.
+fn scaled_download_percent(done: u64, total: u64, phase_start: u64, phase_end: u64) -> u64 {
+    if total == 0 {
+        return phase_start;
+    }
+    let phase_width = phase_end.saturating_sub(phase_start);
+    let phase_progress = done
+        .min(total)
+        .saturating_mul(phase_width)
+        .checked_div(total)
+        .unwrap_or(0);
+    phase_start.saturating_add(phase_progress).min(phase_end)
 }
 
 /// HTTP blob source with persistent partial files and cumulative download progress.
@@ -2842,11 +2849,12 @@ impl BlobSource for HttpBlobs {
                 let added = downloaded.saturating_sub(reported);
                 reported = reported.max(downloaded);
                 let done = self.done.fetch_add(added, Ordering::Relaxed) + added;
-                let percent = done
-                    .saturating_mul(self.progress_end.saturating_sub(self.progress_start))
-                    .checked_div(self.total)
-                    .map(|percent| (self.progress_start + percent).min(self.progress_end))
-                    .unwrap_or(self.progress_start);
+                let percent = scaled_download_percent(
+                    done,
+                    self.total,
+                    self.progress_start,
+                    self.progress_end,
+                );
                 if percent != last_percent {
                     last_percent = percent;
                     update_progress(
@@ -3853,9 +3861,8 @@ fn install_content_pack(
     let plan = diff(installed.as_ref().and(local.as_ref()), &remote);
     let changed = plan.changed.len();
     let bytes = plan.download_size();
-    update_progress(
+    update_status(
         handle,
-        5,
         &format!("Downloading {} · {}", pack.name, human_bytes(bytes)),
     );
     let progress_label = format!("Downloading {}", pack.name);
@@ -3864,7 +3871,7 @@ fn install_content_pack(
         None,
         handle,
         bytes,
-        5..=95,
+        0..=95,
         &progress_label,
         "content-packs",
     )?;
@@ -5933,6 +5940,20 @@ mod tests {
         assert!(screen.contains("Preparing update"));
         assert!(screen.contains("Patch Notes"));
         assert!(screen.contains("Fixed update handling."));
+    }
+
+    #[test]
+    fn scaled_download_percent_without_transferred_bytes_stays_at_phase_start() {
+        assert_eq!(scaled_download_percent(0, 100, 0, 95), 0);
+        assert_eq!(scaled_download_percent(0, 100, 48, 95), 48);
+        assert_eq!(scaled_download_percent(20, 0, 0, 95), 0);
+    }
+
+    #[test]
+    fn scaled_download_percent_with_transferred_bytes_scales_and_clamps() {
+        assert_eq!(scaled_download_percent(50, 100, 0, 95), 47);
+        assert_eq!(scaled_download_percent(100, 100, 0, 95), 95);
+        assert_eq!(scaled_download_percent(200, 100, 0, 95), 95);
     }
 
     #[test]
