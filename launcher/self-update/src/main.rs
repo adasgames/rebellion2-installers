@@ -1,14 +1,17 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use std::fs;
 use std::{
     env,
     ffi::OsString,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     process::Command,
-    thread,
-    time::Duration,
 };
+#[cfg(not(target_os = "windows"))]
+use std::{thread, time::Duration};
+
+use rebellion2_update_core::{recover_interrupted_apply, InstallationLock};
 
 const LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.json";
 const LAUNCHER_VERSION_FILE: &str = ".launcher-version";
@@ -32,11 +35,76 @@ struct Arguments {
 }
 
 fn main() {
-    let result = parse_arguments(env::args_os().skip(1)).and_then(complete_update);
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--recover-installation")
+    {
+        let result = if arguments.len() == 2 {
+            prepare_installation(Path::new(&arguments[1]))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected --recover-installation <directory>",
+            ))
+        };
+        if let Err(error) = result {
+            eprintln!("Installation recovery failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let result = parse_arguments(arguments).and_then(complete_update);
     if let Err(error) = result {
         report_error(&error.to_string());
         std::process::exit(1);
     }
+}
+
+/// Restores interrupted changes before setup replaces its application baseline.
+/// Setup acquires the same lock after this helper exits and before changing files.
+fn prepare_installation(directory: &Path) -> io::Result<()> {
+    let _installation = InstallationLock::try_acquire(directory)?;
+    #[cfg(target_os = "windows")]
+    let _application_files = lock_application_files(directory)?;
+    recover_interrupted_apply(directory)?;
+    for name in [
+        PENDING_LAUNCHER_MANIFEST_FILE,
+        PENDING_LAUNCHER_VERSION_FILE,
+        PENDING_APPLICATION_MANIFEST_FILE,
+        PENDING_APPLICATION_VERSION_FILE,
+        LEGACY_WINDOWS_STAGED_LAUNCHER_FILE,
+    ] {
+        match fs::remove_file(directory.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Prevents recovery while an older launcher, helper, or game still uses this installation.
+#[cfg(target_os = "windows")]
+fn lock_application_files(directory: &Path) -> io::Result<Vec<fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut files = Vec::new();
+    for name in [
+        LEGACY_WINDOWS_LAUNCHER_FILE,
+        "Rebellion2.exe",
+        "rebellion2-update-helper.exe",
+    ] {
+        match fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(directory.join(name))
+        {
+            Ok(file) => files.push(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(files)
 }
 
 /// Parses the explicit paths supplied by the launcher being replaced.
@@ -121,7 +189,9 @@ fn missing_argument(argument: &str) -> io::Error {
 /// optionally reopens the launcher.
 fn complete_update(arguments: Arguments) -> io::Result<()> {
     validate_paths(&arguments)?;
-    wait_for_launcher_exit(arguments.wait_pid, &arguments.launcher);
+    wait_for_launcher_exit(arguments.wait_pid)?;
+    let installation = InstallationLock::acquire(&arguments.metadata_dir)?;
+    validate_paths(&arguments)?;
     replace_launcher(&arguments)?;
     promote_pending_file(
         &arguments.metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE),
@@ -143,6 +213,8 @@ fn complete_update(arguments: Arguments) -> io::Result<()> {
             .join(PENDING_APPLICATION_VERSION_FILE),
         &arguments.metadata_dir.join(APPLICATION_VERSION_FILE),
     )?;
+    // Release ownership before the replacement launcher acquires it at startup.
+    drop(installation);
     if arguments.relaunch {
         Command::new(&arguments.launcher)
             .current_dir(
@@ -204,19 +276,77 @@ fn promote_pending_file(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Waits until the process that started this helper has exited.
-fn wait_for_launcher_exit(process_id: u32, launcher_path: &Path) {
-    #[cfg(target_os = "windows")]
-    let _ = process_id;
-    #[cfg(target_os = "windows")]
-    while fs::OpenOptions::new()
-        .write(true)
-        .open(launcher_path)
-        .is_err()
-    {
-        thread::sleep(Duration::from_millis(50));
+/// Waits for the actual caller process instead of mistaking a file-access failure for a running launcher.
+#[cfg(target_os = "windows")]
+fn wait_for_launcher_exit(process_id: u32) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
+    };
+    let process_id = if process_id == 0 {
+        legacy_parent_process_id()?
+    } else {
+        process_id
+    };
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+    if process.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(())
+        } else {
+            Err(error)
+        };
     }
-    #[cfg(not(target_os = "windows"))]
+    let result = match unsafe { WaitForSingleObject(process, INFINITE) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        status => Err(io::Error::other(format!(
+            "unexpected launcher wait result: {status}"
+        ))),
+    };
+    unsafe {
+        CloseHandle(process);
+    }
+    result
+}
+
+/// Resolves the caller for the legacy handoff protocol, which supplies no process identifier.
+#[cfg(target_os = "windows")]
+fn legacy_parent_process_id() -> io::Result<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut present = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    let mut parent = None;
+    while present {
+        if entry.th32ProcessID == std::process::id() {
+            parent = Some(entry.th32ParentProcessID);
+            break;
+        }
+        present = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    parent.filter(|parent| *parent != 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "launcher caller process was not found",
+        )
+    })
+}
+
+/// Waits until the process that started this helper has exited.
+#[cfg(not(target_os = "windows"))]
+fn wait_for_launcher_exit(process_id: u32) -> io::Result<()> {
     while Command::new("/bin/kill")
         .arg("-0")
         .arg(process_id.to_string())
@@ -225,8 +355,7 @@ fn wait_for_launcher_exit(process_id: u32, launcher_path: &Path) {
     {
         thread::sleep(Duration::from_millis(50));
     }
-    #[cfg(not(target_os = "windows"))]
-    let _ = launcher_path;
+    Ok(())
 }
 
 /// Verifies that every caller-provided path is a concrete expected file location.
@@ -251,27 +380,7 @@ fn validate_paths(arguments: &Arguments) -> io::Result<()> {
 #[cfg(target_os = "windows")]
 /// Atomically replaces a staged file while allowing an existing destination.
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source: Vec<u16> = OsStr::new(source).encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = OsStr::new(destination)
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    rebellion2_update_core::replace_file_atomically(source, destination)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -339,6 +448,80 @@ fn report_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_installation_discards_pending_handoff_and_preserves_installed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            PENDING_LAUNCHER_MANIFEST_FILE,
+            PENDING_LAUNCHER_VERSION_FILE,
+            PENDING_APPLICATION_MANIFEST_FILE,
+            PENDING_APPLICATION_VERSION_FILE,
+            LEGACY_WINDOWS_STAGED_LAUNCHER_FILE,
+            LAUNCHER_MANIFEST_FILE,
+            LAUNCHER_VERSION_FILE,
+        ] {
+            fs::write(directory.path().join(name), b"existing").unwrap();
+        }
+        prepare_installation(directory.path()).unwrap();
+        assert!(!directory
+            .path()
+            .join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE)
+            .exists());
+        assert!(!directory
+            .path()
+            .join(PENDING_APPLICATION_VERSION_FILE)
+            .exists());
+        assert!(!directory
+            .path()
+            .join(PENDING_LAUNCHER_MANIFEST_FILE)
+            .exists());
+        assert_eq!(
+            fs::read(directory.path().join(LAUNCHER_VERSION_FILE)).unwrap(),
+            b"existing"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(LAUNCHER_MANIFEST_FILE)).unwrap(),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn prepare_installation_with_invalid_journal_preserves_pending_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = directory.path().join(".rebellion2-update-transaction");
+        fs::create_dir(&journal).unwrap();
+        fs::write(journal.join("transaction.json"), b"invalid").unwrap();
+        fs::write(
+            directory.path().join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE),
+            b"staged",
+        )
+        .unwrap();
+        assert!(prepare_installation(directory.path()).is_err());
+        assert_eq!(
+            fs::read(directory.path().join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE)).unwrap(),
+            b"staged"
+        );
+    }
+
+    #[test]
+    fn prepare_installation_while_launcher_owns_installation_fails_before_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let _owner = InstallationLock::try_acquire(directory.path()).unwrap();
+        fs::write(
+            directory.path().join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE),
+            b"staged",
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_installation(directory.path()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(directory
+            .path()
+            .join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE)
+            .exists());
+    }
 
     #[test]
     fn promote_pending_file_with_pending_file_replaces_destination() {

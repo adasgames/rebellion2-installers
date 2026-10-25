@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      {styles}
+    </style>
+  </head>
+  <body>
+    <main class="{card_class}">
+      <p class="kicker">{kicker}</p>
+      <h1>REBELLION <span class="two">II</span></h1>
+      <p class="{status_class}" id="s">{status}</p>
+      {spin}
+      <div class="bar" id="bar">
+        <div class="f" id="f"></div>
+      </div>
+      <div class="p" id="p"></div>
+      {content}
+      <div class="btns">{buttons}</div>
+    </main>
+    <script>
+      window.rebSetProgress = function (percent, label) {{
+        var bar = document.getElementById("bar");
+        if (bar) bar.style.display = "block";
+        var fill = document.getElementById("f");
+        if (fill) fill.style.width = percent + "%";
+        var progress = document.getElementById("p");
+        if (progress) progress.textContent = percent > 0 ? percent + "%" : "";
+        if (label) window.rebSetStatus(label);
+      }};
+      window.rebSetStatus = function (label) {{
+        var status = document.getElementById("s");
+        if (status) status.textContent = label;
+      }};
+    </script>
+  </body>
+</html>

@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 /// Blobs read from a local `blobs/<sha256>` directory (stands in for remote object storage).
 struct DirBlobs(PathBuf);
 impl BlobSource for DirBlobs {
-    fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
-        fs::read(self.0.join(&entry.sha256))
+    fn fetch_to(&self, entry: &FileEntry, destination: &Path) -> io::Result<()> {
+        fs::copy(self.0.join(&entry.sha256), destination)?;
+        Ok(())
     }
 }
 
@@ -56,8 +57,8 @@ fn kb(bytes: u64) -> String {
 }
 
 fn main() {
-    let work = std::env::temp_dir().join("rebellion2-patcher-demo");
-    let _ = fs::remove_dir_all(&work);
+    let directory = tempfile::tempdir().unwrap();
+    let work = directory.path();
     let install = work.join("install");
     let blobs = work.join("blobs");
 
@@ -150,6 +151,5 @@ fn main() {
     );
     println!("└────────────────────────────────────────────────────────────────");
 
-    let _ = fs::remove_dir_all(&work);
     assert!(ok && !ghost, "invariant failed");
 }

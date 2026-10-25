@@ -9,6 +9,12 @@
 //! The manifest format is exactly what `content/gen-manifest.py` emits:
 //! `{"version": "...", "files": [{"path", "sha256", "size"}]}`.
 
+mod installation;
+mod metadata;
+
+pub use installation::InstallationLock;
+pub use metadata::{apply_verified_with_metadata, apply_with_metadata, store_metadata};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -153,6 +159,30 @@ pub fn diff(local: Option<&Manifest>, remote: &Manifest) -> Plan {
     Plan { changed, removed }
 }
 
+/// Includes damaged or missing cached files when updating an installation that is being verified.
+pub fn diff_verified(
+    local: Option<&Manifest>,
+    remote: &Manifest,
+    directory: &Path,
+) -> io::Result<Plan> {
+    validate_manifest(remote)?;
+    if let Some(local) = local {
+        validate_manifest(local)?;
+    }
+    let mut plan = diff(local, remote);
+    let changed: BTreeSet<String> = plan
+        .changed
+        .iter()
+        .map(|entry| manifest_path_key(&entry.path))
+        .collect();
+    for entry in &remote.files {
+        if !changed.contains(&manifest_path_key(&entry.path)) && !verify_file(directory, entry)? {
+            plan.changed.push(entry.clone());
+        }
+    }
+    Ok(plan)
+}
+
 /// Hex SHA-256 of a byte slice (matches the blob keys / manifest hashes).
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -164,10 +194,30 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Hashes a file using a fixed-size buffer instead of loading assets into memory.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 /// Where blob bytes come from, keyed by their SHA-256. The launcher supplies an
 /// HTTP-backed impl; tests supply an in-memory or local-dir impl.
 pub trait BlobSource {
-    fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>>;
+    /// Stages one blob without requiring its complete contents in memory.
+    fn fetch_to(&self, entry: &FileEntry, destination: &Path) -> io::Result<()>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,9 +233,40 @@ struct TransactionRecord {
 ///
 /// Returns the number of files written.
 pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Result<usize> {
+    apply_checked(plan, install_dir, blobs, || Ok(()))
+}
+
+/// Applies a plan and verifies the complete resulting inventory before discarding rollback data.
+pub fn apply_verified(
+    plan: &Plan,
+    install_dir: &Path,
+    blobs: &dyn BlobSource,
+    expected: &Manifest,
+) -> io::Result<usize> {
+    validate_manifest(expected)?;
+    apply_checked(plan, install_dir, blobs, || {
+        if verify_install(install_dir, expected)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed files do not match the expected manifest",
+            ))
+        }
+    })
+}
+
+/// Keeps the transaction recoverable until both the commit and caller's verification succeed.
+fn apply_checked(
+    plan: &Plan,
+    install_dir: &Path,
+    blobs: &dyn BlobSource,
+    verify: impl FnOnce() -> io::Result<()>,
+) -> io::Result<usize> {
     validate_plan_paths(plan)?;
     recover_interrupted_apply(install_dir)?;
     if plan.is_empty() {
+        verify()?;
         return Ok(0);
     }
 
@@ -195,19 +276,22 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
     fs::create_dir_all(&staged)?;
 
     for entry in &plan.changed {
-        let bytes = blobs.fetch(entry)?;
-        if bytes.len() as u64 != entry.size {
+        let destination = staged.join(&entry.path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        blobs.fetch_to(entry, &destination)?;
+        let size = fs::metadata(&destination)?.len();
+        if size != entry.size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "size mismatch for {}: expected {}, got {}",
-                    entry.path,
-                    entry.size,
-                    bytes.len()
+                    entry.path, entry.size, size
                 ),
             ));
         }
-        let actual = sha256_hex(&bytes);
+        let actual = sha256_file(&destination)?;
         if actual != entry.sha256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -217,22 +301,17 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
                 ),
             ));
         }
-        let destination = staged.join(&entry.path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(destination, bytes)?;
     }
 
+    let changed_paths: BTreeSet<String> = plan
+        .changed
+        .iter()
+        .map(|entry| manifest_path_key(&entry.path))
+        .collect();
     let effective_removed: Vec<&String> = plan
         .removed
         .iter()
-        .filter(|path| {
-            !plan
-                .changed
-                .iter()
-                .any(|entry| manifest_path_key(&entry.path) == manifest_path_key(path))
-        })
+        .filter(|path| !changed_paths.contains(&manifest_path_key(path)))
         .collect();
     let mut touched_paths: Vec<&str> = plan
         .changed
@@ -275,7 +354,9 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
     };
     write_transaction_record(&transaction, &record)?;
 
-    if let Err(commit_error) = commit_transaction(install_dir, &transaction, &record.plan) {
+    if let Err(commit_error) =
+        commit_transaction(install_dir, &transaction, &record.plan).and_then(|()| verify())
+    {
         return match rollback_transaction(install_dir, &transaction, &record) {
             Ok(()) => Err(commit_error),
             Err(rollback_error) => Err(io::Error::other(format!(
@@ -448,7 +529,7 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(file_operation_error("remove", path, error)),
     }
 }
 
@@ -456,8 +537,16 @@ fn remove_directory_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(file_operation_error("remove directory", path, error)),
     }
+}
+
+/// Identifies the rejected filesystem operation while preserving its error category.
+fn file_operation_error(action: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("could not {action} {}: {error}", path.display()),
+    )
 }
 
 fn validate_plan_paths(plan: &Plan) -> io::Result<()> {
@@ -484,10 +573,27 @@ fn is_safe_manifest_path(path: &str) -> bool {
         && !path.contains(['\\', ':'])
         && path.split('/').next().is_some_and(|component| {
             manifest_path_key(component) != manifest_path_key(TRANSACTION_DIRECTORY)
+                && manifest_path_key(component) != manifest_path_key(installation::LOCK_FILE)
         })
-        && path
-            .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
+        && path.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && is_unambiguous_component(component)
+        })
+}
+
+/// Rejects names that Windows normalizes to a different managed file or directory.
+fn is_unambiguous_component(component: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        !component.ends_with(['.', ' '])
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = component;
+        true
+    }
 }
 
 fn validate_managed_path(root: &Path, relative: &str) -> io::Result<()> {
@@ -532,35 +638,9 @@ fn metadata_is_plain_directory(metadata: &fs::Metadata) -> bool {
 }
 
 /// Atomically replaces a destination with a prepared file on the same volume.
-#[cfg(target_os = "windows")]
-pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source: Vec<u16> = OsStr::new(source).encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = OsStr::new(destination)
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Atomically replaces a destination with a prepared file on the same volume.
-#[cfg(not(target_os = "windows"))]
 pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
+        .map_err(|error| file_operation_error("replace", destination, error))
 }
 
 /// The correctness oracle: does every file the manifest lists exist under
@@ -570,24 +650,24 @@ pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<
 pub fn verify_install(install_dir: &Path, manifest: &Manifest) -> io::Result<bool> {
     validate_manifest(manifest)?;
     for entry in &manifest.files {
-        validate_managed_path(install_dir, &entry.path)?;
-        let path = install_dir.join(&entry.path);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => return Ok(false),
-            Err(_) => return Ok(false),
-        };
-        if metadata.len() != entry.size {
-            return Ok(false);
-        }
-        let mut file = fs::File::open(&path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        if sha256_hex(&buf) != entry.sha256 {
+        if !verify_file(install_dir, entry)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Verifies one owned file without following symbolic links or loading its complete contents.
+fn verify_file(directory: &Path, entry: &FileEntry) -> io::Result<bool> {
+    validate_managed_path(directory, &entry.path)?;
+    let path = directory.join(&entry.path);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(metadata.len() == entry.size && sha256_file(&path)? == entry.sha256)
 }
 
 #[cfg(test)]
@@ -598,11 +678,12 @@ mod tests {
     /// In-memory blob store keyed by hash — stands in for remote/local blobs.
     struct MemBlobs(HashMap<String, Vec<u8>>);
     impl BlobSource for MemBlobs {
-        fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
-            self.0
+        fn fetch_to(&self, entry: &FileEntry, destination: &Path) -> io::Result<()> {
+            let bytes = self
+                .0
                 .get(&entry.sha256)
-                .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, entry.sha256.clone()))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, entry.sha256.clone()))?;
+            fs::write(destination, bytes)
         }
     }
 
@@ -641,11 +722,107 @@ mod tests {
     }
 
     #[test]
+    fn sha256_file_with_multiple_buffers_matches_byte_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-asset");
+        let bytes: Vec<u8> = (0..200_003).map(|index| (index % 251) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(sha256_file(&path).unwrap(), sha256_hex(&bytes));
+    }
+
+    #[test]
+    fn diff_verified_with_damaged_unchanged_asset_includes_it_for_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("asset"), b"bad").unwrap();
+        let target = manifest("1", &[("asset", b"new")]);
+        assert!(diff(Some(&target), &target).is_empty());
+        let plan = diff_verified(Some(&target), &target, directory.path()).unwrap();
+        assert_eq!(plan.changed, target.files);
+    }
+
+    #[test]
+    fn apply_with_installation_lock_in_inventory_cannot_replace_the_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let _owner = InstallationLock::try_acquire(directory.path()).unwrap();
+        let target = manifest("1", &[(installation::LOCK_FILE, b"replacement")]);
+        let result = apply(
+            &diff(None, &target),
+            directory.path(),
+            &store(&[(installation::LOCK_FILE, b"replacement")]),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            InstallationLock::try_acquire(directory.path())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join(installation::LOCK_FILE))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn validate_manifest_with_windows_normalized_path_alias_rejects_inventory() {
+        for path in [
+            ".rebellion2-install.lock.",
+            ".rebellion2-install.lock ",
+            ".rebellion2-update-transaction./transaction.json",
+            "Content /catalog.xml",
+            "asset.bin.",
+        ] {
+            assert_eq!(
+                validate_manifest(&manifest("1", &[(path, b"new")]))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_with_file_backed_source_stages_without_fetching_asset_into_memory() {
+        struct FileBlobs;
+        impl BlobSource for FileBlobs {
+            fn fetch_to(&self, _: &FileEntry, destination: &Path) -> io::Result<()> {
+                fs::write(destination, b"streamed")
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let target = manifest("1", &[("asset", b"streamed")]);
+        apply(&diff(None, &target), directory.path(), &FileBlobs).unwrap();
+        assert!(verify_install(directory.path(), &target).unwrap());
+    }
+
+    #[test]
     fn fresh_install_pulls_everything() {
         let remote = manifest("1", &[("a", b"A"), ("b", b"B")]);
         let plan = diff(None, &remote);
         assert_eq!(plan.changed.len(), 2);
         assert!(plan.removed.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn replace_file_atomically_with_shared_reader_preserves_old_handle_and_publishes_new_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("version");
+        let staged = directory.path().join("staged");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        let mut reader = fs::File::open(&destination).unwrap();
+        replace_file_atomically(&staged, &destination).unwrap();
+        let mut old_bytes = Vec::new();
+        reader.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old");
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!staged.exists());
     }
 
     #[test]

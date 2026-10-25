@@ -1,4 +1,6 @@
-use rebellion2_update_core::{replace_file_atomically, sha256_hex};
+#[cfg(test)]
+use rebellion2_update_core::sha256_hex;
+use rebellion2_update_core::{replace_file_atomically, sha256_file};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -25,6 +27,7 @@ pub(crate) struct DownloadSpec<'a> {
 #[derive(Debug)]
 pub(crate) enum DownloadError {
     HttpStatus(u16),
+    Connection(io::Error),
     Io(io::Error),
     InvalidData(String),
 }
@@ -34,7 +37,7 @@ impl DownloadError {
     pub(crate) fn status(&self) -> Option<u16> {
         match self {
             Self::HttpStatus(status) => Some(*status),
-            Self::Io(_) | Self::InvalidData(_) => None,
+            Self::Connection(_) | Self::Io(_) | Self::InvalidData(_) => None,
         }
     }
 
@@ -42,9 +45,10 @@ impl DownloadError {
     pub(crate) fn into_io_error(self) -> io::Error {
         match self {
             Self::Io(error) => error,
-            Self::HttpStatus(status) => {
-                io::Error::other(format!("download returned HTTP {status}"))
+            Self::Connection(error) => {
+                io::Error::new(io::ErrorKind::ConnectionAborted, Self::Connection(error))
             }
+            Self::HttpStatus(status) => io::Error::other(Self::HttpStatus(status)),
             Self::InvalidData(message) => io::Error::new(io::ErrorKind::InvalidData, message),
         }
     }
@@ -54,6 +58,7 @@ impl fmt::Display for DownloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
+            Self::Connection(error) => write!(formatter, "connection interrupted: {error}"),
             Self::Io(error) => error.fmt(formatter),
             Self::InvalidData(message) => formatter.write_str(message),
         }
@@ -63,7 +68,7 @@ impl fmt::Display for DownloadError {
 impl std::error::Error for DownloadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Connection(error) | Self::Io(error) => Some(error),
             Self::HttpStatus(_) | Self::InvalidData(_) => None,
         }
     }
@@ -123,7 +128,8 @@ fn download_to_path_with_sleep(
         }
         progress(offset);
 
-        let mut request = agent.get(spec.url);
+        // Byte ranges and signed sizes refer to the stored representation.
+        let mut request = agent.get(spec.url).set("Accept-Encoding", "identity");
         if let Some(authorization) = spec.authorization {
             request = request.set("Authorization", authorization);
         }
@@ -177,7 +183,11 @@ fn download_to_path_with_sleep(
                 if !schedule_retry(
                     attempt,
                     None,
-                    DownloadError::Io(io::Error::other(error.to_string())),
+                    // Transport's Display includes the complete URL, including signed query credentials.
+                    DownloadError::Connection(io::Error::other(format!(
+                        "download connection failed: {}",
+                        error.kind()
+                    ))),
                     &mut last_error,
                     &mut retrying,
                     &mut sleep,
@@ -301,30 +311,23 @@ fn download_to_path_with_sleep(
             .truncate(!resumed)
             .open(&partial)?;
         let mut reader = response.into_reader();
-        let mut buffer = [0_u8; 64 * 1024];
         let mut downloaded = offset;
-        let read_result = loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break Ok(()),
-                Ok(count) => {
-                    if let Err(error) = file.write_all(&buffer[..count]) {
-                        break Err(error);
-                    }
-                    downloaded = downloaded.saturating_add(count as u64);
-                    progress(downloaded);
-                }
-                Err(error) => break Err(error),
-            }
-        };
-        let read_error = read_result.err();
+        let read_result = transfer_download(&mut reader, &mut file, &mut downloaded, &mut progress);
         let sync_error = file.sync_all().err();
         drop(file);
+        let read_error = match read_result {
+            Err(DownloadError::Io(error)) => return Err(DownloadError::Io(error)),
+            Err(error) => Some(error),
+            Ok(()) => None,
+        };
+        if let Some(error) = sync_error {
+            return Err(DownloadError::Io(error));
+        }
 
         let expected_length_received = known_size.is_some_and(|expected| downloaded == expected);
         let response_completed = read_error.is_none() || expected_length_received;
-        let can_validate = sync_error.is_none()
-            && response_completed
-            && known_size.is_none_or(|expected| downloaded == expected);
+        let can_validate =
+            response_completed && known_size.is_none_or(|expected| downloaded == expected);
         if can_validate {
             if file_matches_hash(&partial, spec.expected_sha256)? {
                 replace_file_atomically(&partial, spec.destination)?;
@@ -338,8 +341,8 @@ fn download_to_path_with_sleep(
         }
 
         if last_error.is_none() {
-            if let Some(error) = sync_error.or(read_error) {
-                last_error = Some(DownloadError::Io(error));
+            if let Some(error) = read_error {
+                last_error = Some(error);
             } else if known_size.is_some_and(|expected| downloaded != expected) {
                 last_error = Some(DownloadError::InvalidData(format!(
                     "download ended at {downloaded} bytes; expected {}",
@@ -368,6 +371,29 @@ fn download_to_path_with_sleep(
     }))
 }
 
+/// Distinguishes a failed network read from a local write failure so retries do not misreport disk errors.
+fn transfer_download(
+    reader: &mut dyn Read,
+    destination: &mut dyn Write,
+    downloaded: &mut u64,
+    progress: &mut impl FnMut(u64),
+) -> Result<(), DownloadError> {
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(DownloadError::Connection)?;
+        if count == 0 {
+            return Ok(());
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(DownloadError::Io)?;
+        *downloaded = downloaded.saturating_add(count as u64);
+        progress(*downloaded);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ContentRange {
     start: u64,
@@ -380,7 +406,11 @@ fn parse_content_range(value: &str) -> Option<ContentRange> {
     let (start, end) = range.split_once('-')?;
     let start = start.parse::<u64>().ok()?;
     let end = end.parse::<u64>().ok()?;
-    let total = (total != "*").then(|| total.parse().ok()).flatten();
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse::<u64>().ok()?)
+    };
     (start <= end && total.is_none_or(|total| end < total)).then_some(ContentRange { start, total })
 }
 
@@ -459,8 +489,7 @@ fn file_matches_hash(path: &Path, expected_sha256: Option<&str>) -> Result<bool,
     let Some(expected_sha256) = expected_sha256 else {
         return Ok(true);
     };
-    let bytes = fs::read(path)?;
-    Ok(sha256_hex(&bytes) == expected_sha256)
+    Ok(sha256_file(path)? == expected_sha256)
 }
 
 fn partial_length(path: &Path) -> io::Result<u64> {
@@ -529,6 +558,37 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn download_to_path_connection_failure_does_not_expose_url_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("archive.zip");
+        let url = format!("http://fixture-user:fixture-password@{address}/archive.zip?signature=fixture-secret#private");
+        let error = download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: None,
+                expected_sha256: None,
+            },
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("connection failed"));
+        for secret in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-secret",
+            "private",
+        ] {
+            assert!(!error.contains(secret), "transport error exposed {secret}");
+        }
+    }
 
     #[test]
     fn download_to_path_existing_partial_resumes_from_range() {
@@ -816,7 +876,7 @@ mod tests {
         assert_eq!(retry_errors[0], "HTTP 500");
         assert_eq!(
             retry_errors[1],
-            "response body closed before all bytes were read"
+            "connection interrupted: response body closed before all bytes were read"
         );
     }
 
@@ -1066,6 +1126,8 @@ mod tests {
         assert!(parse_content_range("bytes 5-4/10").is_none());
         assert!(parse_content_range("bytes 0-10/10").is_none());
         assert!(parse_content_range("bytes 0-final/10").is_none());
+        assert!(parse_content_range("bytes 0-3/not-a-number").is_none());
+        assert!(parse_content_range("bytes 0-3/18446744073709551616").is_none());
         assert_eq!(parse_content_range("bytes 4-9/10").unwrap().start, 4);
     }
 

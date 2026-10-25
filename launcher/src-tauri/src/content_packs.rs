@@ -1,6 +1,6 @@
 use rebellion2_update_core::{
-    apply, diff, replace_file_atomically, validate_manifest, validate_manifest_paths,
-    verify_install, BlobSource, Manifest,
+    apply, apply_with_metadata, diff, replace_file_atomically, store_metadata, validate_manifest,
+    validate_manifest_paths, verify_install, BlobSource, Manifest,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as VersionOrdering;
@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{compare_versions, parse_semantic_version};
+use crate::versions::{compare_versions, parse_semantic_version};
 
 pub const CATALOG_PATH: &str = "dist/catalogue.json";
 pub const GAME_DEPENDENCY_ID: &str = "rebellion2";
@@ -389,6 +389,7 @@ pub fn read_manifest(install_root: &Path, id: &str) -> Option<Manifest> {
     }
     Manifest::from_json(&fs::read(metadata_directory(install_root, id).join(MANIFEST_FILE)).ok()?)
         .ok()
+        .filter(|manifest| validate_manifest(manifest).is_ok())
 }
 
 /// Reads a pack definition's version after verifying its declared identity.
@@ -412,10 +413,63 @@ pub fn write_install(
     let metadata = metadata_directory(install_root, &pack.id);
     fs::create_dir_all(&metadata)?;
     let installed = install_record(pack);
-    write_json_atomically(&metadata.join(MANIFEST_FILE), manifest)?;
-    write_json_atomically(&metadata.join(INSTALL_RECORD_FILE), &installed)?;
+    let manifest = serde_json::to_vec(manifest).map_err(io::Error::other)?;
+    let installed = serde_json::to_vec(&installed).map_err(io::Error::other)?;
+    let manifest_path = format!("{METADATA_DIRECTORY}/{}/{MANIFEST_FILE}", pack.id);
+    let install_path = format!("{METADATA_DIRECTORY}/{}/{INSTALL_RECORD_FILE}", pack.id);
+    store_metadata(
+        install_root,
+        &[
+            (manifest_path.as_str(), &manifest),
+            (install_path.as_str(), &installed),
+        ],
+    )?;
     clear_pending_install(install_root, &pack.id);
     Ok(())
+}
+
+/// Commits an existing pack and its install records under one installation transaction.
+pub fn apply_update(
+    install_root: &Path,
+    pack: &ContentPackRelease,
+    manifest: &Manifest,
+    plan: &rebellion2_update_core::Plan,
+    blobs: &dyn BlobSource,
+) -> io::Result<usize> {
+    validate_release(pack)?;
+    validate_pack_manifest(manifest, pack)?;
+    let prefix = format!("Content/Packs/{}/", pack.directory);
+    let rooted_plan = rebellion2_update_core::Plan {
+        changed: plan
+            .changed
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                entry.path = format!("{prefix}{}", entry.path);
+                entry
+            })
+            .collect(),
+        removed: plan
+            .removed
+            .iter()
+            .map(|path| format!("{prefix}{path}"))
+            .collect(),
+    };
+    let manifest = serde_json::to_vec(manifest).map_err(io::Error::other)?;
+    let installed = serde_json::to_vec(&install_record(pack)).map_err(io::Error::other)?;
+    let manifest_path = format!("{METADATA_DIRECTORY}/{}/{MANIFEST_FILE}", pack.id);
+    let install_path = format!("{METADATA_DIRECTORY}/{}/{INSTALL_RECORD_FILE}", pack.id);
+    apply_with_metadata(
+        &rooted_plan,
+        install_root,
+        blobs,
+        &[
+            (manifest_path.as_str(), &manifest),
+            (install_path.as_str(), &installed),
+        ],
+    )?;
+    clear_pending_install(install_root, &pack.id);
+    Ok(plan.changed.len())
 }
 
 fn install_record(pack: &ContentPackRelease) -> InstalledContentPack {
@@ -483,6 +537,33 @@ pub fn removable_manifest(manifest: &Manifest) -> io::Result<rebellion2_update_c
     })
 }
 
+/// Removes a pack's owned files and its registration in the same recoverable transaction.
+pub fn removal_plan(
+    installed: &InstalledContentPack,
+    manifest: &Manifest,
+) -> io::Result<rebellion2_update_core::Plan> {
+    if !is_safe_id(&installed.id) || !is_single_path_component(&installed.directory) {
+        return Err(invalid_data(
+            "content-pack registration contains an unsafe path",
+        ));
+    }
+    let plan = removable_manifest(manifest)?;
+    let prefix = format!("Content/Packs/{}/", installed.directory);
+    let metadata = format!("{METADATA_DIRECTORY}/{}/", installed.id);
+    Ok(rebellion2_update_core::Plan {
+        changed: Vec::new(),
+        removed: plan
+            .removed
+            .into_iter()
+            .map(|path| format!("{prefix}{path}"))
+            .chain(
+                [MANIFEST_FILE, INSTALL_RECORD_FILE, PENDING_INSTALL_FILE]
+                    .map(|name| format!("{metadata}{name}")),
+            )
+            .collect(),
+    })
+}
+
 fn metadata_directory(install_root: &Path, id: &str) -> PathBuf {
     install_root.join(METADATA_DIRECTORY).join(id)
 }
@@ -504,6 +585,7 @@ fn is_single_path_component(value: &str) -> bool {
         && !value.contains('/')
         && !value.contains('\\')
         && !value.contains(':')
+        && (!cfg!(target_os = "windows") || !value.ends_with(['.', ' ']))
 }
 
 fn validate_channel_path(value: &str) -> io::Result<()> {
@@ -578,17 +660,18 @@ mod tests {
     }
 
     impl BlobSource for TestBlobs {
-        fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
+        fn fetch_to(&self, entry: &FileEntry, destination: &Path) -> io::Result<()> {
             if self.fail_on.as_deref() == Some(entry.sha256.as_str()) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     "interrupted",
                 ));
             }
-            self.values
+            let bytes = self
+                .values
                 .get(&entry.sha256)
-                .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing blob"))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing blob"))?;
+            fs::write(destination, bytes)
         }
     }
 
@@ -758,6 +841,16 @@ mod tests {
     #[test]
     fn release_cannot_escape_content_packs_directory() {
         for directory in ["../Outside", "Nested/Pack", "C:\\Pack"] {
+            let mut pack = release();
+            pack.directory = directory.to_string();
+            assert!(validate_release(&pack).is_err(), "accepted {directory}");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn validate_release_with_normalized_directory_alias_rejects_release() {
+        for directory in ["SamplePack.", "SamplePack "] {
             let mut pack = release();
             pack.directory = directory.to_string();
             assert!(validate_release(&pack).is_err(), "accepted {directory}");

@@ -4,8 +4,11 @@ version = "0.1.0"
 description = "Completes a staged Rebellion 2 launcher update after the launcher exits."
 edition = "2021"
 
+[dependencies]
+rebellion2-update-core = { path = "../update-core" }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"
