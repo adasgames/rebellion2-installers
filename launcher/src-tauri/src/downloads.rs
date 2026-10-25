@@ -378,8 +378,8 @@ fn parse_content_range(value: &str) -> Option<ContentRange> {
     let value = value.strip_prefix("bytes ")?;
     let (range, total) = value.split_once('/')?;
     let (start, end) = range.split_once('-')?;
-    let start = start.parse().ok()?;
-    let end = end.parse().ok()?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
     let total = (total != "*").then(|| total.parse().ok()).flatten();
     (start <= end && total.is_none_or(|total| end < total)).then_some(ContentRange { start, total })
 }
