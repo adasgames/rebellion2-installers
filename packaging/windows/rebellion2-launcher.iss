@@ -50,8 +50,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
-; A user-requested reinstall may replace a running launcher. Setup closes it and
-; the [Run] entry starts the installed copy afterward.
+; In-use files must be closed before setup replaces them. The preparation step
+; also rejects a launcher that currently owns the installation.
 CloseApplications=yes
 RestartApplications=no
 #if IconFile != ""
@@ -69,6 +69,8 @@ Name: "desktopicon"; Description: "Add &Rebellion 2 to the desktop"; GroupDescri
 Type: filesandordirs; Name: "{app}\Rebellion2_Data\Plugins\x86_64"
 
 [Files]
+; Keep recovery first so extracting it does not decompress the player payload.
+Source: "{#UpdateHelperPath}"; DestName: "rebellion2-installer-recovery.exe"; Flags: dontcopy
 ; Asset-free game player (no baked art — Content is downloaded by the launcher).
 Source: "{#GameDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; The launcher (verifies ownership, downloads Content, starts the game).
@@ -115,10 +117,105 @@ Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName}"; Flags: nowa
 ; {app} at runtime, so Inno's install log doesn't track them. Remove them explicitly
 ; on uninstall, then drop {app} if nothing else remains.
 Type: filesandordirs; Name: "{app}\Content"
+Type: filesandordirs; Name: "{app}\.download-cache"
+Type: filesandordirs; Name: "{app}\.content-packs"
+Type: filesandordirs; Name: "{app}\.rebellion2-update-transaction"
+Type: filesandordirs; Name: "{app}\.content-install-staging"
 Type: files; Name: "{app}\launcher.log"
+Type: files; Name: "{app}\.session"
+Type: files; Name: "{app}\.rebellion2-install.lock"
+Type: files; Name: "{app}\content.zip"
 Type: files; Name: "{app}\content.zip.part"
+Type: files; Name: "{app}\content.zip.part.etag"
+Type: files; Name: "{app}\content.zip.part.size"
 Type: files; Name: "{app}\.approved-content-update"
+Type: files; Name: "{app}\.launcher-manifest.json"
+Type: files; Name: "{app}\.launcher-version"
 Type: files; Name: "{app}\.launcher-manifest.pending.json"
 Type: files; Name: "{app}\.launcher-version.pending"
+Type: files; Name: "{app}\.game-manifest.json"
+Type: files; Name: "{app}\.game-version"
+Type: files; Name: "{app}\.application-manifest.json"
+Type: files; Name: "{app}\.application-version"
+Type: files; Name: "{app}\.application-manifest.pending.json"
+Type: files; Name: "{app}\.application-version.pending"
 Type: files; Name: "{app}\.rebellion2-launcher.next.exe"
+Type: files; Name: "{app}\.rebellion2-launcher.next.exe.writing"
+Type: files; Name: "{app}\rebellion2-update-helper.exe.writing"
+Type: files; Name: "{app}\.launcher-manifest.pending.json.writing"
+Type: files; Name: "{app}\.launcher-version.pending.writing"
+Type: files; Name: "{app}\.application-manifest.pending.json.writing"
+Type: files; Name: "{app}\.application-version.pending.writing"
+Type: files; Name: "{app}\.game-manifest.json.writing"
+Type: files; Name: "{app}\.game-version.writing"
 Type: dirifempty; Name: "{app}"
+
+[Code]
+var
+  InstallationPrepared: Boolean;
+  InstallationLock: THandle;
+
+function CreateInstallationLock(const FileName: String; Access, Sharing: LongWord;
+  Security: THandle; Creation, Attributes: LongWord; Template: THandle): THandle;
+  external 'CreateFileW@kernel32.dll stdcall';
+function LockInstallation(FileHandle: THandle; OffsetLow, OffsetHigh, CountLow, CountHigh: LongWord): Boolean;
+  external 'LockFile@kernel32.dll stdcall';
+function CloseInstallationLock(FileHandle: THandle): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+procedure ReleaseInstallation;
+begin
+  if InstallationLock <> 0 then begin
+    CloseInstallationLock(InstallationLock);
+    InstallationLock := 0;
+  end;
+end;
+
+procedure PrepareInstallation;
+var
+  ResultCode: Integer;
+begin
+  if InstallationPrepared then exit;
+  ExtractTemporaryFile('rebellion2-installer-recovery.exe');
+  WizardForm.StatusLabel.Caption := 'Restoring interrupted updates...';
+  if not ExecAndLogOutput(ExpandConstant('{tmp}\rebellion2-installer-recovery.exe'),
+    '--recover-installation "' + ExpandConstant('{app}') + '"', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode, nil) then
+    RaiseException('The installation could not be prepared: ' + SysErrorMessage(ResultCode));
+  if ResultCode <> 0 then
+    RaiseException('The previous update could not be restored. Close the game and launcher, then retry setup.');
+
+  { Keep the same lock until setup finishes replacing its files. }
+  InstallationLock := CreateInstallationLock(ExpandConstant('{app}\.rebellion2-install.lock'),
+    $C0000000, 7, 0, 4, $80, 0);
+  if InstallationLock = THandle(-1) then begin
+    InstallationLock := 0;
+    RaiseException('The installation folder could not be locked.');
+  end;
+  if not LockInstallation(InstallationLock, 0, 0, 1, 0) then begin
+    ReleaseInstallation;
+    RaiseException('Another launcher is using this installation. Close it, then retry setup.');
+  end;
+  InstallationPrepared := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  try
+    PrepareInstallation;
+  except
+    ReleaseInstallation;
+    Result := GetExceptionMessage;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then ReleaseInstallation;
+end;
+
+procedure DeinitializeSetup;
+begin
+  ReleaseInstallation;
+end;

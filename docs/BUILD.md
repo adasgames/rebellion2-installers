@@ -149,6 +149,48 @@ cargo run --manifest-path launcher/src-tauri/Cargo.toml -- --preview-update-flow
 The walkthrough shows a launcher update and launcher notes, simulates staging it, proceeds to a game
 update with separate game notes, and finishes on the ready-to-play screen.
 
+## Local native update tests
+
+On Windows with Node 24+, Rust, the Tauri build prerequisites, WebView2, and Inno Setup 6 installed, run:
+
+```powershell
+node scripts/test-launcher-runtime.mjs
+```
+
+This builds and drives the actual debug launcher and self-update helper against a loopback server.
+It uses isolated temporary installations, a stub game, and fixture signing keys. It does not publish
+updates or touch an installed game. Release builds always use the production verification key.
+
+The scenarios cover fresh installation, repair, content packs, independent and combined updates,
+helper relaunch, interrupted downloads and commits, simultaneous launchers, locked files,
+authorization renewal, invalid signatures and paths, corrupt data, HTTP resume, and failed servers.
+They also compile the production installer template with isolated fixture payloads and exercise
+fresh installs, reinstalls, interrupted-update recovery, in-use files, and installation locking.
+They compile tag `v0.0.26` with fixture signing and service settings to test upgrades from that
+launcher with and without Content. Matching archives, damaged current-version installations, and
+full-inventory verification are covered too. The migration sequence is in
+[launcher-rollout.md](launcher-rollout.md).
+
+Every Content install, update, and explicit repair verifies the complete resulting inventory
+before its transaction is completed. A verification record is bound to the exact saved manifest.
+Normal launches reuse that record instead of reading all Content again; installations without
+one, or whose saved manifest has changed, are checked against the published inventory first.
+Set `ISCC_PATH` if the Inno Setup compiler is not in its per-user default directory.
+For the destructive disk-full fixture, use only a disposable virtual volume smaller than 1 GB.
+Create `.reb2-runtime-volume` at its root containing exactly `reb2-runtime-only`, then set
+`REB2_RUNTIME_DISK_ROOT` to its drive root and select the `full disk` scenario. It fills that
+volume, checks that live files survive, frees the filler, and retries the saved download.
+An optional text argument selects matching scenario names. Run the suite serially because each run
+builds a launcher with that run's loopback address.
+
+Each run prints its temporary artifact directory. `results.json` records outcomes; `build.json`
+records source and binary hashes, compiler versions, and the fixture address. `ready.png` captures
+the rendered ready screen. Failed runs retain launcher logs and UI diagnostics. These native tests
+exercise Windows only; macOS and Linux require their own native validation.
+
+For a software-rendered test run, set `REB2_RUNTIME_BROWSER_ARGUMENTS=--disable-gpu` in the test
+process's environment. The report records that override; it does not change launcher release builds.
+
 ## Steam verification recovery
 
 Steam visibility failures use the ownership service's `reason` query parameter on `/done`:

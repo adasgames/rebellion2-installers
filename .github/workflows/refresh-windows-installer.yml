@@ -1,0 +1,170 @@
+name: Refresh Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_version:
+        description: Published game version to keep (for example, 0.0.38)
+        required: true
+        type: string
+      launcher_version:
+        description: Published launcher version to embed (for example, 1.0.7)
+        required: true
+        type: string
+      publish:
+        description: Replace only the existing Windows installer release asset
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: game-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      GAME_VERSION: ${{ inputs.game_version }}
+      LAUNCHER_VERSION: ${{ inputs.launcher_version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download published packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($version in @($env:GAME_VERSION, $env:LAUNCHER_VERSION)) {
+            node scripts/semver.mjs $version $version
+            if ($LASTEXITCODE -ne 0) { throw 'Invalid release version.' }
+          }
+          foreach ($tag in @("v$env:GAME_VERSION", "launcher-v$env:LAUNCHER_VERSION")) {
+            $release = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isDraft,isPrerelease | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) {
+              throw "A stable published release is required: $tag"
+            }
+          }
+          gh release download "v$env:GAME_VERSION" --repo $env:GITHUB_REPOSITORY --pattern Rebellion2-Windows-Setup.exe --dir previous
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the published game installer.' }
+          gh release download "launcher-v$env:LAUNCHER_VERSION" --repo $env:GITHUB_REPOSITORY --pattern Rebellion2-launcher-Windows.zip --dir previous
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the published launcher.' }
+
+      - name: Restore the released player in the disposable runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'released-game'
+          $installer = (Resolve-Path previous/Rebellion2-Windows-Setup.exe).Path
+          $process = Start-Process -FilePath $installer -WindowStyle Hidden -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOICONS', "/DIR=`"$unpacked`""
+          )
+          if ($process.ExitCode -ne 0) { throw 'The published installer could not be unpacked.' }
+          if ((Get-Content -Raw -LiteralPath (Join-Path $unpacked '.game-version')).Trim() -ne $env:GAME_VERSION) {
+            throw 'The player version does not match the requested game release.'
+          }
+          $manifestPath = Join-Path $unpacked '.game-manifest.json'
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          if ($manifest.version -ne $env:GAME_VERSION -or $manifest.files.Count -eq 0) { throw 'Invalid game manifest.' }
+          $root = [IO.Path]::GetFullPath($unpacked) + [IO.Path]::DirectorySeparatorChar
+          $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          New-Item -ItemType Directory -Path player | Out-Null
+          foreach ($entry in $manifest.files) {
+            $relative = [string]$entry.path
+            if ($relative -match '[\\:]' -or $relative.StartsWith('/') -or
+                ($relative.Split('/') | Where-Object { $_ -eq '' -or $_ -in @('.', '..') -or $_ -match '[. ]$' }) -or
+                $relative -match '^(Content|Mods)(/|$)' -or $relative.StartsWith('.') -or
+                $relative -in @('rebellion2-launcher.exe', 'rebellion2-update-helper.exe') -or -not $seen.Add($relative)) {
+              throw "Unsafe or duplicate player path: $relative"
+            }
+            $source = [IO.Path]::GetFullPath((Join-Path $unpacked $relative))
+            if (-not $source.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw 'Player path escapes its source.' }
+            $file = Get-Item -LiteralPath $source
+            if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                $file.Length -ne $entry.size -or (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.sha256) {
+              throw "The released player failed verification: $relative"
+            }
+            $destination = Join-Path $PWD "player/$relative"
+            New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination
+          }
+          if (-not (Test-Path -LiteralPath player/Rebellion2.exe)) { throw 'The released player is missing its executable.' }
+          Copy-Item -LiteralPath $manifestPath -Destination game-manifest.json
+          Set-Content game-version.txt -Value $env:GAME_VERSION -NoNewline
+
+      - name: Verify the published launcher bundle
+        shell: pwsh
+        env:
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = $env:CHANNEL_BASE.TrimEnd('/') + '/'
+          $pointer = Invoke-RestMethod ($base + 'dist/launcher.json')
+          if ($pointer.version -ne $env:LAUNCHER_VERSION) { throw 'The requested launcher is not the current published launcher.' }
+          $relative = [string]$pointer.platforms.windows.manifest
+          if ($relative -notmatch '^dist/[A-Za-z0-9._-]+\.json$') { throw 'Invalid launcher manifest location.' }
+          Invoke-WebRequest ($base + $relative) -OutFile launcher-manifest.json
+          $manifest = Get-Content -Raw launcher-manifest.json | ConvertFrom-Json
+          if ($manifest.version -ne $env:LAUNCHER_VERSION -or $manifest.files.Count -ne 2) { throw 'Invalid launcher manifest.' }
+          Expand-Archive previous/Rebellion2-launcher-Windows.zip launcher-bundle
+          $expected = @('rebellion2-launcher.exe', 'rebellion2-update-helper.exe')
+          foreach ($entry in $manifest.files) {
+            if ($entry.path -cnotin $expected) { throw 'Unexpected launcher file.' }
+            $expected = @($expected | Where-Object { $_ -cne $entry.path })
+            $file = Get-Item -LiteralPath (Join-Path launcher-bundle $entry.path)
+            if ($file.PSIsContainer -or $file.Length -ne $entry.size -or
+                (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.sha256) {
+              throw 'The launcher bundle failed verification.'
+            }
+          }
+          if ($expected.Count -ne 0) { throw 'The launcher bundle is incomplete.' }
+          Set-Content launcher-version.txt -Value $env:LAUNCHER_VERSION -NoNewline
+
+      - name: Build refreshed installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install Inno Setup.' }
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' `
+            "/DGameDir=$PWD\player" `
+            "/DLauncherPath=$PWD\launcher-bundle\rebellion2-launcher.exe" `
+            "/DUpdateHelperPath=$PWD\launcher-bundle\rebellion2-update-helper.exe" `
+            "/DLauncherManifestPath=$PWD\launcher-manifest.json" `
+            "/DLauncherVersionPath=$PWD\launcher-version.txt" `
+            "/DGameManifestPath=$PWD\game-manifest.json" `
+            "/DGameVersionPath=$PWD\game-version.txt" `
+            "/DAppVersion=$env:GAME_VERSION" `
+            "/DOutputDir=$PWD\dist" `
+            "/DIconFile=$PWD\launcher\src-tauri\icons\icon.ico" `
+            packaging/windows/rebellion2-launcher.iss
+          if ($LASTEXITCODE -ne 0) { throw 'The refreshed installer could not be compiled.' }
+          Move-Item -LiteralPath "dist/Rebellion2-$env:GAME_VERSION-Setup.exe" -Destination Rebellion2-Windows-Setup.exe
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: refreshed-windows-installer
+          path: Rebellion2-Windows-Setup.exe
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: refreshed-windows-installer
+      - name: Replace only the Windows installer asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME_VERSION: ${{ inputs.game_version }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "v$GAME_VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          gh release upload "v$GAME_VERSION" Rebellion2-Windows-Setup.exe --clobber --repo "$GITHUB_REPOSITORY"
