@@ -64,6 +64,7 @@ const CONTENT_VERSION_FILE: &str = ".content-version";
 const CONTENT_MANIFEST_FILE: &str = ".manifest.json";
 const CONTENT_INSTALL_STAGING_DIRECTORY: &str = ".content-install-staging";
 const APPROVED_CONTENT_UPDATE_FILE: &str = ".approved-content-update";
+const LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.json";
 const LAUNCHER_VERSION_FILE: &str = ".launcher-version";
 const PENDING_LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.pending.json";
 const PENDING_LAUNCHER_VERSION_FILE: &str = ".launcher-version.pending";
@@ -2341,7 +2342,31 @@ fn hand_off_pending_launcher_update() -> bool {
         return false;
     };
     match metadata_dir.join(STAGED_LAUNCHER_FILE_NAME).try_exists() {
-        Ok(false) => return false,
+        Ok(false) => {
+            let Ok(launcher) = launcher_path() else {
+                return false;
+            };
+            match recover_completed_launcher_handoff(&metadata_dir, &launcher) {
+                Ok(CompletedLauncherHandoffState::None) => {}
+                Ok(CompletedLauncherHandoffState::Recovered) => {
+                    log_line("[launcher] completed interrupted launcher metadata promotion.");
+                }
+                #[cfg(target_os = "windows")]
+                Ok(CompletedLauncherHandoffState::WaitingForContent) => {
+                    log_line(
+                        "[launcher] promoted application launcher is waiting for its matching Content update.",
+                    );
+                }
+                Ok(CompletedLauncherHandoffState::Invalid) => {
+                    log_line("[launcher] discarding invalid pending launcher metadata.");
+                    clear_incomplete_launcher_update(&metadata_dir);
+                }
+                Err(error) => log_line(&format!(
+                    "[launcher] couldn't recover launcher metadata promotion: {error}"
+                )),
+            }
+            return false;
+        }
         Ok(true) => {}
         Err(error) => {
             log_line(&format!(
@@ -2388,6 +2413,214 @@ enum StagedLauncherUpdateState {
     #[cfg(target_os = "windows")]
     WaitingForContent,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletedLauncherHandoffState {
+    None,
+    Recovered,
+    #[cfg(target_os = "windows")]
+    WaitingForContent,
+    Invalid,
+}
+
+/// Finishes metadata promotion when the helper already replaced the staged launcher.
+fn recover_completed_launcher_handoff(
+    metadata_dir: &Path,
+    launcher: &Path,
+) -> io::Result<CompletedLauncherHandoffState> {
+    let pending_launcher_manifest = metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE);
+    let pending_launcher_version = metadata_dir.join(PENDING_LAUNCHER_VERSION_FILE);
+    let has_launcher_metadata =
+        pending_launcher_manifest.try_exists()? || pending_launcher_version.try_exists()?;
+
+    #[cfg(target_os = "windows")]
+    let has_application_metadata = metadata_dir
+        .join(PENDING_APPLICATION_MANIFEST_FILE)
+        .try_exists()?
+        || metadata_dir
+            .join(PENDING_APPLICATION_VERSION_FILE)
+            .try_exists()?;
+    #[cfg(not(target_os = "windows"))]
+    let has_application_metadata = false;
+
+    if !has_launcher_metadata && !has_application_metadata {
+        return Ok(CompletedLauncherHandoffState::None);
+    }
+    if has_launcher_metadata && has_application_metadata {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    }
+
+    if has_launcher_metadata {
+        return recover_launcher_metadata(metadata_dir, launcher);
+    }
+
+    #[cfg(target_os = "windows")]
+    return recover_application_metadata(metadata_dir, launcher);
+
+    #[cfg(not(target_os = "windows"))]
+    Ok(CompletedLauncherHandoffState::Invalid)
+}
+
+/// Validates the installed launcher before completing launcher-only metadata promotion.
+fn recover_launcher_metadata(
+    metadata_dir: &Path,
+    launcher: &Path,
+) -> io::Result<CompletedLauncherHandoffState> {
+    let Some(manifest_bytes) = read_pending_or_installed_file(
+        metadata_dir,
+        PENDING_LAUNCHER_MANIFEST_FILE,
+        LAUNCHER_MANIFEST_FILE,
+    )?
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Some(version_bytes) = read_pending_or_installed_file(
+        metadata_dir,
+        PENDING_LAUNCHER_VERSION_FILE,
+        LAUNCHER_VERSION_FILE,
+    )?
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Ok(manifest) = Manifest::from_json(&manifest_bytes) else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Ok(version) = std::str::from_utf8(&version_bytes) else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Ok((launcher_entry, helper_entry)) = validate_launcher_manifest(&manifest, version.trim())
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let helper = metadata_dir.join(UPDATE_HELPER_FILE_NAME);
+    if !file_matches_entry_or_missing(launcher, launcher_entry)?
+        || !file_matches_entry_or_missing(&helper, helper_entry)?
+    {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    }
+
+    promote_pending_metadata(
+        metadata_dir,
+        PENDING_LAUNCHER_MANIFEST_FILE,
+        LAUNCHER_MANIFEST_FILE,
+    )?;
+    promote_pending_metadata(
+        metadata_dir,
+        PENDING_LAUNCHER_VERSION_FILE,
+        LAUNCHER_VERSION_FILE,
+    )?;
+    Ok(CompletedLauncherHandoffState::Recovered)
+}
+
+/// Validates a promoted legacy launcher before completing application metadata promotion.
+#[cfg(target_os = "windows")]
+fn recover_application_metadata(
+    metadata_dir: &Path,
+    launcher: &Path,
+) -> io::Result<CompletedLauncherHandoffState> {
+    let Some(manifest_bytes) = read_pending_or_installed_file(
+        metadata_dir,
+        PENDING_APPLICATION_MANIFEST_FILE,
+        APPLICATION_MANIFEST_FILE,
+    )?
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Some(version_bytes) = read_pending_or_installed_file(
+        metadata_dir,
+        PENDING_APPLICATION_VERSION_FILE,
+        APPLICATION_VERSION_FILE,
+    )?
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Ok(manifest) = Manifest::from_json(&manifest_bytes) else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Ok(version) = std::str::from_utf8(&version_bytes) else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    if validate_application_manifest(&manifest, version.trim()).is_err() {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    }
+    let Some(launcher_entry) = manifest
+        .files
+        .iter()
+        .find(|entry| entry.path == LAUNCHER_FILE_NAME)
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let Some(helper_entry) = manifest
+        .files
+        .iter()
+        .find(|entry| entry.path == UPDATE_HELPER_FILE_NAME)
+    else {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    };
+    let helper = metadata_dir.join(UPDATE_HELPER_FILE_NAME);
+    if !file_matches_entry_or_missing(launcher, launcher_entry)?
+        || !file_matches_entry_or_missing(&helper, helper_entry)?
+    {
+        return Ok(CompletedLauncherHandoffState::Invalid);
+    }
+    if read_installed_version(&metadata_dir.join("Content")).as_deref() != Some(version.trim()) {
+        return Ok(CompletedLauncherHandoffState::WaitingForContent);
+    }
+
+    promote_pending_metadata(
+        metadata_dir,
+        PENDING_APPLICATION_MANIFEST_FILE,
+        APPLICATION_MANIFEST_FILE,
+    )?;
+    promote_pending_metadata(
+        metadata_dir,
+        PENDING_APPLICATION_VERSION_FILE,
+        APPLICATION_VERSION_FILE,
+    )?;
+    Ok(CompletedLauncherHandoffState::Recovered)
+}
+
+/// Reads pending metadata first and falls back to an already promoted counterpart.
+fn read_pending_or_installed_file(
+    metadata_dir: &Path,
+    pending_name: &str,
+    installed_name: &str,
+) -> io::Result<Option<Vec<u8>>> {
+    for path in [
+        metadata_dir.join(pending_name),
+        metadata_dir.join(installed_name),
+    ] {
+        match fs::read(path) {
+            Ok(bytes) => return Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// Promotes one remaining pending metadata file while tolerating earlier promotion.
+fn promote_pending_metadata(
+    metadata_dir: &Path,
+    pending_name: &str,
+    installed_name: &str,
+) -> io::Result<()> {
+    let pending = metadata_dir.join(pending_name);
+    match pending.try_exists() {
+        Ok(true) => replace_file_atomically(&pending, &metadata_dir.join(installed_name)),
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Treats a missing artifact as an invalid handoff rather than a launcher I/O failure.
+fn file_matches_entry_or_missing(path: &Path, entry: &FileEntry) -> io::Result<bool> {
+    match file_matches_entry(path, entry) {
+        Ok(matches) => Ok(matches),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Verifies every staged launcher artifact before allowing the handoff helper to run.
@@ -5407,6 +5640,267 @@ mod tests {
         assert_eq!(
             staged_launcher_update_state(directory.path()).unwrap(),
             StagedLauncherUpdateState::Invalid
+        );
+    }
+
+    #[test]
+    fn recover_completed_launcher_handoff_with_verified_files_promotes_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("installed-launcher");
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(&launcher, LAUNCHER_FILE_NAME.as_bytes()).unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(directory.path(), &launcher).unwrap(),
+            CompletedLauncherHandoffState::Recovered
+        );
+        assert_eq!(
+            fs::read(directory.path().join(LAUNCHER_MANIFEST_FILE)).unwrap(),
+            serde_json::to_vec(&manifest).unwrap()
+        );
+        assert_eq!(
+            fs::read(directory.path().join(LAUNCHER_VERSION_FILE)).unwrap(),
+            b"1.2.3"
+        );
+        assert!(!directory
+            .path()
+            .join(PENDING_LAUNCHER_MANIFEST_FILE)
+            .exists());
+        assert!(!directory
+            .path()
+            .join(PENDING_LAUNCHER_VERSION_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn recover_completed_launcher_handoff_after_manifest_promotion_finishes_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("installed-launcher");
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(&launcher, LAUNCHER_FILE_NAME.as_bytes()).unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(LAUNCHER_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(directory.path(), &launcher).unwrap(),
+            CompletedLauncherHandoffState::Recovered
+        );
+        assert_eq!(
+            fs::read(directory.path().join(LAUNCHER_VERSION_FILE)).unwrap(),
+            b"1.2.3"
+        );
+        assert!(!directory
+            .path()
+            .join(PENDING_LAUNCHER_VERSION_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn recover_completed_launcher_handoff_with_no_pending_metadata_does_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(
+                directory.path(),
+                &directory.path().join("missing-launcher")
+            )
+            .unwrap(),
+            CompletedLauncherHandoffState::None
+        );
+    }
+
+    #[test]
+    fn recover_completed_launcher_handoff_with_corrupt_launcher_rejects_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("installed-launcher");
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(&launcher, b"corrupt").unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(directory.path(), &launcher).unwrap(),
+            CompletedLauncherHandoffState::Invalid
+        );
+        assert!(directory
+            .path()
+            .join(PENDING_LAUNCHER_MANIFEST_FILE)
+            .exists());
+        assert!(directory
+            .path()
+            .join(PENDING_LAUNCHER_VERSION_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn recover_completed_launcher_handoff_with_malformed_metadata_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_MANIFEST_FILE),
+            b"not-json",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(
+                directory.path(),
+                &directory.path().join("missing-launcher")
+            )
+            .unwrap(),
+            CompletedLauncherHandoffState::Invalid
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recover_completed_application_handoff_waits_for_matching_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("installed-launcher");
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(&launcher, LAUNCHER_FILE_NAME.as_bytes()).unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(directory.path(), &launcher).unwrap(),
+            CompletedLauncherHandoffState::WaitingForContent
+        );
+        assert!(directory
+            .path()
+            .join(PENDING_APPLICATION_MANIFEST_FILE)
+            .exists());
+        assert!(directory
+            .path()
+            .join(PENDING_APPLICATION_VERSION_FILE)
+            .exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recover_completed_application_handoff_with_matching_content_promotes_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("installed-launcher");
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(&launcher, LAUNCHER_FILE_NAME.as_bytes()).unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("Content")).unwrap();
+        fs::write(
+            directory.path().join("Content").join(CONTENT_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(directory.path(), &launcher).unwrap(),
+            CompletedLauncherHandoffState::Recovered
+        );
+        assert!(directory.path().join(APPLICATION_MANIFEST_FILE).is_file());
+        assert_eq!(
+            fs::read(directory.path().join(APPLICATION_VERSION_FILE)).unwrap(),
+            b"1.2.3"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recover_completed_launcher_handoff_with_mixed_metadata_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_completed_launcher_handoff(
+                directory.path(),
+                &directory.path().join("missing-launcher")
+            )
+            .unwrap(),
+            CompletedLauncherHandoffState::Invalid
         );
     }
 

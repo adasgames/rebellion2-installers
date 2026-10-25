@@ -876,6 +876,50 @@ mod tests {
     }
 
     #[test]
+    fn fresh_install_replaces_corrupt_owned_destination_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = release();
+        let (manifest, blobs) = install_fixture();
+        let destination = install_directory(root.path(), &pack).unwrap();
+        let metadata = metadata_directory(root.path(), &pack.id);
+        fs::create_dir_all(&metadata).unwrap();
+        write_json_atomically(&metadata.join(PENDING_INSTALL_FILE), &install_record(&pack))
+            .unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("pack.xml"), b"corrupt").unwrap();
+        let complete_blobs = TestBlobs {
+            values: blobs.values,
+            fail_on: None,
+        };
+
+        assert_eq!(
+            install_fresh(root.path(), &pack, &manifest, &complete_blobs).unwrap(),
+            2
+        );
+        assert!(verify_install(&destination, &manifest).unwrap());
+        assert!(read_installed(root.path(), &pack.id).is_some());
+    }
+
+    #[test]
+    fn fresh_install_replaces_empty_destination_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = release();
+        let (manifest, blobs) = install_fixture();
+        let destination = install_directory(root.path(), &pack).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let complete_blobs = TestBlobs {
+            values: blobs.values,
+            fail_on: None,
+        };
+
+        assert_eq!(
+            install_fresh(root.path(), &pack, &manifest, &complete_blobs).unwrap(),
+            2
+        );
+        assert!(verify_install(&destination, &manifest).unwrap());
+    }
+
+    #[test]
     fn read_pack_version_requires_matching_identity() {
         let root = tempfile::tempdir().unwrap();
         let definition = root.path().join("pack.xml");

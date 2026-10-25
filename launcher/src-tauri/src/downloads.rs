@@ -224,6 +224,28 @@ fn download_to_path_with_sleep(
                 .then(|| response.header("Content-Length")?.parse().ok())
                 .flatten()
         });
+        if response_status == 206
+            && known_size.is_none()
+            && response_total.is_none()
+            && spec.expected_sha256.is_none()
+        {
+            reset_partial(&partial, &etag_path, &size_path)?;
+            known_size = spec.expected_size;
+            let error = DownloadError::InvalidData(
+                "download server did not report the total size of the resumed file".to_string(),
+            );
+            if !schedule_retry(
+                attempt,
+                None,
+                error,
+                &mut last_error,
+                &mut retrying,
+                &mut sleep,
+            ) {
+                break;
+            }
+            continue;
+        }
         if resumed
             && known_size.is_some()
             && response_total.is_some()
@@ -355,11 +377,11 @@ struct ContentRange {
 fn parse_content_range(value: &str) -> Option<ContentRange> {
     let value = value.strip_prefix("bytes ")?;
     let (range, total) = value.split_once('/')?;
-    let (start, _) = range.split_once('-')?;
-    Some(ContentRange {
-        start: start.parse().ok()?,
-        total: (total != "*").then(|| total.parse().ok()).flatten(),
-    })
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total = (total != "*").then(|| total.parse().ok()).flatten();
+    (start <= end && total.is_none_or(|total| end < total)).then_some(ContentRange { start, total })
 }
 
 fn schedule_retry(
@@ -616,6 +638,34 @@ mod tests {
     }
 
     #[test]
+    fn download_to_path_unknown_resumed_total_restarts_unhashed_download() {
+        let body = b"abcdefghij";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_unknown_total_then_full(body, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("content.zip");
+        fs::write(partial_path(&destination), &body[..4]).unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: None,
+                expected_sha256: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].contains("Range: bytes=4-"));
+        assert!(!requests[1].contains("Range:"));
+    }
+
+    #[test]
     fn download_to_path_verified_cache_avoids_network_request() {
         let body = b"already downloaded";
         let directory = tempfile::tempdir().unwrap();
@@ -770,6 +820,255 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_to_path_range_not_satisfiable_resets_partial_and_retries_from_zero() {
+        let body = b"abcdefghij";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_range_not_satisfiable_then_full(body, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        fs::write(partial_path(&destination), b"stale").unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].contains("Range: bytes=5-"));
+        assert!(!requests[1].contains("Range:"));
+    }
+
+    #[test]
+    fn download_to_path_invalid_content_range_restarts_from_zero() {
+        let body = b"abcdefghij";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_invalid_range_then_full(body, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        fs::write(partial_path(&destination), &body[..4]).unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].contains("Range: bytes=4-"));
+        assert!(!requests[1].contains("Range:"));
+    }
+
+    #[test]
+    fn download_to_path_resume_sends_saved_etag_as_if_range() {
+        let body = b"abcdefghij";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve(body, 1, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        fs::write(partial_path(&destination), &body[..4]).unwrap();
+        fs::write(metadata_path(&destination, "etag"), b"\"release-1\"").unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let request = &requests.lock().unwrap()[0];
+        assert!(request.contains("Range: bytes=4-"));
+        assert!(request.contains("If-Range: \"release-1\""));
+    }
+
+    #[test]
+    fn download_to_path_server_size_mismatch_never_promotes_file() {
+        let body = b"short";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_full_repeated(body, MAX_ATTEMPTS, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+
+        let error = download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(10),
+                expected_sha256: None,
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("expected 10"));
+        assert_eq!(requests.lock().unwrap().len(), MAX_ATTEMPTS);
+        assert!(!destination.exists());
+        assert!(!partial_path(&destination).exists());
+    }
+
+    #[test]
+    fn download_to_path_retryable_status_stops_after_maximum_attempts() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_status_repeated(500, MAX_ATTEMPTS, requests.clone(), None);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        let mut retry_numbers = Vec::new();
+
+        let error = download_to_path_with_sleep(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(1),
+                expected_sha256: None,
+            },
+            |_| {},
+            |attempt, _, _| retry_numbers.push(attempt),
+            |_| {},
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.status(), Some(500));
+        assert_eq!(requests.lock().unwrap().len(), MAX_ATTEMPTS);
+        assert_eq!(retry_numbers, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn download_to_path_retry_after_is_capped_before_sleeping() {
+        let body = b"ok";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_retry_after_then_full(body, requests);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        let mut reported_delays = Vec::new();
+        let mut slept_delays = Vec::new();
+
+        download_to_path_with_sleep(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+            |_, delay, _| reported_delays.push(delay),
+            |delay| slept_delays.push(delay),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(reported_delays, vec![MAX_RETRY_DELAY]);
+        assert_eq!(slept_delays, vec![MAX_RETRY_DELAY]);
+        assert_eq!(fs::read(destination).unwrap(), body);
+    }
+
+    #[test]
+    fn download_to_path_unauthorized_status_is_not_retried() {
+        let (url, server) = serve_status(401);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        let mut retries = 0;
+
+        let error = download_to_path_with_sleep(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(1),
+                expected_sha256: None,
+            },
+            |_| {},
+            |_, _, _| retries += 1,
+            |_| {},
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.status(), Some(401));
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn download_to_path_corrupt_destination_is_replaced_from_network() {
+        let body = b"replacement";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_full_repeated(body, 1, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        fs::write(&destination, b"corrupt-data").unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(fs::read(destination).unwrap(), body);
+    }
+
+    #[test]
+    fn clear_download_metadata_and_cache_are_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        fs::write(metadata_path(&destination, "etag"), b"etag").unwrap();
+        fs::write(metadata_path(&destination, "size"), b"5").unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("blob"), b"cached").unwrap();
+
+        clear_download_metadata(&destination).unwrap();
+        clear_download_metadata(&destination).unwrap();
+        clear_cache(&cache).unwrap();
+        clear_cache(&cache).unwrap();
+
+        assert!(!metadata_path(&destination, "etag").exists());
+        assert!(!metadata_path(&destination, "size").exists());
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn parse_content_range_rejects_reversed_or_out_of_bounds_ranges() {
+        assert!(parse_content_range("bytes 5-4/10").is_none());
+        assert!(parse_content_range("bytes 0-10/10").is_none());
+        assert!(parse_content_range("bytes 0-final/10").is_none());
+        assert_eq!(parse_content_range("bytes 4-9/10").unwrap().start, 4);
+    }
+
     fn download_without_waiting(
         spec: &DownloadSpec<'_>,
         progress: impl FnMut(u64),
@@ -894,6 +1193,177 @@ mod tests {
             )
             .unwrap();
             first.write_all(response_body).unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&second));
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        (url, server)
+    }
+
+    fn serve_range_not_satisfiable_then_full(
+        body: &'static [u8],
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&first));
+            write!(
+                first,
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&second));
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        (url, server)
+    }
+
+    fn serve_unknown_total_then_full(
+        body: &'static [u8],
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let request = read_request(&first);
+            let offset = requested_offset(&request).unwrap();
+            requests.lock().unwrap().push(request);
+            let response_body = &body[offset..];
+            write!(
+                first,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/*\r\nConnection: close\r\n\r\n",
+                response_body.len(),
+                offset,
+                body.len() - 1
+            )
+            .unwrap();
+            first.write_all(response_body).unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&second));
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        (url, server)
+    }
+
+    fn serve_invalid_range_then_full(
+        body: &'static [u8],
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&first));
+            write!(
+                first,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                body.len(),
+                body.len() - 1,
+                body.len()
+            )
+            .unwrap();
+            first.write_all(body).unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&second));
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        (url, server)
+    }
+
+    fn serve_full_repeated(
+        body: &'static [u8],
+        count: usize,
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.lock().unwrap().push(read_request(&stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    fn serve_status_repeated(
+        status: u16,
+        count: usize,
+        requests: Arc<Mutex<Vec<String>>>,
+        retry_after: Option<u64>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.lock().unwrap().push(read_request(&stream));
+                let retry_after = retry_after
+                    .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+                    .unwrap_or_default();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    fn serve_retry_after_then_full(
+        body: &'static [u8],
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&first));
+            write!(
+                first,
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 999\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
 
             let (mut second, _) = listener.accept().unwrap();
             requests.lock().unwrap().push(read_request(&second));

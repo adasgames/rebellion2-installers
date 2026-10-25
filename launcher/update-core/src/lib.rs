@@ -244,6 +244,7 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
     let backup = transaction.join(BACKUP_DIRECTORY);
     let mut original_files = Vec::new();
     for path in touched_paths {
+        validate_managed_path(install_dir, path)?;
         let source = install_dir.join(path);
         match fs::symlink_metadata(&source) {
             Ok(metadata) if metadata.is_file() => {
@@ -294,7 +295,7 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
 pub fn recover_interrupted_apply(install_dir: &Path) -> io::Result<bool> {
     let transaction = install_dir.join(TRANSACTION_DIRECTORY);
     match fs::symlink_metadata(&transaction) {
-        Ok(metadata) if metadata.is_dir() => {}
+        Ok(metadata) if metadata_is_plain_directory(&metadata) => {}
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -338,6 +339,7 @@ fn write_transaction_record(transaction: &Path, record: &TransactionRecord) -> i
 
 fn commit_transaction(install_dir: &Path, transaction: &Path, plan: &Plan) -> io::Result<()> {
     for entry in &plan.changed {
+        validate_managed_path(install_dir, &entry.path)?;
         let source = transaction.join(STAGED_DIRECTORY).join(&entry.path);
         let destination = install_dir.join(&entry.path);
         if let Some(parent) = destination.parent() {
@@ -347,6 +349,7 @@ fn commit_transaction(install_dir: &Path, transaction: &Path, plan: &Plan) -> io
     }
 
     for path in &plan.removed {
+        validate_managed_path(install_dir, path)?;
         remove_file_if_present(&install_dir.join(path))?;
     }
     Ok(())
@@ -371,9 +374,30 @@ fn rollback_transaction(
     touched_paths.extend(record.plan.removed.iter().map(String::as_str));
 
     for path in touched_paths {
+        validate_managed_path(install_dir, path)?;
         let destination = install_dir.join(path);
         if original_paths.contains(&manifest_path_key(path)) {
-            let source = transaction.join(BACKUP_DIRECTORY).join(path);
+            let backup = transaction.join(BACKUP_DIRECTORY);
+            if !fs::symlink_metadata(&backup)
+                .is_ok_and(|metadata| metadata_is_plain_directory(&metadata))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "update backup path is not a directory",
+                ));
+            }
+            let source = backup.join(path);
+            validate_managed_path(&backup, path)?;
+            match fs::symlink_metadata(&source) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "update backup is not a regular file",
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
             let replacement = transaction.join(ROLLBACK_DIRECTORY).join(path);
             if let Some(parent) = replacement.parent() {
                 fs::create_dir_all(parent)?;
@@ -466,6 +490,47 @@ fn is_safe_manifest_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+fn validate_managed_path(root: &Path, relative: &str) -> io::Result<()> {
+    let Some(parent) = Path::new(relative).parent() else {
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    for component in parent.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata_is_plain_directory(&metadata) => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "managed path has a non-directory parent: {}",
+                        current.display()
+                    ),
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn metadata_is_plain_directory(metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
 /// Atomically replaces a destination with a prepared file on the same volume.
 #[cfg(target_os = "windows")]
 pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
@@ -503,15 +568,19 @@ pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<
 /// this return `true` — i.e. the patched install is bit-identical to a clean
 /// full install of the same version.
 pub fn verify_install(install_dir: &Path, manifest: &Manifest) -> io::Result<bool> {
+    validate_manifest(manifest)?;
     for entry in &manifest.files {
+        validate_managed_path(install_dir, &entry.path)?;
         let path = install_dir.join(&entry.path);
-        let mut file = match fs::File::open(&path) {
-            Ok(file) => file,
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => return Ok(false),
             Err(_) => return Ok(false),
         };
-        if file.metadata()?.len() != entry.size {
+        if metadata.len() != entry.size {
             return Ok(false);
         }
+        let mut file = fs::File::open(&path)?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         if sha256_hex(&buf) != entry.sha256 {
@@ -771,6 +840,115 @@ mod tests {
     }
 
     #[test]
+    fn recover_interrupted_apply_without_record_removes_abandoned_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(transaction.join(STAGED_DIRECTORY)).unwrap();
+        fs::write(
+            transaction.join(STAGED_DIRECTORY).join("partial"),
+            b"partial",
+        )
+        .unwrap();
+
+        assert!(recover_interrupted_apply(directory.path()).unwrap());
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn recover_interrupted_apply_with_malformed_record_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("live");
+        fs::write(&live, b"unchanged").unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(&transaction).unwrap();
+        fs::write(transaction.join(TRANSACTION_RECORD_FILE), b"not-json").unwrap();
+
+        let error = recover_interrupted_apply(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(live).unwrap(), b"unchanged");
+        assert!(transaction.exists());
+    }
+
+    #[test]
+    fn apply_empty_plan_recovers_abandoned_transaction_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(transaction.join(STAGED_DIRECTORY)).unwrap();
+
+        assert_eq!(
+            apply(&Plan::default(), directory.path(), &store(&[])).unwrap(),
+            0
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn recover_interrupted_apply_rejects_original_path_not_touched_by_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(&transaction).unwrap();
+        let record = TransactionRecord {
+            plan: Plan {
+                changed: vec![entry("changed", b"new")],
+                removed: Vec::new(),
+            },
+            original_files: vec!["unrelated".to_string()],
+        };
+        write_transaction_record(&transaction, &record).unwrap();
+
+        let error = recover_interrupted_apply(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(transaction.exists());
+    }
+
+    #[test]
+    fn apply_rejects_duplicate_changed_paths_before_fetching() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = Plan {
+            changed: vec![entry("same", b"first"), entry("same", b"second")],
+            removed: Vec::new(),
+        };
+
+        let error = apply(&plan, directory.path(), &store(&[])).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!directory.path().join(TRANSACTION_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn apply_rejects_duplicate_removed_paths_before_mutating_install() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("same"), b"keep").unwrap();
+        let plan = Plan {
+            changed: Vec::new(),
+            removed: vec!["same".to_string(), "same".to_string()],
+        };
+
+        let error = apply(&plan, directory.path(), &store(&[])).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(directory.path().join("same")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn apply_changed_path_also_listed_for_removal_keeps_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("same"), b"old").unwrap();
+        let plan = Plan {
+            changed: vec![entry("same", b"new")],
+            removed: vec!["same".to_string()],
+        };
+
+        assert_eq!(
+            apply(&plan, directory.path(), &store(&[("same", b"new")])).unwrap(),
+            1
+        );
+        assert_eq!(fs::read(directory.path().join("same")).unwrap(), b"new");
+    }
+
+    #[test]
     fn apply_with_directory_at_destination_does_not_delete_destination() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("target")).unwrap();
@@ -836,6 +1014,82 @@ mod tests {
         target.files[0].size = 2;
 
         assert!(!verify_install(directory.path(), &target).unwrap());
+    }
+
+    #[test]
+    fn verify_install_rejects_missing_and_hash_mismatched_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = manifest("1", &[("a", b"A")]);
+
+        assert!(!verify_install(directory.path(), &target).unwrap());
+
+        fs::write(directory.path().join("a"), b"B").unwrap();
+        assert!(!verify_install(directory.path(), &target).unwrap());
+
+        fs::write(directory.path().join("a"), b"A").unwrap();
+        assert!(verify_install(directory.path(), &target).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_with_symlink_at_destination_does_not_follow_or_replace_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, directory.path().join("target")).unwrap();
+        let target = manifest("2", &[("target", b"replacement")]);
+
+        let error = apply(
+            &diff(None, &target),
+            directory.path(),
+            &store(&[("target", b"replacement")]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+        assert!(directory.path().join("target").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_with_symlinked_parent_does_not_write_outside_install_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), directory.path().join("nested")).unwrap();
+        let target = manifest("2", &[("nested/target", b"replacement")]);
+
+        let error = apply(
+            &diff(None, &target),
+            directory.path(),
+            &store(&[("nested/target", b"replacement")]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!outside.path().join("target").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_install_rejects_symlinked_file_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("target"), b"A").unwrap();
+
+        symlink(outside.path().join("target"), directory.path().join("file")).unwrap();
+        assert!(!verify_install(directory.path(), &manifest("1", &[("file", b"A")])).unwrap());
+
+        symlink(outside.path(), directory.path().join("nested")).unwrap();
+        assert!(
+            verify_install(directory.path(), &manifest("1", &[("nested/target", b"A")])).is_err()
+        );
     }
 
     #[test]
