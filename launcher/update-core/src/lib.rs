@@ -75,6 +75,25 @@ pub fn validate_manifest_paths(manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
+/// Rejects malformed manifest entries before their hashes are used as blob or cache keys.
+pub fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
+    validate_manifest_paths(manifest)?;
+    for entry in &manifest.files {
+        if entry.sha256.len() != 64
+            || !entry
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest contains an invalid SHA-256 for {}", entry.path),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Match manifest paths using the rules of the platform receiving the update.
 fn manifest_path_key(path: &str) -> String {
     #[cfg(target_os = "windows")]
@@ -103,7 +122,9 @@ impl Plan {
 
     /// Total bytes that must be downloaded to apply this plan.
     pub fn download_size(&self) -> u64 {
-        self.changed.iter().map(|f| f.size).sum()
+        self.changed
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.size))
     }
 }
 
@@ -175,6 +196,17 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
 
     for entry in &plan.changed {
         let bytes = blobs.fetch(entry)?;
+        if bytes.len() as u64 != entry.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "size mismatch for {}: expected {}, got {}",
+                    entry.path,
+                    entry.size,
+                    bytes.len()
+                ),
+            ));
+        }
         let actual = sha256_hex(&bytes);
         if actual != entry.sha256 {
             return Err(io::Error::new(
@@ -409,7 +441,7 @@ fn validate_plan_paths(plan: &Plan) -> io::Result<()> {
         version: String::new(),
         files: plan.changed.clone(),
     };
-    validate_manifest_paths(&manifest)?;
+    validate_manifest(&manifest)?;
     let mut removed_paths = BTreeSet::new();
     for path in &plan.removed {
         if !is_safe_manifest_path(path) || !removed_paths.insert(manifest_path_key(path)) {
@@ -477,6 +509,9 @@ pub fn verify_install(install_dir: &Path, manifest: &Manifest) -> io::Result<boo
             Ok(file) => file,
             Err(_) => return Ok(false),
         };
+        if file.metadata()?.len() != entry.size {
+            return Ok(false);
+        }
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         if sha256_hex(&buf) != entry.sha256 {
@@ -562,6 +597,27 @@ mod tests {
         assert_eq!(plan.download_size(), (b"B2".len() + b"D".len()) as u64);
     }
 
+    #[test]
+    fn download_size_saturates_when_manifest_sizes_exceed_u64() {
+        let plan = Plan {
+            changed: vec![
+                FileEntry {
+                    path: "a".to_string(),
+                    sha256: "0".repeat(64),
+                    size: u64::MAX,
+                },
+                FileEntry {
+                    path: "b".to_string(),
+                    sha256: "1".repeat(64),
+                    size: 1,
+                },
+            ],
+            removed: Vec::new(),
+        };
+
+        assert_eq!(plan.download_size(), u64::MAX);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn diff_does_not_remove_a_windows_path_whose_case_changed() {
@@ -604,6 +660,23 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // nothing partial left behind
         assert!(!dir.path().join("a").exists());
+    }
+
+    #[test]
+    fn blob_with_incorrect_declared_size_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut remote = manifest("1", &[("a", b"A")]);
+        remote.files[0].size = 2;
+
+        let error = apply(
+            &diff(None, &remote),
+            directory.path(),
+            &store(&[("a", b"A")]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!directory.path().join("a").exists());
     }
 
     #[test]
@@ -732,6 +805,37 @@ mod tests {
                 "accepted {path}"
             );
         }
+    }
+
+    #[test]
+    fn manifest_rejects_sha256_values_that_are_not_lowercase_hex() {
+        for sha256 in [
+            "../../outside",
+            "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD",
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            "abcd",
+        ] {
+            let manifest = Manifest {
+                version: "1".to_string(),
+                files: vec![FileEntry {
+                    path: "a".to_string(),
+                    sha256: sha256.to_string(),
+                    size: 1,
+                }],
+            };
+
+            assert!(validate_manifest(&manifest).is_err(), "accepted {sha256}");
+        }
+    }
+
+    #[test]
+    fn verify_install_rejects_incorrect_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a"), b"A").unwrap();
+        let mut target = manifest("1", &[("a", b"A")]);
+        target.files[0].size = 2;
+
+        assert!(!verify_install(directory.path(), &target).unwrap());
     }
 
     #[test]

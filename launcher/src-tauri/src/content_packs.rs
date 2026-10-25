@@ -1,6 +1,6 @@
 use rebellion2_update_core::{
-    apply, diff, replace_file_atomically, validate_manifest_paths, verify_install, BlobSource,
-    Manifest,
+    apply, diff, replace_file_atomically, validate_manifest, validate_manifest_paths,
+    verify_install, BlobSource, Manifest,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as VersionOrdering;
@@ -259,7 +259,7 @@ impl VersionOperator {
 }
 
 pub fn validate_pack_manifest(manifest: &Manifest, pack: &ContentPackRelease) -> io::Result<()> {
-    validate_manifest_paths(manifest)?;
+    validate_manifest(manifest)?;
     if manifest.version != pack.version {
         return Err(invalid_data(
             "content-pack manifest version does not match the catalog",

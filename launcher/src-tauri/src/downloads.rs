@@ -384,6 +384,7 @@ fn schedule_retry(
         last_error.as_ref().expect("download error was stored"),
     );
     sleep(delay);
+    *last_error = None;
     true
 }
 
@@ -738,6 +739,37 @@ mod tests {
         assert!(progress[completed + 1..].contains(&0));
     }
 
+    #[test]
+    fn download_to_path_retry_reports_each_attempts_actual_failure() {
+        let body = b"abcdefghij";
+        let (url, server) = serve_retryable_then_interrupted_then_not_found(body);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        let mut retry_errors = Vec::new();
+
+        let error = download_to_path_with_sleep(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+            |_, _, error| retry_errors.push(error.to_string()),
+            |_| {},
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.status(), Some(404));
+        assert_eq!(retry_errors[0], "HTTP 500");
+        assert_eq!(
+            retry_errors[1],
+            "response body closed before all bytes were read"
+        );
+    }
+
     fn download_without_waiting(
         spec: &DownloadSpec<'_>,
         progress: impl FnMut(u64),
@@ -906,6 +938,42 @@ mod tests {
                 .unwrap();
                 stream.write_all(response_body).unwrap();
             }
+        });
+        (url, server)
+    }
+
+    fn serve_retryable_then_interrupted_then_not_found(
+        body: &'static [u8],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_request(&first);
+            write!(
+                first,
+                "HTTP/1.1 500 Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = read_request(&second);
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(&body[..4]).unwrap();
+            drop(second);
+
+            let (mut third, _) = listener.accept().unwrap();
+            let _ = read_request(&third);
+            write!(
+                third,
+                "HTTP/1.1 404 Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
         (url, server)
     }

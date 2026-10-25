@@ -29,14 +29,15 @@ use std::{fs, io, thread};
 
 use content_packs::{ContentPackCatalog, ContentPackRelease, GAME_DEPENDENCY_ID};
 use downloads::{
-    clear_cache, clear_download_metadata, download_to_path, known_download_size, DownloadSpec,
+    clear_cache, clear_download_metadata, download_to_path, known_download_size, DownloadError,
+    DownloadSpec,
 };
 use rebellion2_update_core::FileEntry;
 #[cfg(target_os = "windows")]
 use rebellion2_update_core::Plan;
 use rebellion2_update_core::{
-    apply, diff, recover_interrupted_apply, replace_file_atomically, sha256_hex,
-    validate_manifest_paths, verify_install, BlobSource, Manifest,
+    apply, diff, recover_interrupted_apply, replace_file_atomically, sha256_hex, validate_manifest,
+    verify_install, BlobSource, Manifest,
 };
 use serde::Deserialize;
 use tauri::{
@@ -1136,6 +1137,7 @@ fn validate_launcher_manifest<'a>(
     manifest: &'a Manifest,
     version: &str,
 ) -> io::Result<(&'a FileEntry, &'a FileEntry)> {
+    validate_manifest(manifest)?;
     if manifest.version != version {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1498,6 +1500,7 @@ fn sign_macos_bundle(bundle: &Path) -> io::Result<()> {
 
 /// Validates that a game manifest cannot overwrite launcher or content files.
 fn validate_game_manifest(manifest: &Manifest, version: &str) -> io::Result<()> {
+    validate_manifest(manifest)?;
     if manifest.version != version || manifest.files.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2121,6 +2124,7 @@ fn verify_signed_manifest(
 /// the installation directory.
 #[cfg(any(target_os = "windows", test))]
 fn validate_application_manifest(manifest: &Manifest, version: &str) -> io::Result<()> {
+    validate_manifest(manifest)?;
     if manifest.version != version {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3035,7 +3039,7 @@ fn do_update(
     update_status(handle, checking_label);
 
     let remote: Manifest = fetch_json(&format!("{base}{}", latest.manifest), token.as_deref())?;
-    validate_base_content_manifest(&remote)?;
+    validate_base_content_release_manifest(&remote, &latest.version)?;
     let local = read_local_manifest(&content_dir)
         .and_then(sanitize_local_base_manifest)
         .or_else(|| {
@@ -3239,17 +3243,6 @@ fn start_install(handle: tauri::AppHandle, url: String) {
                     "[launcher] Content installed to {}",
                     content_dir.display()
                 ));
-                if let (Some(base), Some(version)) = (content_base(), requested_content_version()) {
-                    let token = SESSION.lock().unwrap().clone();
-                    if let Ok(manifest) = fetch_json::<Manifest>(
-                        &format!("{base}dist/manifest-{version}.json"),
-                        token.as_deref(),
-                    ) {
-                        if validate_base_content_manifest(&manifest).is_ok() {
-                            let _ = store_manifest_and_version(&content_dir, &manifest, &version);
-                        }
-                    }
-                }
                 update_progress(&handle, 100, "Starting game…");
                 match launch_game() {
                     Ok(true) => handle.exit(0),
@@ -3265,17 +3258,34 @@ fn start_install(handle: tauri::AppHandle, url: String) {
             Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
                 show_update_required_ui(&handle)
             }
+            Err(err) if presigned_download_requires_authorization(err.as_ref()) => {
+                log_line("[launcher] the Content download link expired; requesting ownership verification.");
+                show_message(
+                    &handle,
+                    "Sign in required",
+                    "Verify ownership again to refresh the download link. Your saved download progress will be reused when possible.",
+                    Some(("Sign in", "signin")),
+                );
+            }
             Err(err) => {
                 log_line(&format!("[launcher] failed to install Content: {err}"));
                 show_message(
                     &handle,
                     "Download interrupted",
                     "The installation could not finish. Any usable download progress was saved. Check your connection, then retry.",
-                    Some(("Retry", "signin")),
+                    Some(("Retry", "install")),
                 );
             }
         }
     });
+}
+
+/// Returns whether a failed first-install request needs a fresh presigned URL.
+fn presigned_download_requires_authorization(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<DownloadError>()
+        .and_then(DownloadError::status)
+        .is_some_and(|status| matches!(status, 401 | 403))
 }
 
 // -- session token + channel helpers -----------------------------------------
@@ -3516,7 +3526,7 @@ fn read_local_manifest(content_dir: &Path) -> Option<Manifest> {
 }
 
 fn validate_base_content_manifest(manifest: &Manifest) -> io::Result<()> {
-    validate_manifest_paths(manifest)?;
+    validate_manifest(manifest)?;
     if let Some(entry) = manifest
         .files
         .iter()
@@ -3533,8 +3543,20 @@ fn validate_base_content_manifest(manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
+/// Validates a base-content manifest against the release pointer that selected it.
+fn validate_base_content_release_manifest(manifest: &Manifest, version: &str) -> io::Result<()> {
+    validate_base_content_manifest(manifest)?;
+    if manifest.version != version {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "base-content manifest version does not match its channel pointer",
+        ));
+    }
+    Ok(())
+}
+
 fn sanitize_local_base_manifest(mut manifest: Manifest) -> Option<Manifest> {
-    validate_manifest_paths(&manifest).ok()?;
+    validate_manifest(&manifest).ok()?;
     manifest
         .files
         .retain(|entry| is_base_content_path(&entry.path));
@@ -3552,6 +3574,7 @@ fn store_manifest_and_version(
     manifest: &Manifest,
     version: &str,
 ) -> io::Result<()> {
+    validate_base_content_release_manifest(manifest, version)?;
     let json = serde_json::to_vec(manifest).map_err(|err| io::Error::other(err.to_string()))?;
     write_file_atomically(content_dir.join(CONTENT_MANIFEST_FILE), &json)?;
     write_file_atomically(content_dir.join(CONTENT_VERSION_FILE), version.as_bytes())?;
@@ -5047,14 +5070,7 @@ fn install_content(
                 &format!("{content_base}dist/manifest-{version}.json"),
                 token.as_deref(),
             )?;
-            if manifest.version != version {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "published Content manifest version does not match the requested release",
-                )
-                .into());
-            }
-            validate_base_content_manifest(&manifest)?;
+            validate_base_content_release_manifest(&manifest, version)?;
             Some(manifest)
         }
         _ => None,
@@ -5594,6 +5610,21 @@ mod tests {
     }
 
     #[test]
+    fn presigned_download_only_requests_authorization_for_expired_link_statuses() {
+        for status in [401, 403] {
+            assert!(presigned_download_requires_authorization(
+                &DownloadError::HttpStatus(status)
+            ));
+        }
+        assert!(!presigned_download_requires_authorization(
+            &DownloadError::HttpStatus(500)
+        ));
+        assert!(!presigned_download_requires_authorization(
+            &DownloadError::InvalidData("truncated".to_string())
+        ));
+    }
+
+    #[test]
     fn content_pack_download_error_identifies_missing_resource() {
         for resource in ["content-pack list", "content-pack manifest"] {
             let error = content_pack_download_error(resource, Box::new(ContentUnavailable));
@@ -6062,10 +6093,27 @@ mod tests {
     }
 
     #[test]
+    fn launcher_manifest_with_invalid_hash_returns_error() {
+        let mut manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        manifest.files[0].sha256 = "../outside".to_string();
+
+        assert!(validate_launcher_manifest(&manifest, "1.2.3").is_err());
+    }
+
+    #[test]
     fn game_manifest_with_player_files_returns_ok() {
         let manifest = application_manifest("0.0.26", &["Rebellion2.exe", "Data/shared.dat"]);
 
         assert!(validate_game_manifest(&manifest, "0.0.26").is_ok());
+    }
+
+    #[test]
+    fn game_manifest_with_invalid_hash_returns_error() {
+        let mut manifest = application_manifest("0.0.26", &["Rebellion2.exe"]);
+        manifest.files[0].sha256 = "../outside".to_string();
+
+        assert!(validate_game_manifest(&manifest, "0.0.26").is_err());
     }
 
     #[test]
@@ -6705,6 +6753,15 @@ mod tests {
     }
 
     #[test]
+    fn validate_application_manifest_with_invalid_hash_returns_error() {
+        let mut manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        manifest.files[0].sha256 = "../outside".to_string();
+
+        assert!(validate_application_manifest(&manifest, "1.2.3").is_err());
+    }
+
+    #[test]
     fn validate_application_manifest_with_different_version_returns_error() {
         let manifest = application_manifest("1.2.3", &[LAUNCHER_FILE_NAME]);
 
@@ -6780,6 +6837,20 @@ mod tests {
         );
 
         assert!(validate_base_content_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn base_content_release_manifest_rejects_different_version() {
+        let manifest = application_manifest(
+            "1.2.3",
+            &[
+                "catalog.xml",
+                "Application/Schemas/content-pack.xsd",
+                "Packs/ClassicGalacticCivilWar/pack.xml",
+            ],
+        );
+
+        assert!(validate_base_content_release_manifest(&manifest, "1.2.4").is_err());
     }
 
     #[test]
