@@ -3159,13 +3159,19 @@ impl BlobSource for HttpBlobs {
                     self.done.fetch_add(added, Ordering::Relaxed) + added
                 } else {
                     let removed = reported - downloaded;
-                    let previous = self
-                        .done
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                            Some(value.saturating_sub(removed))
-                        })
-                        .unwrap_or_else(|previous| previous);
-                    previous.saturating_sub(removed)
+                    let mut previous = self.done.load(Ordering::Relaxed);
+                    loop {
+                        let next = previous.saturating_sub(removed);
+                        match self.done.compare_exchange_weak(
+                            previous,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break next,
+                            Err(actual) => previous = actual,
+                        }
+                    }
                 };
                 reported = downloaded;
                 let percent = scaled_download_percent(
@@ -5986,7 +5992,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("program");
 
-        write_executable(&path, b"program").unwrap();
+        write_executable_atomically(&path, b"program").unwrap();
 
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o111,
