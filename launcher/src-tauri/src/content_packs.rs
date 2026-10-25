@@ -1,5 +1,6 @@
 use rebellion2_update_core::{
-    apply, diff, validate_manifest_paths, verify_install, BlobSource, Manifest,
+    apply, diff, replace_file_atomically, validate_manifest_paths, verify_install, BlobSource,
+    Manifest,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as VersionOrdering;
@@ -341,12 +342,22 @@ pub fn install_fresh(
         ));
     }
 
-    if destination.exists() {
-        if destination_has_files {
-            fs::remove_dir_all(&destination)?;
-        } else {
-            fs::remove_dir(&destination)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if destination_has_files {
+                fs::remove_dir_all(&destination)?;
+            } else {
+                fs::remove_dir(&destination)?;
+            }
         }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", destination.display()),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -433,16 +444,15 @@ fn clear_pending_install(install_root: &Path, id: &str) {
 }
 
 fn directory_has_entries(path: &Path) -> io::Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    if !path.is_dir() {
-        return Err(io::Error::new(
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(fs::read_dir(path)?.next().is_some()),
+        Ok(_) => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{} exists and is not a directory", path.display()),
-        ));
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
-    Ok(fs::read_dir(path)?.next().is_some())
 }
 
 fn remove_directory_if_present(path: &Path) -> io::Result<()> {
@@ -458,10 +468,7 @@ pub fn remove_install_metadata(install_root: &Path, id: &str) -> io::Result<()> 
         return Err(invalid_data("content-pack id must be a lowercase slug"));
     }
     let directory = metadata_directory(install_root, id);
-    if directory.exists() {
-        fs::remove_dir_all(directory)?;
-    }
-    Ok(())
+    remove_directory_if_present(&directory)
 }
 
 pub fn removable_manifest(manifest: &Manifest) -> io::Result<rebellion2_update_core::Plan> {
@@ -517,10 +524,7 @@ fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
     let temporary = path.with_extension("part");
     let bytes = serde_json::to_vec(value).map_err(|error| io::Error::other(error.to_string()))?;
     fs::write(&temporary, bytes)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temporary, path)
+    replace_file_atomically(&temporary, path)
 }
 
 fn invalid_data(message: &str) -> io::Error {
@@ -781,6 +785,21 @@ mod tests {
         assert_eq!(installed.version, pack.version);
         assert_eq!(read_manifest(root.path(), &pack.id).unwrap(), manifest);
         assert!(!root.path().join("Content").exists());
+    }
+
+    #[test]
+    fn write_json_atomically_with_existing_file_replaces_complete_document() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("install.json");
+        fs::write(&path, b"old").unwrap();
+        let record = install_record(&release());
+
+        write_json_atomically(&path, &record).unwrap();
+
+        let stored: InstalledContentPack =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.id, record.id);
+        assert!(!path.with_extension("part").exists());
     }
 
     #[test]

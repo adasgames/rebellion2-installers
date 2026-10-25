@@ -17,6 +17,7 @@ mod content_packs;
 mod downloads;
 
 use std::cmp::Ordering as VersionOrdering;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
 use std::path::Component;
@@ -34,8 +35,8 @@ use rebellion2_update_core::FileEntry;
 #[cfg(target_os = "windows")]
 use rebellion2_update_core::Plan;
 use rebellion2_update_core::{
-    apply, diff, recover_interrupted_apply, sha256_hex, validate_manifest_paths, verify_install,
-    BlobSource, Manifest,
+    apply, diff, recover_interrupted_apply, replace_file_atomically, sha256_hex,
+    validate_manifest_paths, verify_install, BlobSource, Manifest,
 };
 use serde::Deserialize;
 use tauri::{
@@ -151,9 +152,34 @@ static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 static GATE_FAILURE_PENDING: Mutex<Option<String>> = Mutex::new(None);
 /// Set until the bundled launcher page is ready for its first channel scan.
 static INITIAL_SCAN_PENDING: AtomicBool = AtomicBool::new(false);
+/// Prevents overlapping installer operations from sharing transaction and download state.
+static INSTALL_OPERATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Enables the local, network-free split-update walkthrough in debug builds.
 #[cfg(debug_assertions)]
 static PREVIEW_UPDATE_FLOW: AtomicBool = AtomicBool::new(false);
+
+struct InstallOperationGuard;
+
+impl Drop for InstallOperationGuard {
+    fn drop(&mut self) {
+        INSTALL_OPERATION_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+/// Acquires exclusive access to all on-disk installation and update state.
+fn begin_install_operation(handle: &tauri::AppHandle) -> Option<InstallOperationGuard> {
+    if INSTALL_OPERATION_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        update_status(
+            handle,
+            "Another installation operation is already in progress.",
+        );
+        return None;
+    }
+    Some(InstallOperationGuard)
+}
 
 /// Ed25519 public key (hex) that must have signed executable update manifests.
 const APPLICATION_UPDATE_PUBKEY: &str =
@@ -342,7 +368,23 @@ fn main() {
     #[cfg(not(debug_assertions))]
     let preview_update_flow = false;
 
-    if !preview_update_flow && hand_off_pending_launcher_update() {
+    let interrupted_updates_ready = preview_update_flow
+        || match recover_interrupted_updates() {
+            Ok(0) => true,
+            Ok(recovered) => {
+                log_line(&format!(
+                    "[launcher] restored {recovered} interrupted update layer(s) before startup."
+                ));
+                true
+            }
+            Err(error) => {
+                log_line(&format!(
+                    "[launcher] couldn't restore an interrupted update before startup: {error}"
+                ));
+                false
+            }
+        };
+    if !preview_update_flow && interrupted_updates_ready && hand_off_pending_launcher_update() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -623,9 +665,13 @@ fn resume_after_gate(handle: &tauri::AppHandle) {
     if let Some((base, latest, finishes_application_update, progress_start, release_notes)) =
         pending_update
     {
+        let Some(operation) = begin_install_operation(handle) else {
+            return;
+        };
         show_progress_ui_with_release_notes(handle, release_notes.as_ref());
         let handle = handle.clone();
         thread::spawn(move || {
+            let _operation = operation;
             run_update(
                 &handle,
                 &base,
@@ -662,6 +708,13 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     #[cfg(debug_assertions)]
     if PREVIEW_UPDATE_FLOW.load(Ordering::Relaxed) {
         on_preview_choice(handle, choice);
+        return;
+    }
+
+    if INSTALL_OPERATION_IN_PROGRESS.load(Ordering::Acquire) {
+        log_line(&format!(
+            "[launcher] ignored '{choice}' while an installation operation was in progress."
+        ));
         return;
     }
 
@@ -763,9 +816,13 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 release_notes,
             }) = pending
             {
+                let Some(operation) = begin_install_operation(handle) else {
+                    return;
+                };
                 show_progress_ui_with_release_notes(handle, release_notes.as_ref());
                 let handle = handle.clone();
                 thread::spawn(move || {
+                    let _operation = operation;
                     run_update(
                         &handle,
                         &base,
@@ -942,6 +999,9 @@ fn start_launcher_update(handle: &tauri::AppHandle) {
         thread::spawn(move || scan_and_prompt(&handle));
         return;
     };
+    let Some(operation) = begin_install_operation(handle) else {
+        return;
+    };
     let release_notes = content_base().and_then(|base| {
         fetch_release_notes_pointer(
             &base,
@@ -952,27 +1012,30 @@ fn start_launcher_update(handle: &tauri::AppHandle) {
     });
     show_progress_ui_with_release_notes(handle, release_notes.as_ref());
     let handle = handle.clone();
-    thread::spawn(move || match do_launcher_update(&handle, &update) {
-        Ok(()) => {
-            log_line(&format!(
-                "[launcher] launcher update {} staged.",
-                update.version
-            ));
-            LAUNCHER_UPDATE_STAGED.store(true, Ordering::Relaxed);
-            *PENDING_LAUNCHER_UPDATE.lock().unwrap() = None;
-            update_progress(&handle, 100, "Launcher update downloaded.");
-            thread::sleep(Duration::from_millis(900));
-            scan_game_and_content(&handle);
-        }
-        Err(error) => {
-            log_line(&format!("[launcher] launcher update failed: {error}"));
-            show_retryable_failure(
-                &handle,
-                "Update failed",
-                "The launcher update was interrupted. Any download progress was saved.",
-                "launcher-update",
-                Some(("Continue", "skip-launcher-update")),
-            );
+    thread::spawn(move || {
+        let _operation = operation;
+        match do_launcher_update(&handle, &update) {
+            Ok(()) => {
+                log_line(&format!(
+                    "[launcher] launcher update {} staged.",
+                    update.version
+                ));
+                LAUNCHER_UPDATE_STAGED.store(true, Ordering::Relaxed);
+                *PENDING_LAUNCHER_UPDATE.lock().unwrap() = None;
+                update_progress(&handle, 100, "Launcher update downloaded.");
+                thread::sleep(Duration::from_millis(900));
+                scan_game_and_content(&handle);
+            }
+            Err(error) => {
+                log_line(&format!("[launcher] launcher update failed: {error}"));
+                show_retryable_failure(
+                    &handle,
+                    "Update failed",
+                    "The launcher update was interrupted. Any download progress was saved.",
+                    "launcher-update",
+                    Some(("Continue", "skip-launcher-update")),
+                );
+            }
         }
     });
 }
@@ -1001,15 +1064,22 @@ fn do_launcher_update(
     let launcher = fetch_verified_blob(&blobs, launcher_entry)?;
     let helper = fetch_verified_blob(&blobs, helper_entry)?;
     let metadata_dir = install_dir()?;
-    write_executable(&metadata_dir.join(UPDATE_HELPER_FILE_NAME), &helper)?;
-    write_executable(&metadata_dir.join(STAGED_LAUNCHER_FILE_NAME), &launcher)?;
-    fs::write(
+    #[cfg(target_os = "windows")]
+    for stale in [
+        PENDING_APPLICATION_MANIFEST_FILE,
+        PENDING_APPLICATION_VERSION_FILE,
+    ] {
+        remove_path_if_present(&metadata_dir.join(stale))?;
+    }
+    write_executable_atomically(&metadata_dir.join(UPDATE_HELPER_FILE_NAME), &helper)?;
+    write_executable_atomically(&metadata_dir.join(STAGED_LAUNCHER_FILE_NAME), &launcher)?;
+    write_file_atomically(
         metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE),
-        manifest_bytes,
+        &manifest_bytes,
     )?;
-    fs::write(
+    write_file_atomically(
         metadata_dir.join(PENDING_LAUNCHER_VERSION_FILE),
-        &update.version,
+        update.version.as_bytes(),
     )?;
     blobs.clear_cache();
     Ok(())
@@ -1028,9 +1098,25 @@ fn fetch_verified_blob(
 }
 
 /// Writes a launcher component and makes it executable on Unix platforms.
-fn write_executable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::write(path, bytes)?;
-    ensure_executable(path)
+fn write_executable_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path_with_suffix(path, ".writing");
+    remove_path_if_present(&temporary)?;
+    fs::write(&temporary, bytes)?;
+    ensure_executable(&temporary)?;
+    replace_file_atomically(&temporary, path)
+}
+
+fn write_file_atomically(path: PathBuf, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path_with_suffix(&path, ".writing");
+    remove_path_if_present(&temporary)?;
+    fs::write(&temporary, bytes)?;
+    replace_file_atomically(&temporary, &path)
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 /// Ensures a program can be executed on Unix without changing Windows metadata.
@@ -1160,10 +1246,16 @@ fn start_game_update(handle: &tauri::AppHandle) {
         show_update_signin(handle, notes.as_ref());
         return;
     }
+    let Some(operation) = begin_install_operation(handle) else {
+        return;
+    };
     let notes = fetch_release_notes(&content_base().unwrap_or_default(), &update.content);
     show_progress_ui_with_release_notes(handle, notes.as_ref());
     let handle = handle.clone();
-    thread::spawn(move || run_game_update(&handle, &update));
+    thread::spawn(move || {
+        let _operation = operation;
+        run_game_update(&handle, &update);
+    });
 }
 
 /// Applies a signed game-player layer before updating its matching protected content.
@@ -1283,8 +1375,11 @@ fn do_game_update(
         (changed, download_size)
     };
 
-    fs::write(metadata_dir.join(GAME_MANIFEST_FILE), manifest_bytes)?;
-    fs::write(metadata_dir.join(GAME_VERSION_FILE), &update.version)?;
+    write_file_atomically(metadata_dir.join(GAME_MANIFEST_FILE), &manifest_bytes)?;
+    write_file_atomically(
+        metadata_dir.join(GAME_VERSION_FILE),
+        update.version.as_bytes(),
+    )?;
     clear_download_cache("game");
     Ok((changed, download_size))
 }
@@ -1560,10 +1655,16 @@ fn start_application_update(handle: &tauri::AppHandle) {
         if !begin_application_update_or_request_authorization(handle, &update.version) {
             return;
         }
+        let Some(operation) = begin_install_operation(handle) else {
+            return;
+        };
         let release_notes = fetch_current_release_notes(&update.version);
         show_progress_ui_with_release_notes(handle, release_notes.as_ref());
         let handle = handle.clone();
-        thread::spawn(move || run_windows_application_update(&handle, &update));
+        thread::spawn(move || {
+            let _operation = operation;
+            run_windows_application_update(&handle, &update);
+        });
     }
 }
 
@@ -1579,10 +1680,14 @@ fn start_application_update(handle: &tauri::AppHandle) {
     if !begin_application_update_or_request_authorization(handle, &version) {
         return;
     }
+    let Some(operation) = begin_install_operation(handle) else {
+        return;
+    };
     let release_notes = fetch_current_release_notes(&version);
     show_progress_ui_with_release_notes(handle, release_notes.as_ref());
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
+        let _operation = operation;
         run_macos_application_update(&handle).await;
     });
 }
@@ -1977,15 +2082,17 @@ fn do_application_update(
         if sha256_hex(&bytes) != entry.sha256 {
             return Err("staged launcher hash does not match the manifest".into());
         }
-        fs::write(install_dir.join(STAGED_LAUNCHER_FILE_NAME), bytes)?;
+        remove_path_if_present(&install_dir.join(PENDING_LAUNCHER_MANIFEST_FILE))?;
+        remove_path_if_present(&install_dir.join(PENDING_LAUNCHER_VERSION_FILE))?;
+        write_executable_atomically(&install_dir.join(STAGED_LAUNCHER_FILE_NAME), &bytes)?;
     }
-    fs::write(
+    write_file_atomically(
         install_dir.join(PENDING_APPLICATION_MANIFEST_FILE),
-        manifest_bytes,
+        &manifest_bytes,
     )?;
-    fs::write(
+    write_file_atomically(
         install_dir.join(PENDING_APPLICATION_VERSION_FILE),
-        &update.version,
+        update.version.as_bytes(),
     )?;
     blobs.clear_cache();
     update_status(handle, "Application files ready. Updating game content…");
@@ -2229,8 +2336,35 @@ fn hand_off_pending_launcher_update() -> bool {
     let Ok(metadata_dir) = install_dir() else {
         return false;
     };
-    if !metadata_dir.join(STAGED_LAUNCHER_FILE_NAME).is_file() {
-        return false;
+    match metadata_dir.join(STAGED_LAUNCHER_FILE_NAME).try_exists() {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(error) => {
+            log_line(&format!(
+                "[launcher] couldn't inspect the staged launcher update: {error}"
+            ));
+            return false;
+        }
+    }
+    match staged_launcher_update_state(&metadata_dir) {
+        Ok(StagedLauncherUpdateState::Ready) => {}
+        Ok(StagedLauncherUpdateState::WaitingForContent) => {
+            log_line(
+                "[launcher] staged application launcher is waiting for its matching Content update.",
+            );
+            return false;
+        }
+        Ok(StagedLauncherUpdateState::Invalid) => {
+            log_line("[launcher] discarding an incomplete staged launcher update.");
+            clear_incomplete_launcher_update(&metadata_dir);
+            return false;
+        }
+        Err(error) => {
+            log_line(&format!(
+                "[launcher] couldn't validate the staged launcher update: {error}"
+            ));
+            return false;
+        }
     }
     match start_update_helper(true) {
         Ok(()) => true,
@@ -2239,6 +2373,151 @@ fn hand_off_pending_launcher_update() -> bool {
                 "[launcher] couldn't resume the staged launcher update: {error}"
             ));
             false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedLauncherUpdateState {
+    Ready,
+    WaitingForContent,
+    Invalid,
+}
+
+/// Verifies every staged launcher artifact before allowing the handoff helper to run.
+fn staged_launcher_update_state(metadata_dir: &Path) -> io::Result<StagedLauncherUpdateState> {
+    let staged = metadata_dir.join(STAGED_LAUNCHER_FILE_NAME);
+    let helper = metadata_dir.join(UPDATE_HELPER_FILE_NAME);
+    let manifest_path = metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE);
+    let version_path = metadata_dir.join(PENDING_LAUNCHER_VERSION_FILE);
+    let launcher_manifest_exists = manifest_path.try_exists()?;
+    let launcher_version_exists = version_path.try_exists()?;
+    if launcher_manifest_exists || launcher_version_exists {
+        #[cfg(target_os = "windows")]
+        if metadata_dir
+            .join(PENDING_APPLICATION_MANIFEST_FILE)
+            .try_exists()?
+            || metadata_dir
+                .join(PENDING_APPLICATION_VERSION_FILE)
+                .try_exists()?
+        {
+            return Ok(StagedLauncherUpdateState::Invalid);
+        }
+        if !staged.try_exists()?
+            || !helper.try_exists()?
+            || !launcher_manifest_exists
+            || !launcher_version_exists
+        {
+            return Ok(StagedLauncherUpdateState::Invalid);
+        }
+
+        let manifest = match Manifest::from_json(&fs::read(manifest_path)?) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(StagedLauncherUpdateState::Invalid),
+        };
+        let version = fs::read_to_string(version_path)?;
+        let (launcher_entry, helper_entry) =
+            match validate_launcher_manifest(&manifest, version.trim()) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    return Ok(StagedLauncherUpdateState::Invalid)
+                }
+                Err(error) => return Err(error),
+            };
+        if !file_matches_entry(&staged, launcher_entry)?
+            || !file_matches_entry(&helper, helper_entry)?
+        {
+            return Ok(StagedLauncherUpdateState::Invalid);
+        }
+        ensure_executable(&staged)?;
+        ensure_executable(&helper)?;
+        return Ok(StagedLauncherUpdateState::Ready);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        staged_application_launcher_state(metadata_dir, &staged, &helper)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Ok(StagedLauncherUpdateState::Invalid)
+}
+
+/// Validates the staged launcher belonging to a legacy all-application update.
+#[cfg(target_os = "windows")]
+fn staged_application_launcher_state(
+    metadata_dir: &Path,
+    staged: &Path,
+    helper: &Path,
+) -> io::Result<StagedLauncherUpdateState> {
+    let manifest_path = metadata_dir.join(PENDING_APPLICATION_MANIFEST_FILE);
+    let version_path = metadata_dir.join(PENDING_APPLICATION_VERSION_FILE);
+    if !staged.try_exists()?
+        || !helper.try_exists()?
+        || !manifest_path.try_exists()?
+        || !version_path.try_exists()?
+    {
+        return Ok(StagedLauncherUpdateState::Invalid);
+    }
+
+    let manifest = match Manifest::from_json(&fs::read(manifest_path)?) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(StagedLauncherUpdateState::Invalid),
+    };
+    let version = fs::read_to_string(version_path)?;
+    if let Err(error) = validate_application_manifest(&manifest, version.trim()) {
+        if error.kind() == io::ErrorKind::InvalidData {
+            return Ok(StagedLauncherUpdateState::Invalid);
+        }
+        return Err(error);
+    }
+    let Some(launcher_entry) = manifest
+        .files
+        .iter()
+        .find(|entry| entry.path == LAUNCHER_FILE_NAME)
+    else {
+        return Ok(StagedLauncherUpdateState::Invalid);
+    };
+    let Some(helper_entry) = manifest
+        .files
+        .iter()
+        .find(|entry| entry.path == UPDATE_HELPER_FILE_NAME)
+    else {
+        return Ok(StagedLauncherUpdateState::Invalid);
+    };
+    if !file_matches_entry(staged, launcher_entry)? || !file_matches_entry(helper, helper_entry)? {
+        return Ok(StagedLauncherUpdateState::Invalid);
+    }
+    ensure_executable(staged)?;
+    ensure_executable(helper)?;
+
+    let content_version = read_installed_version(&metadata_dir.join("Content"));
+    if content_version.as_deref() != Some(version.trim()) {
+        return Ok(StagedLauncherUpdateState::WaitingForContent);
+    }
+    Ok(StagedLauncherUpdateState::Ready)
+}
+
+fn file_matches_entry(path: &Path, entry: &FileEntry) -> io::Result<bool> {
+    let bytes = fs::read(path)?;
+    Ok(bytes.len() as u64 == entry.size && sha256_hex(&bytes) == entry.sha256)
+}
+
+fn clear_incomplete_launcher_update(metadata_dir: &Path) {
+    for path in [
+        metadata_dir.join(STAGED_LAUNCHER_FILE_NAME),
+        metadata_dir.join(PENDING_LAUNCHER_MANIFEST_FILE),
+        metadata_dir.join(PENDING_LAUNCHER_VERSION_FILE),
+        #[cfg(target_os = "windows")]
+        metadata_dir.join(PENDING_APPLICATION_MANIFEST_FILE),
+        #[cfg(target_os = "windows")]
+        metadata_dir.join(PENDING_APPLICATION_VERSION_FILE),
+    ] {
+        if let Err(error) = remove_path_if_present(&path) {
+            log_line(&format!(
+                "[launcher] couldn't remove incomplete update artifact {}: {error}",
+                path.display()
+            ));
         }
     }
 }
@@ -2429,11 +2708,17 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
         return;
     }
 
+    let Some(operation) = begin_install_operation(handle) else {
+        return;
+    };
     show_progress_ui_with_release_notes(handle, release_notes.as_ref());
     let handle = handle.clone();
     let base = base.to_string();
     let latest = latest.clone();
-    thread::spawn(move || run_update(&handle, &base, &latest, false, 0));
+    thread::spawn(move || {
+        let _operation = operation;
+        run_update(&handle, &base, &latest, false, 0);
+    });
 }
 
 /// Requests authorization when necessary, then computes the update size and prompts.
@@ -2869,9 +3154,20 @@ impl BlobSource for HttpBlobs {
                 expected_sha256: Some(&entry.sha256),
             },
             |downloaded| {
-                let added = downloaded.saturating_sub(reported);
-                reported = reported.max(downloaded);
-                let done = self.done.fetch_add(added, Ordering::Relaxed) + added;
+                let done = if downloaded >= reported {
+                    let added = downloaded - reported;
+                    self.done.fetch_add(added, Ordering::Relaxed) + added
+                } else {
+                    let removed = reported - downloaded;
+                    let previous = self
+                        .done
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                            Some(value.saturating_sub(removed))
+                        })
+                        .unwrap_or_else(|previous| previous);
+                    previous.saturating_sub(removed)
+                };
+                reported = downloaded;
                 let percent = scaled_download_percent(
                     done,
                     self.total,
@@ -2923,47 +3219,53 @@ impl BlobSource for HttpBlobs {
 /// Downloads and extracts the full Content zip (first install), then stores the
 /// version's manifest so future runs patch instead of re-pulling.
 fn start_install(handle: tauri::AppHandle, url: String) {
+    let Some(operation) = begin_install_operation(&handle) else {
+        return;
+    };
     show_progress_ui(&handle);
-    thread::spawn(move || match install_content(&handle, &url) {
-        Ok(content_dir) => {
-            log_line(&format!(
-                "[launcher] Content installed to {}",
-                content_dir.display()
-            ));
-            if let (Some(base), Some(version)) = (content_base(), requested_content_version()) {
-                let token = SESSION.lock().unwrap().clone();
-                if let Ok(manifest) = fetch_json::<Manifest>(
-                    &format!("{base}dist/manifest-{version}.json"),
-                    token.as_deref(),
-                ) {
-                    if validate_base_content_manifest(&manifest).is_ok() {
-                        let _ = store_manifest_and_version(&content_dir, &manifest, &version);
+    thread::spawn(move || {
+        let _operation = operation;
+        match install_content(&handle, &url) {
+            Ok(content_dir) => {
+                log_line(&format!(
+                    "[launcher] Content installed to {}",
+                    content_dir.display()
+                ));
+                if let (Some(base), Some(version)) = (content_base(), requested_content_version()) {
+                    let token = SESSION.lock().unwrap().clone();
+                    if let Ok(manifest) = fetch_json::<Manifest>(
+                        &format!("{base}dist/manifest-{version}.json"),
+                        token.as_deref(),
+                    ) {
+                        if validate_base_content_manifest(&manifest).is_ok() {
+                            let _ = store_manifest_and_version(&content_dir, &manifest, &version);
+                        }
                     }
                 }
+                update_progress(&handle, 100, "Starting game…");
+                match launch_game() {
+                    Ok(true) => handle.exit(0),
+                    Ok(false) => show_message(
+                        &handle,
+                        "Installed",
+                        "The game is ready to play.",
+                        Some(("Launch Game", "play")),
+                    ),
+                    Err(err) => log_line(&format!("[launcher] failed to start the game: {err}")),
+                }
             }
-            update_progress(&handle, 100, "Starting game…");
-            match launch_game() {
-                Ok(true) => handle.exit(0),
-                Ok(false) => show_message(
+            Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
+                show_update_required_ui(&handle)
+            }
+            Err(err) => {
+                log_line(&format!("[launcher] failed to install Content: {err}"));
+                show_message(
                     &handle,
-                    "Installed",
-                    "The game is ready to play.",
-                    Some(("Launch Game", "play")),
-                ),
-                Err(err) => log_line(&format!("[launcher] failed to start the game: {err}")),
+                    "Download interrupted",
+                    "The installation could not finish. Any usable download progress was saved. Check your connection, then retry.",
+                    Some(("Retry", "signin")),
+                );
             }
-        }
-        Err(err) if err.downcast_ref::<ContentUnavailable>().is_some() => {
-            show_update_required_ui(&handle)
-        }
-        Err(err) => {
-            log_line(&format!("[launcher] failed to install Content: {err}"));
-            show_message(
-                &handle,
-                "Download interrupted",
-                "Your download progress was saved. Check your connection, then retry.",
-                Some(("Retry", "signin")),
-            );
         }
     });
 }
@@ -3243,8 +3545,8 @@ fn store_manifest_and_version(
     version: &str,
 ) -> io::Result<()> {
     let json = serde_json::to_vec(manifest).map_err(|err| io::Error::other(err.to_string()))?;
-    fs::write(content_dir.join(CONTENT_MANIFEST_FILE), json)?;
-    fs::write(content_dir.join(CONTENT_VERSION_FILE), version)?;
+    write_file_atomically(content_dir.join(CONTENT_MANIFEST_FILE), &json)?;
+    write_file_atomically(content_dir.join(CONTENT_VERSION_FILE), version.as_bytes())?;
     Ok(())
 }
 
@@ -3794,10 +4096,16 @@ fn start_content_pack_install(handle: &tauri::AppHandle, id: &str) {
         );
         return;
     };
+    let Some(operation) = begin_install_operation(handle) else {
+        return;
+    };
     show_progress_ui(handle);
     update_progress(handle, 0, &format!("Preparing {}\u{2026}", pack.name));
     let handle = handle.clone();
-    thread::spawn(move || run_content_pack_install(&handle, &pack));
+    thread::spawn(move || {
+        let _operation = operation;
+        run_content_pack_install(&handle, &pack);
+    });
 }
 
 fn run_content_pack_install(handle: &tauri::AppHandle, pack: &ContentPackRelease) {
@@ -3934,20 +4242,26 @@ fn installed_content_pack_version(install_root: &Path, id: &str) -> Option<Strin
 }
 
 fn start_content_pack_remove(handle: &tauri::AppHandle, id: &str) {
+    let Some(operation) = begin_install_operation(handle) else {
+        return;
+    };
     let id = id.to_string();
     show_progress_ui(handle);
     update_progress(handle, 10, "Removing content pack\u{2026}");
     let handle = handle.clone();
-    thread::spawn(move || match remove_content_pack(&id) {
-        Ok(()) => {
-            log_line(&format!("[launcher] content pack {id} removed."));
-            update_progress(&handle, 100, "Content pack removed.");
-            thread::sleep(Duration::from_millis(400));
-            show_content_pack_manager(&handle);
-        }
-        Err(error) => {
-            log_line(&format!("[launcher] content-pack removal failed: {error}"));
-            show_content_pack_error(&handle, "Removal failed", &error);
+    thread::spawn(move || {
+        let _operation = operation;
+        match remove_content_pack(&id) {
+            Ok(()) => {
+                log_line(&format!("[launcher] content pack {id} removed."));
+                update_progress(&handle, 100, "Content pack removed.");
+                thread::sleep(Duration::from_millis(400));
+                show_content_pack_manager(&handle);
+            }
+            Err(error) => {
+                log_line(&format!("[launcher] content-pack removal failed: {error}"));
+                show_content_pack_error(&handle, "Removal failed", &error);
+            }
         }
     });
 }
@@ -3996,8 +4310,16 @@ fn remove_content_pack(id: &str) -> io::Result<()> {
 }
 
 fn remove_empty_directories(directory: &Path) -> io::Result<bool> {
-    if !directory.exists() {
-        return Ok(true);
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a directory", directory.display()),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
     }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -4611,6 +4933,16 @@ fn install_content(
                 last_report = current;
                 last_bytes = current;
                 last_time = Instant::now();
+                let total = known_download_size(&archive_path).unwrap_or(0);
+                let percent = current.saturating_mul(100).checked_div(total).unwrap_or(0);
+                update_progress(
+                    handle,
+                    percent,
+                    &format!(
+                        "Restarting Content download… {:.2} GB",
+                        current as f64 / gib
+                    ),
+                );
                 return;
             }
             downloaded = current;
@@ -4668,12 +5000,68 @@ fn install_content(
 
     remove_path_if_present(&extraction_dir)?;
     fs::create_dir_all(&extraction_dir)?;
-    let mut archive = zip::ZipArchive::new(fs::File::open(&archive_path)?)?;
-    archive.extract(&extraction_dir)?;
+    let archive_file = fs::File::open(&archive_path)?;
+    let mut archive = match zip::ZipArchive::new(archive_file) {
+        Ok(archive) => archive,
+        Err(error) => {
+            invalidate_content_archive(&archive_path);
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = archive.extract(&extraction_dir) {
+        drop(archive);
+        invalidate_content_archive(&archive_path);
+        return Err(error.into());
+    }
+    drop(archive);
 
-    let version = requested_content_version().unwrap_or_else(|| "installed".to_string());
-    let target = snapshot_base_content_directory(&extraction_dir, &version, true)?;
-    validate_base_content_manifest(&target)?;
+    let requested_version = requested_content_version();
+    let target = match snapshot_base_content_directory(
+        &extraction_dir,
+        requested_version.as_deref().unwrap_or_default(),
+        true,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            invalidate_content_archive(&archive_path);
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = validate_base_content_manifest(&target) {
+        invalidate_content_archive(&archive_path);
+        return Err(error.into());
+    }
+
+    let token = SESSION.lock().unwrap().clone();
+    let expected = match (content_base(), requested_version.as_deref()) {
+        (Some(content_base), Some(version)) => {
+            let manifest = fetch_json::<Manifest>(
+                &format!("{content_base}dist/manifest-{version}.json"),
+                token.as_deref(),
+            )?;
+            if manifest.version != version {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "published Content manifest version does not match the requested release",
+                )
+                .into());
+            }
+            validate_base_content_manifest(&manifest)?;
+            Some(manifest)
+        }
+        _ => None,
+    };
+    if let Some(expected) = expected.as_ref() {
+        if !manifest_files_match(&target, expected) {
+            invalidate_content_archive(&archive_path);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "downloaded Content archive does not match its published manifest",
+            )
+            .into());
+        }
+    }
+
     let local = snapshot_base_content_directory(&content_dir, "existing", false)?;
     let plan = diff(Some(&local), &target);
     apply(
@@ -4683,9 +5071,15 @@ fn install_content(
             root: extraction_dir.clone(),
         },
     )?;
-    store_manifest_and_version(&content_dir, &target, &version)?;
+    if let Some(version) = requested_version.as_deref() {
+        store_manifest_and_version(&content_dir, expected.as_ref().unwrap_or(&target), version)?;
+    }
 
-    remove_path_if_present(&extraction_dir)?;
+    if let Err(error) = remove_path_if_present(&extraction_dir) {
+        log_line(&format!(
+            "[launcher] unable to remove completed Content staging directory: {error}"
+        ));
+    }
     let _ = fs::remove_file(&archive_path);
     if let Err(error) = clear_download_metadata(&archive_path) {
         log_line(&format!(
@@ -4693,6 +5087,29 @@ fn install_content(
         ));
     }
     Ok(content_dir)
+}
+
+/// Removes a completed Content archive that failed validation so Retry downloads it again.
+fn invalidate_content_archive(archive_path: &Path) {
+    if let Err(error) = remove_path_if_present(archive_path) {
+        log_line(&format!(
+            "[launcher] unable to remove invalid Content archive: {error}"
+        ));
+    }
+    if let Err(error) = clear_download_metadata(archive_path) {
+        log_line(&format!(
+            "[launcher] unable to clear invalid Content download metadata: {error}"
+        ));
+    }
+}
+
+/// Compares manifest file inventories without relying on source ordering or version labels.
+fn manifest_files_match(left: &Manifest, right: &Manifest) -> bool {
+    let mut left_files = left.files.clone();
+    let mut right_files = right.files.clone();
+    left_files.sort_by(|left, right| left.path.cmp(&right.path));
+    right_files.sort_by(|left, right| left.path.cmp(&right.path));
+    left_files == right_files
 }
 
 struct DirectoryBlobs {
@@ -4735,6 +5152,22 @@ fn collect_base_content_files(
         let entry = entry?;
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if !reject_unowned_files {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative != "Application"
+                    && relative != "Packs"
+                    && relative != "Packs/ClassicGalacticCivilWar"
+                    && !relative.starts_with("Application/")
+                    && !relative.starts_with("Packs/ClassicGalacticCivilWar/")
+                {
+                    continue;
+                }
+            }
             collect_base_content_files(root, &entry.path(), reject_unowned_files, files)?;
             continue;
         }
@@ -4770,12 +5203,11 @@ fn collect_base_content_files(
 }
 
 fn remove_path_if_present(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else if path.exists() {
-        fs::remove_file(path)
-    } else {
-        Ok(())
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -4868,6 +5300,153 @@ fn launch_game() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_file_atomically_replaces_complete_file_without_leaving_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        fs::write(&path, b"old").unwrap();
+
+        write_file_atomically(path.clone(), b"new metadata").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new metadata");
+        assert!(!path_with_suffix(&path, ".writing").exists());
+    }
+
+    #[test]
+    fn staged_launcher_update_state_with_verified_files_is_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(
+            directory.path().join(STAGED_LAUNCHER_FILE_NAME),
+            LAUNCHER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            staged_launcher_update_state(directory.path()).unwrap(),
+            StagedLauncherUpdateState::Ready
+        );
+
+        #[cfg(target_os = "windows")]
+        {
+            fs::write(
+                directory.path().join(PENDING_APPLICATION_VERSION_FILE),
+                b"stale",
+            )
+            .unwrap();
+            assert_eq!(
+                staged_launcher_update_state(directory.path()).unwrap(),
+                StagedLauncherUpdateState::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn staged_launcher_update_state_with_corrupt_executable_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(directory.path().join(STAGED_LAUNCHER_FILE_NAME), b"partial").unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_LAUNCHER_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            staged_launcher_update_state(directory.path()).unwrap(),
+            StagedLauncherUpdateState::Invalid
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_application_launcher_waits_for_matching_content_before_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest =
+            application_manifest("1.2.3", &[LAUNCHER_FILE_NAME, UPDATE_HELPER_FILE_NAME]);
+        fs::write(
+            directory.path().join(STAGED_LAUNCHER_FILE_NAME),
+            LAUNCHER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(UPDATE_HELPER_FILE_NAME),
+            UPDATE_HELPER_FILE_NAME.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(PENDING_APPLICATION_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            staged_launcher_update_state(directory.path()).unwrap(),
+            StagedLauncherUpdateState::WaitingForContent
+        );
+
+        fs::create_dir(directory.path().join("Content")).unwrap();
+        fs::write(
+            directory.path().join("Content").join(CONTENT_VERSION_FILE),
+            b"1.2.3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            staged_launcher_update_state(directory.path()).unwrap(),
+            StagedLauncherUpdateState::Ready
+        );
+    }
+
+    #[test]
+    fn manifest_files_match_ignores_order_and_version_but_detects_different_files() {
+        let left = Manifest {
+            version: "first".to_string(),
+            files: vec![entry_for_bytes("b", b"B"), entry_for_bytes("a", b"A")],
+        };
+        let mut right = Manifest {
+            version: "second".to_string(),
+            files: vec![entry_for_bytes("a", b"A"), entry_for_bytes("b", b"B")],
+        };
+
+        assert!(manifest_files_match(&left, &right));
+
+        right.files[1] = entry_for_bytes("b", b"changed");
+        assert!(!manifest_files_match(&left, &right));
+    }
 
     #[test]
     fn reconcile_windows_native_plugins_with_unlisted_plugins_removes_only_unlisted_files() {
@@ -5253,16 +5832,20 @@ mod tests {
         );
     }
 
+    fn entry_for_bytes(path: &str, bytes: &[u8]) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            sha256: sha256_hex(bytes),
+            size: bytes.len() as u64,
+        }
+    }
+
     fn application_manifest(version: &str, paths: &[&str]) -> Manifest {
         Manifest {
             version: version.to_string(),
             files: paths
                 .iter()
-                .map(|path| FileEntry {
-                    path: (*path).to_string(),
-                    sha256: sha256_hex(path.as_bytes()),
-                    size: path.len() as u64,
-                })
+                .map(|path| entry_for_bytes(path, path.as_bytes()))
                 .collect(),
         }
     }

@@ -213,13 +213,23 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
     let mut original_files = Vec::new();
     for path in touched_paths {
         let source = install_dir.join(path);
-        if source.is_file() {
-            let destination = backup.join(path);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
+        match fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.is_file() => {
+                let destination = backup.join(path);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(source, destination)?;
+                original_files.push(path.to_string());
             }
-            fs::copy(source, destination)?;
-            original_files.push(path.to_string());
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("update destination is not a file: {path}"),
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
 
@@ -251,14 +261,32 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
 /// Returns `true` when recovery work was found.
 pub fn recover_interrupted_apply(install_dir: &Path) -> io::Result<bool> {
     let transaction = install_dir.join(TRANSACTION_DIRECTORY);
-    if !transaction.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(&transaction) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "update transaction path is not a directory",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
     }
 
     let record_path = transaction.join(TRANSACTION_RECORD_FILE);
-    if !record_path.is_file() {
-        remove_directory_if_present(&transaction)?;
-        return Ok(true);
+    match fs::symlink_metadata(&record_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "update transaction record is not a file",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            remove_directory_if_present(&transaction)?;
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
     }
 
     let record: TransactionRecord = serde_json::from_slice(&fs::read(record_path)?)
@@ -273,7 +301,7 @@ fn write_transaction_record(transaction: &Path, record: &TransactionRecord) -> i
     let bytes = serde_json::to_vec(record).map_err(|error| io::Error::other(error.to_string()))?;
     let temporary = transaction.join(TRANSACTION_RECORD_TEMP_FILE);
     fs::write(&temporary, bytes)?;
-    replace_file(&temporary, &transaction.join(TRANSACTION_RECORD_FILE))
+    replace_file_atomically(&temporary, &transaction.join(TRANSACTION_RECORD_FILE))
 }
 
 fn commit_transaction(install_dir: &Path, transaction: &Path, plan: &Plan) -> io::Result<()> {
@@ -283,7 +311,7 @@ fn commit_transaction(install_dir: &Path, transaction: &Path, plan: &Plan) -> io
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        replace_file(&source, &destination)?;
+        replace_file_atomically(&source, &destination)?;
     }
 
     for path in &plan.removed {
@@ -322,7 +350,7 @@ fn rollback_transaction(
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            replace_file(&replacement, &destination)?;
+            replace_file_atomically(&replacement, &destination)?;
         } else {
             remove_file_if_present(&destination)?;
         }
@@ -406,8 +434,9 @@ fn is_safe_manifest_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+/// Atomically replaces a destination with a prepared file on the same volume.
 #[cfg(target_os = "windows")]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -431,8 +460,9 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Atomically replaces a destination with a prepared file on the same volume.
 #[cfg(not(target_os = "windows"))]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
@@ -638,6 +668,50 @@ mod tests {
             b"old-removed"
         );
         assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn recover_interrupted_apply_with_file_at_transaction_path_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::write(&transaction, b"not a transaction directory").unwrap();
+
+        let error = recover_interrupted_apply(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(transaction).unwrap(),
+            b"not a transaction directory"
+        );
+    }
+
+    #[test]
+    fn recover_interrupted_apply_with_directory_at_record_path_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(transaction.join(TRANSACTION_RECORD_FILE)).unwrap();
+
+        let error = recover_interrupted_apply(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(transaction.join(TRANSACTION_RECORD_FILE).is_dir());
+    }
+
+    #[test]
+    fn apply_with_directory_at_destination_does_not_delete_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("target")).unwrap();
+        let target = manifest("2", &[("target", b"replacement")]);
+
+        let error = apply(
+            &diff(None, &target),
+            directory.path(),
+            &store(&[("target", b"replacement")]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(directory.path().join("target").is_dir());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use rebellion2_update_core::sha256_hex;
+use rebellion2_update_core::{replace_file_atomically, sha256_hex};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -118,6 +118,7 @@ fn download_to_path_with_sleep(
         let mut offset = partial_length(&partial)?;
         if known_size.is_some_and(|size| offset > size) {
             reset_partial(&partial, &etag_path, &size_path)?;
+            known_size = spec.expected_size;
             offset = 0;
         }
         progress(offset);
@@ -141,6 +142,7 @@ fn download_to_path_with_sleep(
             Err(ureq::Error::Status(status, response)) => {
                 if status == 416 && offset > 0 {
                     reset_partial(&partial, &etag_path, &size_path)?;
+                    known_size = spec.expected_size;
                     let error = DownloadError::HttpStatus(status);
                     if schedule_retry(
                         attempt,
@@ -190,11 +192,11 @@ fn download_to_path_with_sleep(
         let content_range = response
             .header("Content-Range")
             .and_then(parse_content_range);
-        let resumed = offset > 0
-            && response_status == 206
-            && content_range.is_some_and(|range| range.start == offset);
-        if response_status == 206 && offset > 0 && !resumed {
+        let valid_partial_response =
+            response_status != 206 || content_range.is_some_and(|range| range.start == offset);
+        if !valid_partial_response {
             reset_partial(&partial, &etag_path, &size_path)?;
+            known_size = spec.expected_size;
             let error = DownloadError::InvalidData(
                 "download server returned an invalid resume range".to_string(),
             );
@@ -210,16 +212,41 @@ fn download_to_path_with_sleep(
             }
             continue;
         }
+        let resumed = offset > 0 && response_status == 206;
         if offset > 0 && !resumed {
             offset = 0;
             reset_partial(&partial, &etag_path, &size_path)?;
+            known_size = spec.expected_size;
         }
 
-        if let Some(total) = content_range.and_then(|range| range.total).or_else(|| {
+        let response_total = content_range.and_then(|range| range.total).or_else(|| {
             (response_status != 206)
                 .then(|| response.header("Content-Length")?.parse().ok())
                 .flatten()
-        }) {
+        });
+        if resumed
+            && known_size.is_some()
+            && response_total.is_some()
+            && known_size != response_total
+        {
+            reset_partial(&partial, &etag_path, &size_path)?;
+            known_size = spec.expected_size;
+            let error = DownloadError::InvalidData(
+                "download size changed while resuming; restarting from the beginning".to_string(),
+            );
+            if !schedule_retry(
+                attempt,
+                None,
+                error,
+                &mut last_error,
+                &mut retrying,
+                &mut sleep,
+            ) {
+                break;
+            }
+            continue;
+        }
+        if let Some(total) = response_total {
             if spec.expected_size.is_some_and(|expected| expected != total) {
                 let error = DownloadError::InvalidData(format!(
                     "download size changed: expected {}, server reported {total}",
@@ -278,8 +305,7 @@ fn download_to_path_with_sleep(
             && known_size.is_none_or(|expected| downloaded == expected);
         if can_validate {
             if file_matches_hash(&partial, spec.expected_sha256)? {
-                remove_file_if_present(spec.destination)?;
-                fs::rename(&partial, spec.destination)?;
+                replace_file_atomically(&partial, spec.destination)?;
                 return Ok(());
             }
             reset_partial(&partial, &etag_path, &size_path)?;
@@ -382,8 +408,7 @@ fn promote_if_complete(
         return Ok(false);
     }
     let length = fs::metadata(partial)?.len();
-    remove_file_if_present(spec.destination)?;
-    fs::rename(partial, spec.destination)?;
+    replace_file_atomically(partial, spec.destination)?;
     progress(length);
     Ok(true)
 }
@@ -561,6 +586,35 @@ mod tests {
     }
 
     #[test]
+    fn download_to_path_changed_total_restarts_unhashed_download() {
+        let body = b"abcdefghijkl";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, server) = serve_changed_total_then_full(body, requests.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("content.zip");
+        fs::write(partial_path(&destination), b"old!").unwrap();
+        fs::write(metadata_path(&destination, "size"), b"10").unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: None,
+                expected_sha256: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].contains("Range: bytes=4-"));
+        assert!(!requests[1].contains("Range:"));
+    }
+
+    #[test]
     fn download_to_path_verified_cache_avoids_network_request() {
         let body = b"already downloaded";
         let directory = tempfile::tempdir().unwrap();
@@ -582,6 +636,30 @@ mod tests {
 
         assert_eq!(reported, body.len() as u64);
         assert_eq!(fs::read(destination).unwrap(), body);
+    }
+
+    #[test]
+    fn download_to_path_completed_partial_atomically_replaces_stale_destination() {
+        let body = b"completed replacement";
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        fs::write(&destination, b"stale").unwrap();
+        fs::write(partial_path(&destination), body).unwrap();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: "http://127.0.0.1:1/unreachable",
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), body);
+        assert!(!partial_path(&destination).exists());
     }
 
     #[test]
@@ -629,6 +707,35 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(error.status(), Some(404));
+    }
+
+    #[test]
+    fn download_to_path_hash_retry_reports_progress_reset() {
+        let body = b"abcdefghij";
+        let (url, server) = serve_bad_then_good(body);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        let mut progress = Vec::new();
+
+        download_without_waiting(
+            &DownloadSpec {
+                url: &url,
+                authorization: None,
+                destination: &destination,
+                expected_size: Some(body.len() as u64),
+                expected_sha256: Some(&sha256_hex(body)),
+            },
+            |downloaded| progress.push(downloaded),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), body);
+        let completed = progress
+            .iter()
+            .position(|value| *value == body.len() as u64)
+            .unwrap();
+        assert!(progress[completed + 1..].contains(&0));
     }
 
     fn download_without_waiting(
@@ -733,6 +840,42 @@ mod tests {
         (url, server)
     }
 
+    fn serve_changed_total_then_full(
+        body: &'static [u8],
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let request = read_request(&first);
+            let offset = requested_offset(&request).unwrap();
+            requests.lock().unwrap().push(request);
+            let response_body = &body[offset..];
+            write!(
+                first,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                response_body.len(),
+                offset,
+                body.len() - 1,
+                body.len()
+            )
+            .unwrap();
+            first.write_all(response_body).unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            requests.lock().unwrap().push(read_request(&second));
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        (url, server)
+    }
+
     fn serve_status(status: u16) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -744,6 +887,25 @@ mod tests {
                 "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+        });
+        (url, server)
+    }
+
+    fn serve_bad_then_good(body: &'static [u8]) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for response_body in [b"xxxxxxxxxx".as_slice(), body] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                )
+                .unwrap();
+                stream.write_all(response_body).unwrap();
+            }
         });
         (url, server)
     }
