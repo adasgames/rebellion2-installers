@@ -6212,13 +6212,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_executable_on_unix_sets_execute_permissions() {
+    fn ensure_executable_on_unix_sets_execute_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("program");
 
-        write_executable_atomically(&path, b"program").unwrap();
+        fs::write(&path, b"program").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ensure_executable(&path).unwrap();
 
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o111,
