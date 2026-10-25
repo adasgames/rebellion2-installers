@@ -66,7 +66,7 @@ fn main() {
 fn prepare_installation(directory: &Path) -> io::Result<()> {
     let _installation = InstallationLock::try_acquire(directory)?;
     #[cfg(target_os = "windows")]
-    let _application_files = lock_application_files(directory)?;
+    check_application_files_available(directory)?;
     recover_interrupted_apply(directory)?;
     for name in [
         PENDING_LAUNCHER_MANIFEST_FILE,
@@ -84,9 +84,9 @@ fn prepare_installation(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Prevents recovery while an older launcher, helper, or game still uses this installation.
+/// Checks for application files still in use before starting recovery.
 #[cfg(target_os = "windows")]
-fn lock_application_files(directory: &Path) -> io::Result<Vec<fs::File>> {
+fn check_application_files_available(directory: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     let mut files = Vec::new();
     for name in [
@@ -104,7 +104,7 @@ fn lock_application_files(directory: &Path) -> io::Result<Vec<fs::File>> {
             Err(error) => return Err(error),
         }
     }
-    Ok(files)
+    Ok(())
 }
 
 /// Parses the explicit paths supplied by the launcher being replaced.

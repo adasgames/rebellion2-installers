@@ -2422,6 +2422,9 @@ try {
         contentVersion: "2.0.0",
       });
       const files = new Map([
+        ["Rebellion2.exe", gameBytes],
+        ["rebellion2-launcher.exe", launcherBytes],
+        ["rebellion2-update-helper.exe", helperBytes],
         [
           "Rebellion2_Data/runtime-settings.json",
           Buffer.from("old player settings"),

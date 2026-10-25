@@ -500,8 +500,13 @@ fn main() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .run(launcher_context())
         .expect("error while running the Rebellion II launcher");
+}
+
+/// Creates the launcher context and embeds platform metadata once.
+fn launcher_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
 }
 
 /// Displays startup failures without reading, recovering, or modifying the locked installation.
@@ -535,7 +540,7 @@ fn show_startup_error(message: String) {
                 .build()?;
             Ok(())
         })
-        .run(tauri::generate_context!());
+        .run(launcher_context());
     if let Err(error) = result {
         eprintln!("Could not display launcher startup error: {error}");
     }
@@ -1594,7 +1599,7 @@ fn read_game_manifest(metadata_dir: &Path) -> Option<Manifest> {
 
 /// Returns the installed game-player version independently from launcher metadata.
 fn current_game_version() -> Option<String> {
-    install_dir()
+    let version = install_dir()
         .ok()
         .and_then(|directory| fs::read_to_string(directory.join(GAME_VERSION_FILE)).ok())
         .map(|version| version.trim().to_string())
@@ -1604,18 +1609,10 @@ fn current_game_version() -> Option<String> {
                 .and_then(|directory| fs::read_to_string(directory.join(GAME_VERSION_FILE)).ok())
                 .map(|version| version.trim().to_string())
                 .filter(|version| !version.is_empty())
-        })
-        .or_else(|| {
-            #[cfg(target_os = "windows")]
-            {
-                pending_application_game_version()
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                None
-            }
-        })
-        .or_else(current_application_version)
+        });
+    #[cfg(target_os = "windows")]
+    let version = version.or_else(pending_application_game_version);
+    version.or_else(current_application_version)
 }
 
 /// Reads the player version already committed by a combined update before launcher promotion.
