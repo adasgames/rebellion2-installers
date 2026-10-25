@@ -34,7 +34,8 @@ use rebellion2_update_core::FileEntry;
 #[cfg(target_os = "windows")]
 use rebellion2_update_core::Plan;
 use rebellion2_update_core::{
-    apply, diff, sha256_hex, validate_manifest_paths, verify_install, BlobSource, Manifest,
+    apply, diff, recover_interrupted_apply, sha256_hex, validate_manifest_paths, verify_install,
+    BlobSource, Manifest,
 };
 use serde::Deserialize;
 use tauri::{
@@ -59,6 +60,7 @@ const CONTENT_PACK_BASE: Option<&str> = option_env!("REB2_CONTENT_PACK_BASE_URL"
 
 const CONTENT_VERSION_FILE: &str = ".content-version";
 const CONTENT_MANIFEST_FILE: &str = ".manifest.json";
+const CONTENT_INSTALL_STAGING_DIRECTORY: &str = ".content-install-staging";
 const APPROVED_CONTENT_UPDATE_FILE: &str = ".approved-content-update";
 const LAUNCHER_VERSION_FILE: &str = ".launcher-version";
 const PENDING_LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.pending.json";
@@ -1441,6 +1443,8 @@ fn is_launcher_metadata_path(path: &Path) -> bool {
             | ".rebellion2-launcher.next.exe"
             | ".rebellion2-launcher.next"
             | ".rebellion2-launcher.next.appimage"
+            | ".rebellion2-update-transaction"
+            | ".content-install-staging"
             | ".download-cache"
             | ".session"
             | "launcher.log"
@@ -2244,6 +2248,25 @@ fn hand_off_pending_launcher_update() -> bool {
 /// Reads the channel pointer and decides what to show.
 fn scan_and_prompt(handle: &tauri::AppHandle) {
     update_status(handle, "Checking for updates…");
+
+    match recover_interrupted_updates() {
+        Ok(0) => {}
+        Ok(recovered) => log_line(&format!(
+            "[launcher] restored {recovered} interrupted update layer(s)."
+        )),
+        Err(error) => {
+            log_line(&format!(
+                "[launcher] couldn't restore an interrupted update: {error}"
+            ));
+            show_message(
+                handle,
+                "Update recovery failed",
+                "The previous installation could not be restored. Close the launcher and try again before starting the game.",
+                Some(("Retry", "retry-update-check")),
+            );
+            return;
+        }
+    }
 
     if let Some(version) = check_launcher_update() {
         log_line(&format!("[launcher] launcher update available: {version}"));
@@ -4442,6 +4465,28 @@ fn clear_committed_download_cache(directory: &Path) {
     }
 }
 
+/// Restores every update layer that may have been interrupted during its commit phase.
+fn recover_interrupted_updates() -> io::Result<usize> {
+    let install_root = install_dir()?;
+    let content = install_root.join("Content");
+    let mut recovered = usize::from(recover_interrupted_apply(&install_root)?);
+    recovered += usize::from(recover_interrupted_apply(&content)?);
+
+    let packs = content.join("Packs");
+    let entries = match fs::read_dir(packs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(recovered),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            recovered += usize::from(recover_interrupted_apply(&entry.path())?);
+        }
+    }
+    Ok(recovered)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn macos_data_dir(home: &Path) -> PathBuf {
     home.join("Library")
@@ -4525,6 +4570,7 @@ fn install_content(
     let base = install_dir()?;
     let archive_path = base.join("content.zip");
     let content_dir = base.join("Content");
+    let extraction_dir = base.join(CONTENT_INSTALL_STAGING_DIRECTORY);
 
     log_line("[launcher] downloading Content…");
     let gib = (1u64 << 30) as f64;
@@ -4620,13 +4666,26 @@ fn install_content(
     }
     update_progress(handle, 100, "Extracting Content…");
 
-    prepare_content_directory_for_install(&content_dir)?;
-    fs::create_dir_all(&content_dir)?;
+    remove_path_if_present(&extraction_dir)?;
+    fs::create_dir_all(&extraction_dir)?;
     let mut archive = zip::ZipArchive::new(fs::File::open(&archive_path)?)?;
-    archive.extract(&content_dir)?;
-    if let Some(version) = requested_content_version() {
-        fs::write(content_dir.join(CONTENT_VERSION_FILE), version)?;
-    }
+    archive.extract(&extraction_dir)?;
+
+    let version = requested_content_version().unwrap_or_else(|| "installed".to_string());
+    let target = snapshot_base_content_directory(&extraction_dir, &version, true)?;
+    validate_base_content_manifest(&target)?;
+    let local = snapshot_base_content_directory(&content_dir, "existing", false)?;
+    let plan = diff(Some(&local), &target);
+    apply(
+        &plan,
+        &content_dir,
+        &DirectoryBlobs {
+            root: extraction_dir.clone(),
+        },
+    )?;
+    store_manifest_and_version(&content_dir, &target, &version)?;
+
+    remove_path_if_present(&extraction_dir)?;
     let _ = fs::remove_file(&archive_path);
     if let Err(error) = clear_download_metadata(&archive_path) {
         log_line(&format!(
@@ -4636,23 +4695,77 @@ fn install_content(
     Ok(content_dir)
 }
 
-/// Clears only files owned by the base-content channel. Optional packs are managed
-/// independently and must survive a first-install repair.
-fn prepare_content_directory_for_install(content_dir: &Path) -> io::Result<()> {
-    if let Some(manifest) = read_local_manifest(content_dir).and_then(sanitize_local_base_manifest)
-    {
-        apply(
-            &content_packs::removable_manifest(&manifest)?,
-            content_dir,
-            &EmptyBlobs,
-        )?;
-    } else {
-        remove_path_if_present(&content_dir.join("Application"))?;
-        remove_path_if_present(&content_dir.join("catalog.xml"))?;
-        remove_path_if_present(&content_dir.join("Packs").join("ClassicGalacticCivilWar"))?;
+struct DirectoryBlobs {
+    root: PathBuf,
+}
+
+impl BlobSource for DirectoryBlobs {
+    fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>> {
+        fs::read(self.root.join(&entry.path))
     }
-    remove_path_if_present(&content_dir.join(CONTENT_MANIFEST_FILE))?;
-    remove_path_if_present(&content_dir.join(CONTENT_VERSION_FILE))?;
+}
+
+/// Describes all base-content files in a directory while ignoring separately managed packs.
+fn snapshot_base_content_directory(
+    directory: &Path,
+    version: &str,
+    reject_unowned_files: bool,
+) -> io::Result<Manifest> {
+    let mut files = Vec::new();
+    collect_base_content_files(directory, directory, reject_unowned_files, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(Manifest {
+        version: version.to_string(),
+        files,
+    })
+}
+
+fn collect_base_content_files(
+    root: &Path,
+    directory: &Path,
+    reject_unowned_files: bool,
+    files: &mut Vec<FileEntry>,
+) -> io::Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_base_content_files(root, &entry.path(), reject_unowned_files, files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "content archive contains an unsupported filesystem entry",
+            ));
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !is_base_content_path(&relative) {
+            if reject_unowned_files {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("content archive contains an unmanaged path: {relative}"),
+                ));
+            }
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        files.push(FileEntry {
+            path: relative,
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+        });
+    }
     Ok(())
 }
 
@@ -4700,6 +4813,7 @@ fn reconcile_windows_native_plugins(install_dir: &Path, manifest: &Manifest) -> 
 }
 
 fn launch_game() -> io::Result<bool> {
+    recover_interrupted_updates()?;
     let base = install_dir()?;
     let exe = game_path()?;
     if !exe.exists() {
@@ -6078,26 +6192,53 @@ mod tests {
     }
 
     #[test]
-    fn base_content_repair_preserves_optional_pack_directory() {
+    fn base_content_repair_transaction_preserves_optional_pack_directory() {
         let root = tempfile::tempdir().unwrap();
         let content = root.path().join("Content");
+        let replacement = root.path().join("Replacement");
         fs::create_dir_all(content.join("Application")).unwrap();
         fs::create_dir_all(content.join("Packs/ClassicGalacticCivilWar")).unwrap();
         fs::create_dir_all(content.join("Packs/OptionalPack")).unwrap();
-        fs::write(content.join("catalog.xml"), b"catalog").unwrap();
-        fs::write(content.join("Application/base.xml"), b"base").unwrap();
+        fs::write(content.join("catalog.xml"), b"old catalog").unwrap();
+        fs::write(content.join("Application/removed.xml"), b"removed").unwrap();
         fs::write(
             content.join("Packs/ClassicGalacticCivilWar/pack.xml"),
-            b"base pack",
+            b"old base pack",
         )
         .unwrap();
         fs::write(content.join("Packs/OptionalPack/pack.xml"), b"optional").unwrap();
+        fs::create_dir_all(replacement.join("Application")).unwrap();
+        fs::create_dir_all(replacement.join("Packs/ClassicGalacticCivilWar")).unwrap();
+        fs::write(replacement.join("catalog.xml"), b"new catalog").unwrap();
+        fs::write(replacement.join("Application/added.xml"), b"added").unwrap();
+        fs::write(
+            replacement.join("Packs/ClassicGalacticCivilWar/pack.xml"),
+            b"new base pack",
+        )
+        .unwrap();
 
-        prepare_content_directory_for_install(&content).unwrap();
+        let local = snapshot_base_content_directory(&content, "old", false).unwrap();
+        let target = snapshot_base_content_directory(&replacement, "new", true).unwrap();
+        apply(
+            &diff(Some(&local), &target),
+            &content,
+            &DirectoryBlobs { root: replacement },
+        )
+        .unwrap();
 
-        assert!(!content.join("catalog.xml").exists());
-        assert!(!content.join("Application").exists());
-        assert!(!content.join("Packs/ClassicGalacticCivilWar").exists());
+        assert_eq!(
+            fs::read(content.join("catalog.xml")).unwrap(),
+            b"new catalog"
+        );
+        assert!(!content.join("Application/removed.xml").exists());
+        assert_eq!(
+            fs::read(content.join("Application/added.xml")).unwrap(),
+            b"added"
+        );
+        assert_eq!(
+            fs::read(content.join("Packs/ClassicGalacticCivilWar/pack.xml")).unwrap(),
+            b"new base pack"
+        );
         assert_eq!(
             fs::read(content.join("Packs/OptionalPack/pack.xml")).unwrap(),
             b"optional"
@@ -6105,26 +6246,18 @@ mod tests {
     }
 
     #[test]
-    fn base_content_repair_ignores_optional_files_in_legacy_manifest() {
+    fn base_content_snapshot_ignores_optional_pack_files() {
         let root = tempfile::tempdir().unwrap();
         let content = root.path().join("Content");
         fs::create_dir_all(content.join("Application")).unwrap();
         fs::create_dir_all(content.join("Packs/OptionalPack")).unwrap();
         fs::write(content.join("Application/base.xml"), b"base").unwrap();
         fs::write(content.join("Packs/OptionalPack/pack.xml"), b"optional").unwrap();
-        let manifest = application_manifest(
-            "1.0.0",
-            &["Application/base.xml", "Packs/OptionalPack/pack.xml"],
-        );
-        store_manifest_and_version(&content, &manifest, "1.0.0").unwrap();
 
-        prepare_content_directory_for_install(&content).unwrap();
+        let manifest = snapshot_base_content_directory(&content, "1.0.0", false).unwrap();
 
-        assert!(!content.join("Application/base.xml").exists());
-        assert_eq!(
-            fs::read(content.join("Packs/OptionalPack/pack.xml")).unwrap(),
-            b"optional"
-        );
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].path, "Application/base.xml");
     }
 
     #[test]

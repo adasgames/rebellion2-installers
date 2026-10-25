@@ -14,7 +14,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+const TRANSACTION_DIRECTORY: &str = ".rebellion2-update-transaction";
+const TRANSACTION_RECORD_FILE: &str = "transaction.json";
+const TRANSACTION_RECORD_TEMP_FILE: &str = "transaction.json.part";
+const STAGED_DIRECTORY: &str = "staged";
+const BACKUP_DIRECTORY: &str = "backup";
+const ROLLBACK_DIRECTORY: &str = "rollback";
 
 /// One file in a content manifest: its install-relative POSIX path, the SHA-256
 /// of its bytes (also its blob key), and its size.
@@ -82,7 +89,7 @@ fn manifest_path_key(path: &str) -> String {
 
 /// The set of operations to turn a local install into the target version:
 /// files to (re)write, and files to delete.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub changed: Vec<FileEntry>,
     pub removed: Vec<String>,
@@ -142,13 +149,30 @@ pub trait BlobSource {
     fn fetch(&self, entry: &FileEntry) -> io::Result<Vec<u8>>;
 }
 
-/// Apply a plan under `install_dir`. Every fetched blob is hash-checked before
-/// it's written, and each file lands via write-temp-then-rename so a partial
-/// write can never surface as a live file. Deleted paths are removed last.
+#[derive(Debug, Serialize, Deserialize)]
+struct TransactionRecord {
+    plan: Plan,
+    original_files: Vec<String>,
+}
+
+/// Applies a plan under `install_dir` without exposing partially downloaded files.
+/// Every changed file is downloaded, hash-checked, and staged before the live
+/// installation is touched. Original files are retained until the commit completes,
+/// allowing a later launcher run to roll back an interrupted commit.
 ///
 /// Returns the number of files written.
 pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Result<usize> {
     validate_plan_paths(plan)?;
+    recover_interrupted_apply(install_dir)?;
+    if plan.is_empty() {
+        return Ok(0);
+    }
+
+    let transaction = install_dir.join(TRANSACTION_DIRECTORY);
+    remove_directory_if_present(&transaction)?;
+    let staged = transaction.join(STAGED_DIRECTORY);
+    fs::create_dir_all(&staged)?;
+
     for entry in &plan.changed {
         let bytes = blobs.fetch(entry)?;
         let actual = sha256_hex(&bytes);
@@ -161,31 +185,195 @@ pub fn apply(plan: &Plan, install_dir: &Path, blobs: &dyn BlobSource) -> io::Res
                 ),
             ));
         }
-        let dst = install_dir.join(&entry.path);
-        if let Some(parent) = dst.parent() {
+        let destination = staged.join(&entry.path);
+        if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = PathBuf::from(format!("{}.part", dst.display()));
-        fs::write(&tmp, &bytes)?;
-        replace_file(&tmp, &dst)?;
+        fs::write(destination, bytes)?;
     }
 
-    let changed_paths: BTreeSet<PathBuf> = plan
+    let effective_removed: Vec<&String> = plan
+        .removed
+        .iter()
+        .filter(|path| {
+            !plan
+                .changed
+                .iter()
+                .any(|entry| manifest_path_key(&entry.path) == manifest_path_key(path))
+        })
+        .collect();
+    let mut touched_paths: Vec<&str> = plan
         .changed
         .iter()
-        .filter_map(|entry| fs::canonicalize(install_dir.join(&entry.path)).ok())
+        .map(|entry| entry.path.as_str())
         .collect();
-    for path in &plan.removed {
-        let victim = install_dir.join(path);
-        let replaced_by_changed_path = fs::canonicalize(&victim)
-            .map(|path| changed_paths.contains(&path))
-            .unwrap_or(false);
-        if victim.exists() && !replaced_by_changed_path {
-            fs::remove_file(&victim)?;
+    touched_paths.extend(effective_removed.iter().map(|path| path.as_str()));
+
+    let backup = transaction.join(BACKUP_DIRECTORY);
+    let mut original_files = Vec::new();
+    for path in touched_paths {
+        let source = install_dir.join(path);
+        if source.is_file() {
+            let destination = backup.join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, destination)?;
+            original_files.push(path.to_string());
         }
     }
 
+    let record = TransactionRecord {
+        plan: Plan {
+            changed: plan.changed.clone(),
+            removed: effective_removed.into_iter().cloned().collect(),
+        },
+        original_files,
+    };
+    write_transaction_record(&transaction, &record)?;
+
+    if let Err(commit_error) = commit_transaction(install_dir, &transaction, &record.plan) {
+        return match rollback_transaction(install_dir, &transaction, &record) {
+            Ok(()) => Err(commit_error),
+            Err(rollback_error) => Err(io::Error::other(format!(
+                "{commit_error}; restoring the previous installation also failed: {rollback_error}"
+            ))),
+        };
+    }
+
+    fs::remove_file(transaction.join(TRANSACTION_RECORD_FILE))?;
+    let _ = remove_directory_if_present(&transaction);
+
     Ok(plan.changed.len())
+}
+
+/// Restores the previous installation when an earlier apply was interrupted during commit.
+/// Returns `true` when recovery work was found.
+pub fn recover_interrupted_apply(install_dir: &Path) -> io::Result<bool> {
+    let transaction = install_dir.join(TRANSACTION_DIRECTORY);
+    if !transaction.exists() {
+        return Ok(false);
+    }
+
+    let record_path = transaction.join(TRANSACTION_RECORD_FILE);
+    if !record_path.is_file() {
+        remove_directory_if_present(&transaction)?;
+        return Ok(true);
+    }
+
+    let record: TransactionRecord = serde_json::from_slice(&fs::read(record_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    validate_plan_paths(&record.plan)?;
+    validate_original_paths(&record)?;
+    rollback_transaction(install_dir, &transaction, &record)?;
+    Ok(true)
+}
+
+fn write_transaction_record(transaction: &Path, record: &TransactionRecord) -> io::Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(|error| io::Error::other(error.to_string()))?;
+    let temporary = transaction.join(TRANSACTION_RECORD_TEMP_FILE);
+    fs::write(&temporary, bytes)?;
+    replace_file(&temporary, &transaction.join(TRANSACTION_RECORD_FILE))
+}
+
+fn commit_transaction(install_dir: &Path, transaction: &Path, plan: &Plan) -> io::Result<()> {
+    for entry in &plan.changed {
+        let source = transaction.join(STAGED_DIRECTORY).join(&entry.path);
+        let destination = install_dir.join(&entry.path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        replace_file(&source, &destination)?;
+    }
+
+    for path in &plan.removed {
+        remove_file_if_present(&install_dir.join(path))?;
+    }
+    Ok(())
+}
+
+fn rollback_transaction(
+    install_dir: &Path,
+    transaction: &Path,
+    record: &TransactionRecord,
+) -> io::Result<()> {
+    let original_paths: BTreeSet<String> = record
+        .original_files
+        .iter()
+        .map(|path| manifest_path_key(path))
+        .collect();
+    let mut touched_paths: Vec<&str> = record
+        .plan
+        .changed
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    touched_paths.extend(record.plan.removed.iter().map(String::as_str));
+
+    for path in touched_paths {
+        let destination = install_dir.join(path);
+        if original_paths.contains(&manifest_path_key(path)) {
+            let source = transaction.join(BACKUP_DIRECTORY).join(path);
+            let replacement = transaction.join(ROLLBACK_DIRECTORY).join(path);
+            if let Some(parent) = replacement.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, &replacement)?;
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            replace_file(&replacement, &destination)?;
+        } else {
+            remove_file_if_present(&destination)?;
+        }
+    }
+
+    fs::remove_file(transaction.join(TRANSACTION_RECORD_FILE))?;
+    let _ = remove_directory_if_present(transaction);
+    Ok(())
+}
+
+fn validate_original_paths(record: &TransactionRecord) -> io::Result<()> {
+    let touched: BTreeSet<String> = record
+        .plan
+        .changed
+        .iter()
+        .map(|entry| manifest_path_key(&entry.path))
+        .chain(
+            record
+                .plan
+                .removed
+                .iter()
+                .map(|path| manifest_path_key(path)),
+        )
+        .collect();
+    let mut originals = BTreeSet::new();
+    for path in &record.original_files {
+        let key = manifest_path_key(path);
+        if !is_safe_manifest_path(path) || !touched.contains(&key) || !originals.insert(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "update transaction contains an invalid original path",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_directory_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_plan_paths(plan: &Plan) -> io::Result<()> {
@@ -194,11 +382,12 @@ fn validate_plan_paths(plan: &Plan) -> io::Result<()> {
         files: plan.changed.clone(),
     };
     validate_manifest_paths(&manifest)?;
+    let mut removed_paths = BTreeSet::new();
     for path in &plan.removed {
-        if !is_safe_manifest_path(path) {
+        if !is_safe_manifest_path(path) || !removed_paths.insert(manifest_path_key(path)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("update plan contains an unsafe removal path: {path}"),
+                format!("update plan contains an invalid removal path: {path}"),
             ));
         }
     }
@@ -209,6 +398,9 @@ fn is_safe_manifest_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
         && !path.contains(['\\', ':'])
+        && path.split('/').next().is_some_and(|component| {
+            manifest_path_key(component) != manifest_path_key(TRANSACTION_DIRECTORY)
+        })
         && path
             .split('/')
             .all(|component| !component.is_empty() && component != "." && component != "..")
@@ -385,6 +577,70 @@ mod tests {
     }
 
     #[test]
+    fn apply_with_later_fetch_failure_keeps_every_live_file_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a"), b"old-a").unwrap();
+        fs::write(directory.path().join("b"), b"old-b").unwrap();
+        let target = manifest("2", &[("a", b"new-a"), ("b", b"new-b")]);
+        let available = store(&[("a", b"new-a")]);
+
+        let result = apply(&diff(None, &target), directory.path(), &available);
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read(directory.path().join("a")).unwrap(), b"old-a");
+        assert_eq!(fs::read(directory.path().join("b")).unwrap(), b"old-b");
+        assert!(recover_interrupted_apply(directory.path()).unwrap());
+        assert!(!directory.path().join(TRANSACTION_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn recover_interrupted_apply_restores_every_original_file() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("changed"), b"old-changed").unwrap();
+        fs::write(directory.path().join("removed"), b"old-removed").unwrap();
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        let staged = transaction.join(STAGED_DIRECTORY);
+        let backup = transaction.join(BACKUP_DIRECTORY);
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(staged.join("changed"), b"new-changed").unwrap();
+        fs::write(staged.join("added"), b"new-added").unwrap();
+        fs::write(backup.join("changed"), b"old-changed").unwrap();
+        fs::write(backup.join("removed"), b"old-removed").unwrap();
+        let record = TransactionRecord {
+            plan: Plan {
+                changed: vec![
+                    entry("changed", b"new-changed"),
+                    entry("added", b"new-added"),
+                ],
+                removed: vec!["removed".to_string()],
+            },
+            original_files: vec!["changed".to_string(), "removed".to_string()],
+        };
+        write_transaction_record(&transaction, &record).unwrap();
+        commit_transaction(directory.path(), &transaction, &record.plan).unwrap();
+        assert_eq!(
+            fs::read(directory.path().join("changed")).unwrap(),
+            b"new-changed"
+        );
+        assert!(directory.path().join("added").is_file());
+        assert!(!directory.path().join("removed").exists());
+
+        assert!(recover_interrupted_apply(directory.path()).unwrap());
+
+        assert_eq!(
+            fs::read(directory.path().join("changed")).unwrap(),
+            b"old-changed"
+        );
+        assert!(!directory.path().join("added").exists());
+        assert_eq!(
+            fs::read(directory.path().join("removed")).unwrap(),
+            b"old-removed"
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
     fn manifest_rejects_paths_outside_its_install_root() {
         for path in [
             "../outside",
@@ -394,6 +650,7 @@ mod tests {
             "nested//file",
             "nested/./file",
             "nested/../outside",
+            ".rebellion2-update-transaction/staged/file",
         ] {
             let manifest = manifest("1", &[(path, b"data")]);
             assert!(

@@ -116,6 +116,8 @@ Filename: "{app}\{#MyLauncherExe}"; Description: "Run {#MyAppName}"; Flags: nowa
 ; on uninstall, then drop {app} if nothing else remains.
 Type: filesandordirs; Name: "{app}\Content"
 Type: filesandordirs; Name: "{app}\.download-cache"
+Type: filesandordirs; Name: "{app}\.rebellion2-update-transaction"
+Type: filesandordirs; Name: "{app}\.content-install-staging"
 Type: files; Name: "{app}\launcher.log"
 Type: files; Name: "{app}\content.zip"
 Type: files; Name: "{app}\content.zip.part"
