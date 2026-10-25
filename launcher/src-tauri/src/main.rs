@@ -2348,6 +2348,7 @@ fn hand_off_pending_launcher_update() -> bool {
     }
     match staged_launcher_update_state(&metadata_dir) {
         Ok(StagedLauncherUpdateState::Ready) => {}
+        #[cfg(target_os = "windows")]
         Ok(StagedLauncherUpdateState::WaitingForContent) => {
             log_line(
                 "[launcher] staged application launcher is waiting for its matching Content update.",
@@ -2380,6 +2381,7 @@ fn hand_off_pending_launcher_update() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StagedLauncherUpdateState {
     Ready,
+    #[cfg(target_os = "windows")]
     WaitingForContent,
     Invalid,
 }
