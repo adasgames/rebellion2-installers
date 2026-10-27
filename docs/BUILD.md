@@ -88,6 +88,16 @@ the run also uploads the signed Linux player layer and adds Linux while preservi
 platform entry. If the split game channel does not exist, the run leaves all live channel pointers
 unchanged so older clients continue using the legacy application channel.
 
+## Backfilling macOS for an existing game release
+
+Actions tab → **Backfill macOS game** → **Run workflow**.
+
+Supply the matching game and media refs, existing game version, and published launcher version.
+The workflow uses the standard macOS player and launcher packaging, verifies bundle signing, and
+adds only the missing macOS package and signed update layer. Publication requires backfill
+confirmation and preserves the existing Windows/Linux entries, matching content, and release notes.
+Backfill workflows share the game-release concurrency group so their channel updates cannot race.
+
 ## Release notes
 
 Both workflows accept Markdown with `##` section headings and `*` or `-` bullets. Other prose may
