@@ -1,0 +1,240 @@
+name: Backfill macOS game
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Existing rebellion2 release ref
+        required: true
+        type: string
+      asset_ref:
+        description: Existing rebellion2-media release ref
+        required: true
+        type: string
+      version:
+        description: Existing game release version
+        required: true
+        type: string
+      launcher_version:
+        description: Published launcher version to embed
+        required: true
+        type: string
+      publish:
+        description: Publish macOS and add it to an existing split game channel
+        required: true
+        default: false
+        type: boolean
+      confirm_backfill:
+        description: Confirm this adds macOS to an existing published game version
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: game-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate macOS backfill
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          tag="v${VERSION}"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  player-macos:
+    name: Build macOS game
+    needs: prepare
+    uses: ./.github/workflows/build-player.yml
+    with:
+      artifact: player-macos
+      asset_ref: ${{ inputs.asset_ref }}
+      source_ref: ${{ inputs.source_ref }}
+      target: StandaloneOSX
+      version: ${{ needs.prepare.outputs.version }}
+    secrets: inherit
+
+  package-macos:
+    name: Package macOS game
+    runs-on: macos-latest
+    needs: [prepare, player-macos]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: player-macos
+          path: player-archive
+
+      - name: Extract and package the macOS game layer
+        run: |
+          set -euo pipefail
+          mkdir player
+          tar -xzf player-archive/player-macos.tar.gz -C player
+          game_app="$(find "$PWD/player" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$game_app"
+          find "$game_app/Contents/MacOS" -maxdepth 1 -type f -exec chmod +x {} \;
+          xattr -cr "$game_app"
+          mkdir macos-game-layer
+          mkdir macos-game-archive
+          ditto "$game_app" "macos-game-archive/Rebellion2 Game.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "macos-game-archive/Rebellion2 Game.app" \
+            macos-game-layer/Rebellion2-Game-macOS.zip
+          node scripts/package-update-layer.mjs \
+            macos-game-layer \
+            "${{ needs.prepare.outputs.version }}" \
+            game-manifest-macos.json \
+            game-blobs-macos
+          printf '%s' "$game_app" > game-app-path.txt
+
+      - name: Assemble the current launcher with the game
+        env:
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          LAUNCHER_VERSION: ${{ inputs.launcher_version }}
+        run: |
+          set -euo pipefail
+          base="${CHANNEL_BASE%/}"
+          curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
+          launcher_version="$(jq -r .version launcher.json)"
+          test "$launcher_version" = "$LAUNCHER_VERSION"
+          curl --fail --location --silent --show-error \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${launcher_version}/Rebellion2-launcher-macOS.zip" \
+            -o launcher.zip
+          ditto -x -k launcher.zip launcher-bundle
+          app="$(find "$PWD/launcher-bundle" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          game_app="$(cat game-app-path.txt)"
+          test -n "$app"
+          mkdir -p "$app/Contents/Resources/InstallerMetadata"
+          ditto "$game_app" "$app/Contents/Resources/Rebellion2 Game.app"
+          cp game-manifest-macos.json "$app/Contents/Resources/InstallerMetadata/.game-manifest.json"
+          printf '%s' "${{ needs.prepare.outputs.version }}" > "$app/Contents/Resources/InstallerMetadata/.game-version"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          bash packaging/macos/build-zip.sh \
+            "$app" \
+            "${{ needs.prepare.outputs.version }}" \
+            "$PWD/Rebellion2-macOS.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: game-macos-backfill
+          path: |
+            Rebellion2-macOS.zip
+            game-manifest-macos.json
+            game-blobs-macos
+          if-no-files-found: error
+
+  publish:
+    name: Publish macOS game backfill
+    if: inputs.publish && inputs.confirm_backfill
+    runs-on: ubuntu-latest
+    needs: [prepare, package-macos]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: game-macos-backfill
+          path: macos
+
+      - name: Publish macOS backfill
+        env:
+          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          GAME_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
+          STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          manifest="macos/game-manifest-macos.json"
+          manifest_path="dist/game-manifest-macos-${VERSION}.json"
+          signature="$(node -e '
+            const c=require("crypto"),fs=require("fs");
+            const seed=Buffer.from(process.env.GAME_SIGNING_KEY.trim(),"hex");
+            const pkcs8=Buffer.concat([Buffer.from("302e020100300506032b657004220420","hex"),seed]);
+            const key=c.createPrivateKey({key:pkcs8,format:"der",type:"pkcs8"});
+            process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
+          ' "$manifest")"
+
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+          export RCLONE_S3_PROVIDER="$STORAGE_PROVIDER"
+          export RCLONE_S3_ACCESS_KEY_ID="$STORAGE_ACCESS_KEY_ID"
+          export RCLONE_S3_SECRET_ACCESS_KEY="$STORAGE_SECRET_ACCESS_KEY"
+          export RCLONE_S3_ENDPOINT="$STORAGE_ENDPOINT"
+          export RCLONE_S3_REGION=auto
+          remote=":s3:${STORAGE_BUCKET}"
+
+          gh release upload "$TAG" \
+            "macos/Rebellion2-macOS.zip" \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | grep -Fx "Rebellion2-macOS.zip"
+
+          pointer_listing="$(rclone lsf "${remote}/dist" --files-only --include game.json)"
+          if ! grep -Fxq game.json <<< "$pointer_listing"; then
+            echo "No split game channel exists; leaving the global channel unchanged."
+            exit 0
+          fi
+          rclone cat "${remote}/dist/game.json" > current-game.json
+          node scripts/add-game-platform.mjs \
+            current-game.json \
+            game-with-macos.json \
+            "$VERSION" \
+            macos \
+            "$manifest_path" \
+            game-blobs/ \
+            "$signature"
+
+          rclone copy macos/game-blobs-macos "${remote}/game-blobs" --ignore-existing
+          rclone copyto "$manifest" "${remote}/${manifest_path}"
+
+          restore_pointer() {
+            rclone copyto current-game.json "${remote}/dist/game.json"
+          }
+          on_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then restore_pointer; fi
+            exit "$status"
+          }
+          trap on_exit EXIT
+          rclone copyto game-with-macos.json "${remote}/dist/game.json"
+
+          base="${CHANNEL_BASE%/}"
+          published=false
+          for _ in 1 2 3 4 5 6; do
+            if curl --fail --location --silent --show-error "$base/dist/game.json" \
+              | jq -e \
+                --arg version "$VERSION" \
+                --arg manifest "$manifest_path" \
+                '.version == $version and .platforms.macos.manifest == $manifest' >/dev/null; then
+              published=true
+              break
+            fi
+            sleep 5
+          done
+          test "$published" = true
+          trap - EXIT
