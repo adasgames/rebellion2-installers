@@ -333,7 +333,7 @@ pub(crate) fn update_check_failure_reason(error: &str) -> &str {
 /// Builds the confirmation screen for an independent launcher update.
 pub(crate) fn launcher_update_screen(version: &str, notes: Option<&ReleaseNotes>) -> String {
     let buttons = format!(
-        "<a class=\"b primary\" href=\"{a}?choice=launcher-update\">Update launcher</a>\
+        "<a class=\"b primary\" href=\"{a}?choice=launcher-update\">Update and restart</a>\
          <a class=\"b secondary\" href=\"{a}?choice=skip-launcher-update\">Not now</a>",
         a = ACT,
     );
@@ -341,7 +341,7 @@ pub(crate) fn launcher_update_screen(version: &str, notes: Option<&ReleaseNotes>
     render_with_content(
         "Launcher update available",
         false,
-        &format!("Launcher version {version} is available. This does not update the game."),
+        &format!("Launcher version {version} is available. The launcher will restart and continue where you left off."),
         &release_notes,
         &buttons,
     )

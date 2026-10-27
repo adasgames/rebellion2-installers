@@ -74,6 +74,7 @@ fn prepare_installation(directory: &Path) -> io::Result<()> {
         PENDING_APPLICATION_MANIFEST_FILE,
         PENDING_APPLICATION_VERSION_FILE,
         LEGACY_WINDOWS_STAGED_LAUNCHER_FILE,
+        ".launcher-resume.json",
     ] {
         match fs::remove_file(directory.join(name)) {
             Ok(()) => {}
@@ -458,12 +459,14 @@ mod tests {
             PENDING_APPLICATION_MANIFEST_FILE,
             PENDING_APPLICATION_VERSION_FILE,
             LEGACY_WINDOWS_STAGED_LAUNCHER_FILE,
+            ".launcher-resume.json",
             LAUNCHER_MANIFEST_FILE,
             LAUNCHER_VERSION_FILE,
         ] {
             fs::write(directory.path().join(name), b"existing").unwrap();
         }
         prepare_installation(directory.path()).unwrap();
+        assert!(!directory.path().join(".launcher-resume.json").exists());
         assert!(!directory
             .path()
             .join(LEGACY_WINDOWS_STAGED_LAUNCHER_FILE)
