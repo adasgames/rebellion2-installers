@@ -155,7 +155,8 @@ jobs:
           buildName: ${{ inputs.target == 'StandaloneLinux64' && 'Rebellion2.x86_64' || 'Rebellion2' }}
           buildsPath: build
           buildMethod: StandalonePlayerBuild.Build
-          customParameters: -buildVersion ${{ inputs.version }}
+          versioning: Custom
+          version: ${{ inputs.version }}
           allowDirtyBuild: true
 
       - name: Upload Windows player
