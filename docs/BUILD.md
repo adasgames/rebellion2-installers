@@ -41,9 +41,10 @@ run uploads workflow artifacts only. A publishing run creates or updates GitHub 
 `launcher-v<version>`, uploads signed manifests and content-addressed blobs, publishes launcher-only
 release notes, and moves `dist/launcher.json` last.
 
-Installed launchers display this as a **Launcher update**. They download and stage it without
-restarting or closing. The same session then checks for a game update and always leaves the player
-with a **Play game** action. The staged launcher applies the next time the launcher starts.
+Installed launchers display this as a **Launcher update**. After downloading and verifying the
+replacement, the launcher restarts before checking for game updates. It restores its window position,
+cached sign-in, pending first-install archive, and update choices, then continues the update flow.
+If the helper cannot start, a retry screen keeps the older launcher from continuing into game updates.
 
 ## Building a game release
 

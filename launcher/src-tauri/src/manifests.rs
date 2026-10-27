@@ -99,6 +99,7 @@ fn is_update_state_path(path: &Path) -> bool {
             | "content.zip.part.size"
             | ".launcher-manifest.json"
             | ".launcher-version.pending"
+            | ".launcher-resume.json"
             | ".launcher-manifest.pending.json"
             | ".rebellion2-launcher.next.exe"
             | ".rebellion2-launcher.next"

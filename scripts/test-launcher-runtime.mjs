@@ -752,6 +752,18 @@ async function launch(directory, args = []) {
   return session;
 }
 
+async function reconnectAfterLauncherRestart(session, version) {
+  await until(() => session.child.exitCode !== null, "previous launcher exits");
+  await until(
+    async () =>
+      (await readText(path.join(session.directory, ".launcher-version"))) ===
+      version,
+    "replacement launcher version",
+  );
+  session.socket?.close();
+  await connect(session);
+}
+
 async function seedLegacyInstall(name) {
   const directory = await seedInstall(name, { contentVersion: "2.0.0" });
   await fs.unlink(path.join(directory, ".game-version"));
@@ -1510,8 +1522,10 @@ try {
         state.fault = { pauseNotes: true };
         await click(session, `${channel}-update`);
         await screen(session, "Updating", 1500);
-        if (channel === "launcher") await screen(session, "up to date");
-        else await ready(session);
+        if (channel === "launcher") {
+          await reconnectAfterLauncherRestart(session, "1.1.0");
+          await screen(session, "up to date");
+        } else await ready(session);
         assert.equal(
           state.requests.filter(
             (request) => request.path === "/dist/runtime-notes.json",
@@ -2622,76 +2636,212 @@ try {
     );
   }
 
-  await scenario(
-    "launcher handoff replaces executable promotes metadata and relaunches",
-    async () => {
-      const nextLauncher = Buffer.concat([
-        launcherBytes,
-        Buffer.from("updated launcher"),
-      ]);
-      const nextHelper = Buffer.concat([
-        helperBytes,
-        Buffer.from("updated helper"),
-      ]);
-      const files = new Map([
-        ["rebellion2-launcher.exe", nextLauncher],
-        ["rebellion2-update-helper.exe", nextHelper],
-      ]);
-      const signature = publishManifest(
-        "/dist/launcher-manifest.json",
-        manifest("1.1.0", files),
-        files,
-      );
-      state.documents.set("/dist/launcher.json", {
-        version: "1.1.0",
-        platforms: {
-          windows: {
-            manifest: "dist/launcher-manifest.json",
-            blobs: "launcher-blobs/",
-            signature,
+  for (const installed of [true, false])
+    await scenario(
+      `launcher handoff automatically resumes and preserves position (Content installed: ${installed})`,
+      async () => {
+        const nextLauncher = Buffer.concat([
+          launcherBytes,
+          Buffer.from("updated launcher"),
+        ]);
+        const nextHelper = Buffer.concat([
+          helperBytes,
+          Buffer.from("updated helper"),
+        ]);
+        const files = new Map([
+          ["rebellion2-launcher.exe", nextLauncher],
+          ["rebellion2-update-helper.exe", nextHelper],
+        ]);
+        const signature = publishManifest(
+          "/dist/launcher-manifest.json",
+          manifest("1.1.0", files),
+          files,
+        );
+        state.documents.set("/dist/launcher.json", {
+          version: "1.1.0",
+          platforms: {
+            windows: {
+              manifest: "dist/launcher-manifest.json",
+              blobs: "launcher-blobs/",
+              signature,
+            },
           },
-        },
-      });
-      const directory = await seedInstall("launcher-handoff", {
+        });
+        const directory = await seedInstall(`launcher-handoff-${installed}`, {
+          installed,
+          contentVersion: "2.0.0",
+        });
+        const first = await launch(directory);
+        if (!installed) await verifyOwnership(first);
+        await screen(first, "Launcher update available");
+        await command("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class LauncherTestWindow { [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int width, int height, uint flags); }'; $window = (Get-Process -Id ${first.child.pid}).MainWindowHandle; if ($window -eq 0 -or -not [LauncherTestWindow]::SetWindowPos($window, [IntPtr]::Zero, 150, 220, 0, 0, 21)) { throw 'Could not move the test launcher window.' }`,
+        ]);
+        const position = await evaluate(
+          first,
+          "({x: window.screenX, y: window.screenY})",
+        );
+        const ownershipRequests = state.requests.filter((request) =>
+          request.path.startsWith("/auth"),
+        ).length;
+        await click(first, "launcher-update");
+        await reconnectAfterLauncherRestart(first, "1.1.0");
+        await screen(first, installed ? "up to date" : "Ready to install");
+        assert.deepEqual(
+          await evaluate(first, "({x: window.screenX, y: window.screenY})"),
+          position,
+        );
+        assert.equal(
+          state.requests.filter((request) => request.path.startsWith("/auth"))
+            .length,
+          ownershipRequests,
+        );
+        assert.equal(
+          await readText(path.join(directory, ".launcher-resume.json")),
+          null,
+        );
+        assert.equal(
+          await readText(path.join(directory, ".launcher-version")),
+          "1.1.0",
+        );
+        assert.equal(
+          await readText(path.join(directory, ".launcher-version.pending")),
+          null,
+        );
+        assert.equal(
+          digest(
+            await fs.readFile(path.join(directory, "rebellion2-launcher.exe")),
+          ),
+          digest(nextLauncher),
+        );
+        assert.equal(
+          digest(
+            await fs.readFile(
+              path.join(directory, "rebellion2-update-helper.exe"),
+            ),
+          ),
+          digest(nextHelper),
+        );
+      },
+    );
+
+  await scenario(
+    "launcher restart continues to the game update before downloading game files",
+    async () => {
+      publishLauncher();
+      publishGame("3.0.0");
+      const directory = await seedInstall("launcher-restart-game", {
         contentVersion: "2.0.0",
       });
-      const first = await launch(directory);
-      await screen(first, "Launcher update available");
-      await click(first, "launcher-update");
-      await screen(first, "up to date");
+      const session = await launch(directory);
+      await screen(session, "Launcher update available");
+      await click(session, "launcher-update");
+      await reconnectAfterLauncherRestart(session, "1.1.0");
+      await screen(session, "Game update available");
       assert.equal(
-        await readText(path.join(directory, ".launcher-version")),
-        "1.0.0",
+        state.requests.filter((request) =>
+          request.path.startsWith("/game-blobs/"),
+        ).length,
+        0,
       );
       assert.equal(
-        await readText(path.join(directory, ".launcher-version.pending")),
+        await readText(path.join(directory, ".game-version")),
+        "2.0.0",
+      );
+      await click(session, "game-update");
+      await ready(session);
+      assert.equal(
+        await readText(path.join(directory, ".game-version")),
+        "3.0.0",
+      );
+    },
+  );
+
+  await scenario(
+    "launcher restart failure blocks game updates and play",
+    async () => {
+      publishLauncher(
         "1.1.0",
+        launcherBytes,
+        Buffer.from("invalid helper executable"),
       );
-      await stop(first);
-      const second = await launch(directory);
-      await screen(second, "up to date");
+      publishGame("3.0.0");
+      const directory = await seedInstall("launcher-restart-failure", {
+        contentVersion: "2.0.0",
+      });
+      const session = await launch(directory);
+      await screen(session, "Launcher update available");
+      await click(session, "launcher-update");
+      await screen(session, "Couldn't restart launcher");
       assert.equal(
-        await readText(path.join(directory, ".launcher-version")),
-        "1.1.0",
-      );
-      assert.equal(
-        await readText(path.join(directory, ".launcher-version.pending")),
-        null,
-      );
-      assert.equal(
-        digest(
-          await fs.readFile(path.join(directory, "rebellion2-launcher.exe")),
+        await evaluate(
+          session,
+          "Boolean(document.querySelector('a[href*=\"choice=restart-launcher\"]'))",
         ),
-        digest(nextLauncher),
+        true,
       );
-      assert.equal(
-        digest(
-          await fs.readFile(
-            path.join(directory, "rebellion2-update-helper.exe"),
+      for (const choice of ["play", "game-update", "skip-launcher-update"]) {
+        assert.equal(
+          await evaluate(
+            session,
+            `Boolean(document.querySelector('a[href*="choice=${choice}"]'))`,
           ),
-        ),
-        digest(nextHelper),
+          false,
+        );
+      }
+      assert.equal(
+        state.requests.filter((request) =>
+          request.path.startsWith("/game-blobs/"),
+        ).length,
+        0,
       );
+      assert.equal(
+        await readText(path.join(directory, ".game-version")),
+        "2.0.0",
+      );
+    },
+  );
+
+  await scenario(
+    "locked launcher continuation cannot prevent startup and is cleared after unlocking",
+    async () => {
+      const directory = await seedInstall("locked-launcher-continuation", {
+        contentVersion: "2.0.0",
+      });
+      const record = path.join(directory, ".launcher-resume.json");
+      await fs.writeFile(
+        record,
+        JSON.stringify({
+          launcher_version: "1.0.0",
+          first_install_url: null,
+          window_position: [150, 220],
+          game_update_dismissed: false,
+          application_update_dismissed: false,
+        }),
+      );
+      const locker = spawn(path.join(scratch, "hold-file.exe"), [record], {
+        windowsHide: true,
+      });
+      await once(locker.stdout, "data");
+      try {
+        const session = await launch(directory);
+        await screen(session, "up to date");
+        assert.equal(session.child.exitCode, null);
+        locker.stdin.end();
+        await once(locker, "exit");
+        await stop(session);
+        const second = await launch(directory);
+        await screen(second, "up to date");
+        assert.equal(await readText(record), null);
+      } finally {
+        if (locker.exitCode === null) {
+          locker.kill();
+          await once(locker, "exit");
+        }
+      }
     },
   );
 

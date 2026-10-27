@@ -79,7 +79,7 @@ use rebellion2_update_core::{
     recover_interrupted_apply, replace_file_atomically, sha256_file, store_metadata,
     verify_install, BlobSource, InstallationLock, Manifest,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     webview::{PageLoadEvent, PageLoadPayload},
     Manager, WebviewUrl, WebviewWindowBuilder,
@@ -109,6 +109,7 @@ const LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.json";
 const LAUNCHER_VERSION_FILE: &str = ".launcher-version";
 const PENDING_LAUNCHER_MANIFEST_FILE: &str = ".launcher-manifest.pending.json";
 const PENDING_LAUNCHER_VERSION_FILE: &str = ".launcher-version.pending";
+const LAUNCHER_RESUME_FILE: &str = ".launcher-resume.json";
 const GAME_MANIFEST_FILE: &str = ".game-manifest.json";
 const GAME_VERSION_FILE: &str = ".game-version";
 #[cfg(target_os = "macos")]
@@ -346,6 +347,16 @@ enum Pending {
     },
 }
 
+/// Preserves the current flow and window placement across a verified launcher replacement.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LauncherResume {
+    launcher_version: String,
+    first_install_url: Option<String>,
+    window_position: Option<(i32, i32)>,
+    game_update_dismissed: bool,
+    application_update_dismissed: bool,
+}
+
 #[derive(Debug)]
 struct ContentUnavailable;
 impl std::fmt::Display for ContentUnavailable {
@@ -445,6 +456,24 @@ fn main() {
         *SESSION.lock().unwrap() = Some(token);
     }
 
+    let resume = install_dir()
+        .and_then(|directory| {
+            read_launcher_resume(&directory, current_launcher_version().as_deref())
+        })
+        .unwrap_or_else(|error| {
+            log_line(&format!(
+                "[launcher] couldn't restore launcher continuation: {error}"
+            ));
+            None
+        });
+    if let Some(resume) = &resume {
+        if let Some(url) = &resume.first_install_url {
+            *PENDING.lock().unwrap() = Some(Pending::FirstInstall { url: url.clone() });
+        }
+        GAME_UPDATE_DISMISSED.store(resume.game_update_dismissed, Ordering::Relaxed);
+        APPLICATION_UPDATE_DISMISSED.store(resume.application_update_dismissed, Ordering::Relaxed);
+    }
+
     tauri::Builder::default()
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -465,9 +494,13 @@ fn main() {
             let repair = std::env::args().any(|arg| arg == "--repair");
             // A first install or repair needs a fresh presigned Content archive URL
             // from the ownership gate. A cached patch token cannot supply that URL.
-            let need_signin = !preview_update_flow && requires_ownership_gate(installed, repair);
+            let need_signin = !preview_update_flow
+                && requires_ownership_gate(installed, repair)
+                && !resume
+                    .as_ref()
+                    .is_some_and(|state| state.first_install_url.is_some());
 
-            if need_signin {
+            let window = if need_signin {
                 // Open the gate; on_nav captures the token from /done, then scans.
                 let navigation_handle = handle.clone();
                 let page_load_handle = handle.clone();
@@ -479,9 +512,10 @@ fn main() {
                 .title("Rebellion 2 Launcher")
                 .inner_size(520.0, 700.0)
                 .resizable(false)
+                .visible(resume.is_none())
                 .on_navigation(move |url| on_nav(&navigation_handle, url))
                 .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                .build()?;
+                .build()?
             } else {
                 // Installed (or already signed in) — go straight to the scan. A scan
                 // failure can still offer the installed game when its content matches.
@@ -491,12 +525,29 @@ fn main() {
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
                     .resizable(false)
+                    .visible(resume.is_none())
                     .on_navigation({
                         let h = handle.clone();
                         move |url| on_nav(&h, url)
                     })
                     .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                    .build()?;
+                    .build()?
+            };
+            if let Some(resume) = &resume {
+                if let Some((x, y)) = resume.window_position {
+                    if let Err(error) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
+                        log_line(&format!(
+                            "[launcher] couldn't restore window position: {error}"
+                        ));
+                    }
+                }
+                window.show()?;
+                if let Err(error) = fs::remove_file(install_dir()?.join(LAUNCHER_RESUME_FILE)) {
+                    log_line(&format!(
+                        "[launcher] couldn't clear launcher continuation: {error}"
+                    ));
+                }
+                log_line("[launcher] resumed after launcher replacement.");
             }
             Ok(())
         })
@@ -863,6 +914,16 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         }
         "quit" => handle.exit(0),
         "launcher-update" => start_launcher_update(handle),
+        "restart-launcher" => {
+            let Some(operation) = begin_install_operation(handle) else {
+                return;
+            };
+            let handle = handle.clone();
+            thread::spawn(move || {
+                finish_launcher_restart(&handle);
+                drop(operation);
+            });
+        }
         "skip-launcher-update" => {
             *PENDING_LAUNCHER_UPDATE.lock().unwrap() = None;
             show_status_page(handle);
@@ -1118,7 +1179,6 @@ fn start_launcher_update(handle: &tauri::AppHandle) {
     let handle = handle.clone();
     thread::spawn(move || {
         let result = do_launcher_update(&handle, &update);
-        drop(operation);
         match result {
             Ok(()) => {
                 log_line(&format!(
@@ -1127,9 +1187,7 @@ fn start_launcher_update(handle: &tauri::AppHandle) {
                 ));
                 LAUNCHER_UPDATE_STAGED.store(true, Ordering::Relaxed);
                 *PENDING_LAUNCHER_UPDATE.lock().unwrap() = None;
-                update_progress(&handle, 100, "Launcher update downloaded.");
-                thread::sleep(Duration::from_millis(900));
-                scan_game_and_content(&handle);
+                finish_launcher_restart(&handle);
             }
             Err(error) => {
                 log_line(&format!("[launcher] launcher update failed: {error}"));
@@ -1142,7 +1200,75 @@ fn start_launcher_update(handle: &tauri::AppHandle) {
                 );
             }
         }
+        drop(operation);
     });
+}
+
+/// Restarts into a verified replacement before allowing further game or content operations.
+fn finish_launcher_restart(handle: &tauri::AppHandle) {
+    if let Err(error) = restart_updated_launcher(handle) {
+        log_line(&format!(
+            "[launcher] couldn't restart the updated launcher: {error}"
+        ));
+        show_retryable_failure(
+            handle,
+            "Couldn't restart launcher",
+            &error.to_string(),
+            "restart-launcher",
+            None,
+        );
+    }
+}
+
+/// Records the continuation before the existing helper replaces and reopens this process.
+fn restart_updated_launcher(handle: &tauri::AppHandle) -> io::Result<()> {
+    let directory = install_dir()?;
+    if staged_launcher_update_state(&directory, &launcher_path()?)?
+        != StagedLauncherUpdateState::Ready
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "The staged launcher is not ready to restart.",
+        ));
+    }
+    let first_install_url = match PENDING.lock().unwrap().as_ref() {
+        Some(Pending::FirstInstall { url }) => Some(url.clone()),
+        _ => None,
+    };
+    let resume = LauncherResume {
+        launcher_version: fs::read_to_string(directory.join(PENDING_LAUNCHER_VERSION_FILE))?
+            .trim()
+            .to_string(),
+        first_install_url,
+        window_position: handle
+            .get_webview_window("main")
+            .and_then(|window| window.outer_position().ok())
+            .map(|position| (position.x, position.y)),
+        game_update_dismissed: GAME_UPDATE_DISMISSED.load(Ordering::Relaxed),
+        application_update_dismissed: APPLICATION_UPDATE_DISMISSED.load(Ordering::Relaxed),
+    };
+    write_file_atomically(
+        directory.join(LAUNCHER_RESUME_FILE),
+        &serde_json::to_vec(&resume)?,
+    )?;
+    update_progress(handle, 100, "Restarting launcher…");
+    start_update_helper(true)?;
+    handle.exit(0);
+    Ok(())
+}
+
+/// Reads a continuation only for the exact launcher release it was recorded for.
+fn read_launcher_resume(
+    directory: &Path,
+    version: Option<&str>,
+) -> io::Result<Option<LauncherResume>> {
+    let bytes = match fs::read(directory.join(LAUNCHER_RESUME_FILE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let resume: LauncherResume = serde_json::from_slice(&bytes)?;
+    Ok((Some(resume.launcher_version.as_str()) == version).then_some(resume))
 }
 
 /// Downloads and stages only the launcher executable and its handoff helper.
@@ -5189,6 +5315,7 @@ mod tests {
             ".game-manifest.json",
             ".content-packs/example/install.json",
             ".approved-content-update",
+            ".launcher-resume.json",
             ".rebellion2-install.lock",
         ] {
             let manifest = Manifest {
@@ -5224,6 +5351,59 @@ mod tests {
         )
         .unwrap();
         assert!(read_game_manifest(directory.path()).is_none());
+    }
+
+    #[test]
+    fn read_launcher_resume_preserves_first_install_choices_and_window_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = LauncherResume {
+            launcher_version: "1.2.0".to_string(),
+            first_install_url: Some(
+                "https://content.invalid/archive?signature=fixture".to_string(),
+            ),
+            window_position: Some((-700, 240)),
+            game_update_dismissed: true,
+            application_update_dismissed: true,
+        };
+        write_file_atomically(
+            directory.path().join(LAUNCHER_RESUME_FILE),
+            &serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_launcher_resume(directory.path(), Some("1.2.0")).unwrap(),
+            Some(expected)
+        );
+        assert!(directory.path().join(LAUNCHER_RESUME_FILE).exists());
+    }
+
+    #[test]
+    fn read_launcher_resume_ignores_a_different_launcher_version() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(LAUNCHER_RESUME_FILE), br#"{"launcher_version":"1.2.0","first_install_url":null,"window_position":null,"game_update_dismissed":false,"application_update_dismissed":false}"#).unwrap();
+
+        assert_eq!(
+            read_launcher_resume(directory.path(), Some("1.1.0")).unwrap(),
+            None
+        );
+        assert_eq!(read_launcher_resume(directory.path(), None).unwrap(), None);
+    }
+
+    #[test]
+    fn read_launcher_resume_without_a_record_returns_none() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_launcher_resume(directory.path(), Some("1.2.0")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn read_launcher_resume_rejects_a_truncated_record() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(LAUNCHER_RESUME_FILE), b"{").unwrap();
+        assert!(read_launcher_resume(directory.path(), Some("1.2.0")).is_err());
     }
 
     #[test]
@@ -6234,8 +6414,9 @@ mod tests {
 
         assert!(screen.contains("Launcher update available"));
         assert!(screen.contains("Launcher version 1.2.3 is available."));
-        assert!(screen.contains("This does not update the game."));
-        assert!(screen.contains("choice=launcher-update\">Update launcher"));
+        assert!(screen.contains("Update and restart"));
+        assert!(screen.contains("continue where you left off"));
+        assert!(screen.contains("choice=launcher-update\">Update and restart"));
         assert!(screen.contains("Fixed update handling."));
     }
 
