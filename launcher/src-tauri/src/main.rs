@@ -542,7 +542,11 @@ fn main() {
                     }
                 }
                 window.show()?;
-                fs::remove_file(install_dir()?.join(LAUNCHER_RESUME_FILE))?;
+                if let Err(error) = fs::remove_file(install_dir()?.join(LAUNCHER_RESUME_FILE)) {
+                    log_line(&format!(
+                        "[launcher] couldn't clear launcher continuation: {error}"
+                    ));
+                }
                 log_line("[launcher] resumed after launcher replacement.");
             }
             Ok(())

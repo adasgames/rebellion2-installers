@@ -2806,6 +2806,46 @@ try {
   );
 
   await scenario(
+    "locked launcher continuation cannot prevent startup and is cleared after unlocking",
+    async () => {
+      const directory = await seedInstall("locked-launcher-continuation", {
+        contentVersion: "2.0.0",
+      });
+      const record = path.join(directory, ".launcher-resume.json");
+      await fs.writeFile(
+        record,
+        JSON.stringify({
+          launcher_version: "1.0.0",
+          first_install_url: null,
+          window_position: [150, 220],
+          game_update_dismissed: false,
+          application_update_dismissed: false,
+        }),
+      );
+      const locker = spawn(path.join(scratch, "hold-file.exe"), [record], {
+        windowsHide: true,
+      });
+      await once(locker.stdout, "data");
+      try {
+        const session = await launch(directory);
+        await screen(session, "up to date");
+        assert.equal(session.child.exitCode, null);
+        locker.stdin.end();
+        await once(locker, "exit");
+        await stop(session);
+        const second = await launch(directory);
+        await screen(second, "up to date");
+        assert.equal(await readText(record), null);
+      } finally {
+        if (locker.exitCode === null) {
+          locker.kill();
+          await once(locker, "exit");
+        }
+      }
+    },
+  );
+
+  await scenario(
     "archive traversal is rejected without writing outside staging",
     async () => {
       state.archive = zipArchive(
