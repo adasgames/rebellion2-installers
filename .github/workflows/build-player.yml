@@ -157,7 +157,7 @@ jobs:
           buildMethod: StandalonePlayerBuild.Build
           versioning: Custom
           version: ${{ inputs.version }}
-          customParameters: -enableDiagnostics
+          customParameters: -enableDiagnostics -enableAnalytics
           allowDirtyBuild: true
 
       - name: Upload Windows player
