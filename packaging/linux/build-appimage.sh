@@ -72,6 +72,9 @@ install -m 0644 "$GAME_MANIFEST" "$BOOTSTRAP/.game-manifest.json"
 printf '%s' "$LAUNCHER_VERSION" > "$BOOTSTRAP/.launcher-version"
 printf '%s' "$GAME_VERSION" > "$BOOTSTRAP/.game-version"
 chmod +x "$BOOTSTRAP/game/Rebellion2.x86_64"
+if [ -f "$BOOTSTRAP/game/rebellion2-editor.x86_64" ]; then
+  chmod +x "$BOOTSTRAP/game/rebellion2-editor.x86_64"
+fi
 if [ -f "$BOOTSTRAP/game/UnityCrashHandler64" ]; then
   chmod +x "$BOOTSTRAP/game/UnityCrashHandler64"
 fi

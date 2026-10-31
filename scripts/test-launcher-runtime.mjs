@@ -46,6 +46,7 @@ let base;
 let launcherBytes;
 let helperBytes;
 let gameBytes;
+let editorBytes;
 let installerPath;
 let installedLauncherBytes;
 let olderLauncherBytes;
@@ -95,15 +96,23 @@ async function command(executable, args, options = {}) {
   return output;
 }
 
-async function buildInstallerFixture() {
+async function buildInstallerFixture({
+  editor = false,
+  shortcuts = false,
+} = {}) {
   const compiler =
     process.env.ISCC_PATH ||
     path.join(process.env.LOCALAPPDATA, "Programs", "Inno Setup 6", "ISCC.exe");
   await fs.access(compiler);
-  const fixture = path.join(scratch, "installer-fixture");
+  const fixture = path.join(
+    scratch,
+    editor ? "editor-installer-fixture" : "installer-fixture",
+  );
   const player = path.join(fixture, "player");
   await fs.mkdir(path.join(player, "Rebellion2_Data"), { recursive: true });
   await fs.writeFile(path.join(player, "Rebellion2.exe"), gameBytes);
+  if (editor)
+    await fs.writeFile(path.join(player, "rebellion2-editor.exe"), editorBytes);
   await fs.writeFile(
     path.join(player, "Rebellion2_Data/runtime-settings.json"),
     installedSettings,
@@ -140,6 +149,7 @@ async function buildInstallerFixture() {
         new Map([
           ["Rebellion2.exe", gameBytes],
           ["Rebellion2_Data/runtime-settings.json", installedSettings],
+          ...(editor ? [["rebellion2-editor.exe", editorBytes]] : []),
         ]),
       ),
     ),
@@ -158,7 +168,6 @@ async function buildInstallerFixture() {
   script = script
     .replace(/^AppId=.*$/m, `AppId=Reb2Runtime-${path.basename(scratch)}`)
     .replace("[Setup]", "[Setup]\nUninstallable=no\nCreateUninstallRegKey=no")
-    .replace(/\[Icons\][\s\S]*?(?=\[UninstallDelete\])/, "")
     .replace(
       "  InstallationPrepared := True;",
       `  InstallationPrepared := True;
@@ -167,6 +176,14 @@ async function buildInstallerFixture() {
     while not FileExists(ExpandConstant('{app}\\.test-installer-release')) do Sleep(50);
   end;`,
     );
+  if (shortcuts) {
+    script = script
+      .replaceAll("{group}", path.join(fixture, "start menu"))
+      .replaceAll("{autodesktop}", path.join(fixture, "desktop"))
+      .replace(/\[Run\][\s\S]*?(?=\[UninstallDelete\])/, "");
+  } else {
+    script = script.replace(/\[Icons\][\s\S]*?(?=\[UninstallDelete\])/, "");
+  }
   const scriptPath = path.join(fixture, "fixture.iss");
   await fs.writeFile(scriptPath, script);
   await command(compiler, [
@@ -182,18 +199,33 @@ async function buildInstallerFixture() {
     `/DOutputDir=${fixture}`,
     scriptPath,
   ]);
-  installerPath = path.join(fixture, "Rebellion2-3.0.0-Setup.exe");
+  return path.join(fixture, "Rebellion2-3.0.0-Setup.exe");
 }
 
-async function runInstaller(directory, name) {
-  return command(installerPath, [
+async function runInstaller(
+  directory,
+  name,
+  { installer = installerPath, tasks } = {},
+) {
+  return command(installer, [
     "/VERYSILENT",
     "/SUPPRESSMSGBOXES",
     "/NORESTART",
     "/CLOSEAPPLICATIONS",
     `/DIR=${directory}`,
     `/LOG=${path.join(scratch, `installer-${name}.log`)}`,
+    ...(tasks ? [`/TASKS=${tasks}`] : []),
   ]);
+}
+
+async function readShortcut(file) {
+  const output = await command("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    `$link = (New-Object -ComObject WScript.Shell).CreateShortcut('${file.replaceAll("'", "''")}'); @{target=$link.TargetPath; workingDirectory=$link.WorkingDirectory; icon=$link.IconLocation} | ConvertTo-Json -Compress`,
+  ]);
+  return JSON.parse(output);
 }
 
 async function buildOlderLauncher(environment) {
@@ -379,13 +411,14 @@ function publishLauncher(
   return files;
 }
 
-function publishGame(version) {
+function publishGame(version, extraFiles = new Map()) {
   const files = new Map([
     ["Rebellion2.exe", gameBytes],
     [
       "Rebellion2_Data/runtime-settings.json",
       Buffer.from(JSON.stringify({ version })),
     ],
+    ...extraFiles,
   ]);
   const signature = publishManifest(
     "/dist/game-manifest.json",
@@ -877,6 +910,34 @@ async function click(session, choice) {
     `document.querySelector(${JSON.stringify(selector)}).click(); true`,
   );
 }
+
+async function expectEditorLaunch(session) {
+  await until(
+    async () =>
+      (await readText(path.join(session.directory, "editor-started"))) ===
+      session.directory,
+    "editor launch with installation working directory",
+  );
+  await until(
+    () => session.child.exitCode === 0,
+    "launcher exit after opening editor",
+  );
+  await fs.writeFile(
+    path.join(session.directory, "editor-confirm"),
+    "continue",
+  );
+  await until(
+    async () =>
+      (await readText(path.join(session.directory, "editor-alive"))) ===
+      "alive",
+    "editor process surviving launcher exit",
+  );
+  assert.equal(
+    await readText(path.join(session.directory, "game-started")),
+    null,
+  );
+}
+
 async function stop(session) {
   session.socket?.close();
   if (session.child.exitCode === null && session.child.signalCode === null) {
@@ -1022,6 +1083,12 @@ try {
   ]);
   await command("rustc", [
     "--edition=2021",
+    "scripts/fixtures/editor-stub.rs",
+    "-o",
+    path.join(scratch, "editor-stub.exe"),
+  ]);
+  await command("rustc", [
+    "--edition=2021",
     "scripts/fixtures/hold-file.rs",
     "-o",
     path.join(scratch, "hold-file.exe"),
@@ -1045,10 +1112,11 @@ try {
     ),
   );
   gameBytes = await fs.readFile(path.join(scratch, "game-stub.exe"));
+  editorBytes = await fs.readFile(path.join(scratch, "editor-stub.exe"));
   if (!process.argv[2] || process.argv[2].includes("older launcher"))
     await buildOlderLauncher(environment);
   if (!process.argv[2] || /installer|reinstall/i.test(process.argv[2]))
-    await buildInstallerFixture();
+    installerPath = await buildInstallerFixture();
   const sourceFiles = (
     await command("git", [
       "ls-files",
@@ -1090,12 +1158,185 @@ try {
           launcher: digest(launcherBytes),
           helper: digest(helperBytes),
           gameStub: digest(gameBytes),
+          editorStub: digest(editorBytes),
         },
         olderBuild,
       },
       null,
       2,
     ),
+  );
+
+  await scenario(
+    "content editor launches from the ready screen and survives launcher exit",
+    async () => {
+      const directory = await seedInstall("editor-ready", {
+        contentVersion: "2.0.0",
+      });
+      await fs.writeFile(
+        path.join(directory, "rebellion2-editor.exe"),
+        editorBytes,
+      );
+      const session = await launch(directory);
+      await screen(session, "up to date");
+      assert.equal(
+        await evaluate(
+          session,
+          `[...document.querySelectorAll('.btns .b')].every(button => {
+      const bounds = button.getBoundingClientRect();
+      return bounds.width > 0 && bounds.bottom <= innerHeight && bounds.top >= 0;
+    })`,
+        ),
+        true,
+      );
+      const screenshot = await debuggerCommand(
+        session,
+        "Page.captureScreenshot",
+        { format: "png" },
+      );
+      await fs.writeFile(
+        path.join(scratch, "editor-ready.png"),
+        Buffer.from(screenshot.data, "base64"),
+      );
+      await click(session, "open-editor");
+      await expectEditorLaunch(session);
+    },
+  );
+
+  await scenario(
+    "content editor is delivered by a game update and becomes available without reinstalling",
+    async () => {
+      const runtime = Buffer.from("editor runtime");
+      publishGame(
+        "3.0.0",
+        new Map([
+          ["rebellion2-editor.exe", editorBytes],
+          ["rebellion2-editor_Data/runtime.bin", runtime],
+        ]),
+      );
+      const directory = await seedInstall("editor-update", {
+        contentVersion: "2.0.0",
+      });
+      const session = await launch(directory);
+      await screen(session, "Game update available");
+      await click(session, "game-update");
+      await ready(session);
+      assert.equal(
+        digest(
+          await fs.readFile(path.join(directory, "rebellion2-editor.exe")),
+        ),
+        digest(editorBytes),
+      );
+      assert.equal(
+        await readText(
+          path.join(directory, "rebellion2-editor_Data/runtime.bin"),
+        ),
+        runtime.toString(),
+      );
+      await click(session, "open-editor");
+      await expectEditorLaunch(session);
+    },
+  );
+
+  await scenario(
+    "content editor remains available when the update server is offline",
+    async () => {
+      state.fault = { metadataStatus: 503 };
+      const directory = await seedInstall("editor-offline", {
+        contentVersion: "2.0.0",
+      });
+      await fs.writeFile(
+        path.join(directory, "rebellion2-editor.exe"),
+        editorBytes,
+      );
+      const session = await launch(directory);
+      await screen(session, "still available to play");
+      await click(session, "open-editor");
+      await expectEditorLaunch(session);
+    },
+  );
+
+  await scenario(
+    "content editor is hidden for older games and reports a missing executable",
+    async () => {
+      const directory = await seedInstall("editor-missing", {
+        contentVersion: "2.0.0",
+      });
+      const session = await launch(directory);
+      await screen(session, "up to date");
+      assert.equal(
+        await evaluate(
+          session,
+          `Boolean(document.querySelector('a[href*="choice=open-editor"]'))`,
+        ),
+        false,
+      );
+      await evaluate(
+        session,
+        `location.href = 'https://launcher.invalid/act?choice=open-editor'; true`,
+      );
+      await screen(session, "The editor isn't installed");
+      assert.equal(await readText(path.join(directory, "game-started")), null);
+    },
+  );
+
+  await scenario(
+    "content editor cannot launch against mismatched game and content versions",
+    async () => {
+      const directory = await seedInstall("editor-mismatch");
+      await fs.writeFile(
+        path.join(directory, "rebellion2-editor.exe"),
+        editorBytes,
+      );
+      const session = await launch(directory);
+      await screen(session, "Update available");
+      await evaluate(
+        session,
+        `location.href = 'https://launcher.invalid/act?choice=open-editor'; true`,
+      );
+      await screen(session, "The editor failed to start");
+      assert.match(
+        await readText(path.join(directory, "launcher.log")),
+        /game and content versions do not match/,
+      );
+      assert.equal(
+        await readText(path.join(directory, "editor-started")),
+        null,
+      );
+    },
+  );
+
+  await scenario(
+    "content editor installer creates Start menu and optional desktop shortcuts",
+    async () => {
+      const installer = await buildInstallerFixture({
+        editor: true,
+        shortcuts: true,
+      });
+      const directory = path.join(scratch, "editor-installed");
+      const fixture = path.join(scratch, "editor-installer-fixture");
+      const name = "Rebellion 2 Content Pack Editor.lnk";
+      const menu = path.join(fixture, "start menu", name);
+      const desktop = path.join(fixture, "desktop", name);
+      await runInstaller(directory, "editor-default", { installer });
+      const expected = path.join(directory, "rebellion2-editor.exe");
+      const link = await readShortcut(menu);
+      assert.equal(link.target, expected);
+      assert.equal(link.workingDirectory, directory);
+      assert.equal(link.icon.toLowerCase(), `${expected},0`.toLowerCase());
+      assert.equal(await readText(desktop), null);
+      await runInstaller(directory, "editor-desktop", {
+        installer,
+        tasks: "editordesktopicon",
+      });
+      const desktopLink = await readShortcut(desktop);
+      assert.equal(desktopLink.target, expected);
+      assert.equal(desktopLink.workingDirectory, directory);
+      assert.equal(
+        await readText(path.join(fixture, "desktop", "Rebellion 2.lnk")),
+        null,
+      );
+    },
   );
 
   for (const installed of [true, false]) {
