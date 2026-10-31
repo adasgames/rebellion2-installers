@@ -42,6 +42,9 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 2. Windows may show a blue **"Windows protected your PC"** box. Click **More info → Run anyway**.
 3. Follow the installer. Rebellion 2 lands in your Start Menu.
 
+When included with your game version, the Content Pack Editor also appears in the Start Menu.
+Setup offers a separate optional desktop shortcut. You can also choose **Open editor** in the launcher.
+
 ### macOS
 1. Unzip **`Rebellion2-macOS.zip`**.
 2. Drag **`Rebellion II.app`** into your **Applications** folder. The launcher and game are both

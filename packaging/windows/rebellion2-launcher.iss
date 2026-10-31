@@ -32,6 +32,8 @@
 #define MyAppPublisher "AdasGames"
 #define MyLauncherExe "rebellion2-launcher.exe"
 #define MyGameExe "Rebellion2.exe"
+#define MyEditorExe "rebellion2-editor.exe"
+#define MyEditorName "Rebellion 2 Content Pack Editor"
 
 [Setup]
 AppId={{7C3F1E92-5A4B-4D8E-9F21-3B6C8A2D4E10}
@@ -63,6 +65,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Add &Rebellion 2 to the desktop"; GroupDescription: "Additional icons:"; Flags: unchecked
+#if FileExists(AddBackslash(GameDir) + MyEditorExe)
+Name: "editordesktopicon"; Description: "Add the Rebellion 2 Content Pack &Editor to the desktop"; GroupDescription: "Additional icons:"; Flags: unchecked
+#endif
 
 [InstallDelete]
 ; Rebuild the game-owned native plugin directory instead of retaining obsolete plugins.
@@ -106,6 +111,10 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; WorkingDir: "{
 Name: "{group}\Repair {#MyAppName} Content"; Filename: "{app}\{#MyLauncherExe}"; Parameters: "--repair"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyLauncherExe}"; WorkingDir: "{app}"; Tasks: desktopicon
+#if FileExists(AddBackslash(GameDir) + MyEditorExe)
+Name: "{group}\{#MyEditorName}"; Filename: "{app}\{#MyEditorExe}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyEditorExe}"
+Name: "{autodesktop}\{#MyEditorName}"; Filename: "{app}\{#MyEditorExe}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyEditorExe}"; Tasks: editordesktopicon
+#endif
 
 [Run]
 ; First-run setup still goes through the launcher so it can verify ownership, install

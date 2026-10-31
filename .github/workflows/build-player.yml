@@ -160,12 +160,25 @@ jobs:
           customParameters: -enableDiagnostics
           allowDirtyBuild: true
 
+      - name: Verify companion editor and runtime layout
+        run: |
+          if [ -f game/Tools/package_desktop.py ]; then
+            python3 game/Tools/package_desktop.py \
+              --platform "${{ inputs.target }}" \
+              --game-name Rebellion2 \
+              --build-dir "build/${{ inputs.target }}" \
+              --stage-dir "verified/${{ inputs.target }}"
+          else
+            mkdir -p "verified/${{ inputs.target }}"
+            cp -a "build/${{ inputs.target }}/." "verified/${{ inputs.target }}/"
+          fi
+
       - name: Upload Windows player
         if: inputs.target == 'StandaloneWindows64'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact }}
-          path: build/${{ inputs.target }}
+          path: verified/${{ inputs.target }}
           if-no-files-found: error
 
       - name: Upload Linux player
@@ -173,12 +186,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact }}
-          path: build/${{ inputs.target }}
+          path: verified/${{ inputs.target }}
           if-no-files-found: error
 
       - name: Archive macOS player
         if: inputs.target == 'StandaloneOSX'
-        run: tar -czf player-macos.tar.gz -C build/StandaloneOSX .
+        run: tar -czf player-macos.tar.gz -C verified/StandaloneOSX .
 
       - name: Upload macOS player
         if: inputs.target == 'StandaloneOSX'

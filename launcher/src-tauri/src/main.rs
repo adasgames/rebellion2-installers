@@ -144,10 +144,14 @@ const SESSION_FILE: &str = ".session";
 
 #[cfg(target_os = "windows")]
 const GAME_EXE: &str = "Rebellion2.exe";
+#[cfg(target_os = "windows")]
+const EDITOR_EXE: &str = "rebellion2-editor.exe";
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_NATIVE_PLUGIN_DIRECTORY: &str = "Rebellion2_Data/Plugins/x86_64";
 #[cfg(target_os = "linux")]
 const GAME_EXE: &str = "Rebellion2.x86_64";
+#[cfg(target_os = "linux")]
+const EDITOR_EXE: &str = "rebellion2-editor.x86_64";
 #[cfg(target_os = "linux")]
 const UNITY_CRASH_HANDLER_EXE: &str = "UnityCrashHandler64";
 
@@ -877,29 +881,37 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     }
 
     match choice {
-        "play" => {
+        "play" | "open-editor" => {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
             if show_required_content_pack_update(handle) {
                 return;
             }
-            log_line("[launcher] Play clicked.");
-            match launch_game() {
+            let (name, result) = if choice == "open-editor" {
+                ("editor", launch_editor())
+            } else {
+                ("game", launch_game())
+            };
+            match result {
                 Ok(true) => handle.exit(0),
                 Ok(false) => show_message(
                     handle,
                     "Not installed",
-                    "The game files aren't here yet — reinstall from the latest build.",
+                    if choice == "open-editor" {
+                        "The editor isn't installed. Update the game to a version that includes it."
+                    } else {
+                        "The game files aren't here yet — reinstall from the latest build."
+                    },
                     None,
                 ),
                 Err(err) => {
-                    log_line(&format!("[launcher] failed to start the game: {err}"));
+                    log_line(&format!("[launcher] failed to start the {name}: {err}"));
                     show_message(
                         handle,
                         "Couldn't start",
-                        "The game failed to start — see launcher.log.",
-                        Some(("Retry", "play")),
+                        &format!("The {name} failed to start — see launcher.log."),
+                        Some(("Retry", choice)),
                     );
                 }
             }
@@ -1075,11 +1087,11 @@ fn on_preview_choice(handle: &tauri::AppHandle, choice: &str) {
             let handle = handle.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(700));
-                write_screen(&handle, &launcher_staged_ready_screen("0.0.26"));
+                write_screen(&handle, &launcher_staged_ready_screen("0.0.26", true));
             });
         }
-        "skip-game-update" => write_screen(handle, &up_to_date_screen("0.0.25")),
-        "play" | "quit" => handle.exit(0),
+        "skip-game-update" => write_screen(handle, &up_to_date_screen("0.0.25", true)),
+        "play" | "open-editor" | "quit" => handle.exit(0),
         _ => {}
     }
 }
@@ -3970,10 +3982,11 @@ fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
         return;
     }
 
+    let editor_installed = editor_path().is_ok_and(|path| path.exists());
     let screen = if launcher_update_was_staged() {
-        launcher_staged_ready_screen(version)
+        launcher_staged_ready_screen(version, editor_installed)
     } else {
-        up_to_date_screen(version)
+        up_to_date_screen(version, editor_installed)
     };
     write_screen(handle, &screen);
 }
@@ -4546,7 +4559,11 @@ fn show_update_check_failed(
 ) {
     write_screen(
         handle,
-        &update_check_failed_screen(installed_version, error),
+        &update_check_failed_screen(
+            installed_version,
+            error,
+            editor_path().is_ok_and(|path| path.exists()),
+        ),
     );
 }
 
@@ -4847,6 +4864,20 @@ fn game_path() -> io::Result<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn game_path() -> io::Result<PathBuf> {
     Ok(install_dir()?.join(GAME_EXE))
+}
+
+/// Locates the companion editor in the installed desktop bundle.
+fn editor_path() -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return Ok(macos_editor_path(&game_path()?));
+    #[cfg(not(target_os = "macos"))]
+    Ok(install_dir()?.join(EDITOR_EXE))
+}
+
+/// Keeps the macOS editor inside the game bundle carried by signed game updates.
+#[cfg(any(target_os = "macos", test))]
+fn macos_editor_path(game_bundle: &Path) -> PathBuf {
+    game_bundle.join("Contents/Helpers/rebellion2-editor.app")
 }
 
 fn log_line(message: &str) {
@@ -5231,14 +5262,26 @@ fn include_unlisted_windows_native_plugins(
 #[cfg(target_os = "linux")]
 fn ensure_linux_player_executables(directory: &Path) -> io::Result<()> {
     ensure_executable(&directory.join(GAME_EXE))?;
-    let crash_handler = directory.join(UNITY_CRASH_HANDLER_EXE);
-    if crash_handler.is_file() {
-        ensure_executable(&crash_handler)?;
+    for executable in [UNITY_CRASH_HANDLER_EXE, EDITOR_EXE] {
+        let path = directory.join(executable);
+        if path.is_file() {
+            ensure_executable(&path)?;
+        }
     }
     Ok(())
 }
 
 fn launch_game() -> io::Result<bool> {
+    launch_player(&game_path()?)
+}
+
+/// Starts the editor using the same installed-content and process-lifetime rules as the game.
+fn launch_editor() -> io::Result<bool> {
+    launch_player(&editor_path()?)
+}
+
+/// Validates the installed player/content pair before starting a bundled Unity application.
+fn launch_player(exe: &Path) -> io::Result<bool> {
     recover_interrupted_updates()?;
     let base = install_dir()?;
     let content_version = read_installed_version(&base.join("Content"));
@@ -5251,19 +5294,15 @@ fn launch_game() -> io::Result<bool> {
             "the installed game and content versions do not match; finish the update before launching",
         ));
     }
-    let exe = game_path()?;
     if !exe.exists() {
-        log_line(&format!(
-            "[launcher] game exe not found at {}",
-            exe.display()
-        ));
+        log_line(&format!("[launcher] player not found at {}", exe.display()));
         return Ok(false);
     }
     log_line(&format!("[launcher] launching {}", exe.display()));
 
     #[cfg(target_os = "macos")]
     std::process::Command::new("/usr/bin/open")
-        .arg(&exe)
+        .arg(exe)
         .arg("--args")
         .arg("-contentPath")
         .arg(base.join("Content"))
@@ -5272,14 +5311,12 @@ fn launch_game() -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         ensure_linux_player_executables(&base)?;
-        std::process::Command::new(&exe)
-            .current_dir(&base)
-            .spawn()?;
+        std::process::Command::new(exe).current_dir(&base).spawn()?;
     }
 
     // On Windows the launcher runs inside a WebView2 job object that kills child
     // processes when the launcher exits — so a plain spawn dies the moment we
-    // close. Break the game out of the job (and detach it) so it keeps running;
+    // close. Break the player out of the job (and detach it) so it keeps running;
     // if the job forbids breakaway, hand off to Explorer, which starts it in its
     // own process tree, independent of ours.
     #[cfg(target_os = "windows")]
@@ -5288,7 +5325,7 @@ fn launch_game() -> io::Result<bool> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        let spawned = std::process::Command::new(&exe)
+        let spawned = std::process::Command::new(exe)
             .current_dir(&base)
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
             .spawn();
@@ -5297,7 +5334,7 @@ fn launch_game() -> io::Result<bool> {
                 "[launcher] breakaway spawn failed ({err}); handing off to Explorer."
             ));
             std::process::Command::new("explorer.exe")
-                .arg(&exe)
+                .arg(exe)
                 .spawn()?;
         }
     }
@@ -6406,6 +6443,40 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_player_permissions_restore_the_optional_content_editor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            GAME_EXE,
+            "rebellion2-editor.x86_64",
+            UNITY_CRASH_HANDLER_EXE,
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"program").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        ensure_linux_player_executables(directory.path()).unwrap();
+
+        for name in [
+            GAME_EXE,
+            "rebellion2-editor.x86_64",
+            UNITY_CRASH_HANDLER_EXE,
+        ] {
+            assert_eq!(
+                fs::metadata(directory.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0o111
+            );
+        }
+    }
+
     #[test]
     fn launcher_update_screen_with_release_notes_identifies_launcher_update() {
         let notes = release_notes();
@@ -6433,7 +6504,7 @@ mod tests {
 
     #[test]
     fn launcher_staged_ready_screen_keeps_play_available() {
-        let screen = launcher_staged_ready_screen("0.0.25");
+        let screen = launcher_staged_ready_screen("0.0.25", false);
 
         assert!(screen.contains("Ready to play"));
         assert!(screen.contains("Game version 0.0.25 is up to date."));
@@ -6781,15 +6852,41 @@ mod tests {
 
     #[test]
     fn up_to_date_screen_with_confirmed_version_displays_version() {
-        let screen = up_to_date_screen("1.2.3");
+        let screen = up_to_date_screen("1.2.3", false);
 
         assert!(screen.contains("Version 1.2.3 is up to date."));
         assert!(screen.contains("choice=play\">Launch game"));
+        assert!(!screen.contains("choice=open-editor"));
+    }
+
+    #[test]
+    fn up_to_date_screen_with_installed_editor_offers_editor_launch() {
+        let screen = up_to_date_screen("1.2.3", true);
+        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=play\">Launch game"));
+        assert!(screen.contains("choice=content-packs"));
+    }
+
+    #[test]
+    fn launcher_staged_ready_screen_with_installed_editor_keeps_editor_available() {
+        let screen = launcher_staged_ready_screen("1.2.3", true);
+        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=play\">Play game"));
+    }
+
+    #[test]
+    fn macos_editor_path_follows_the_nested_game_bundle() {
+        let game =
+            Path::new("/Applications/Rebellion II.app/Contents/Resources/Rebellion2 Game.app");
+        assert_eq!(
+            macos_editor_path(game),
+            game.join("Contents/Helpers/rebellion2-editor.app")
+        );
     }
 
     #[test]
     fn update_check_failed_screen_with_installed_game_offers_retry_and_launch() {
-        let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed");
+        let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed", false);
 
         assert!(screen.contains(">Launcher</p>"));
         assert!(screen.contains("Version 1.2.3 is still available to play."));
@@ -6803,13 +6900,20 @@ mod tests {
 
     #[test]
     fn update_check_failed_screen_without_installed_game_offers_only_retry() {
-        let screen = update_check_failed_screen(None, "operation timed out");
+        let screen = update_check_failed_screen(None, "operation timed out", true);
 
         assert!(screen.contains(">Launcher</p>"));
         assert!(screen.contains("Check your connection, then retry."));
         assert!(screen.contains("did not respond in time"));
         assert!(screen.contains("choice=retry-update-check\">Retry"));
         assert!(!screen.contains("choice=play"));
+        assert!(!screen.contains("choice=open-editor"));
+    }
+
+    #[test]
+    fn update_check_failed_screen_with_installed_editor_keeps_it_available_offline() {
+        let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed", true);
+        assert!(screen.contains("choice=open-editor\">Open editor"));
     }
 
     #[test]

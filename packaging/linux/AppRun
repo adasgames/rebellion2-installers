@@ -19,6 +19,9 @@ if [ ! -f "$INSTALL_DIR/rebellion2-update-helper" ]; then
   cp "$BOOTSTRAP/rebellion2-update-helper" "$INSTALL_DIR/rebellion2-update-helper"
 fi
 chmod +x "$INSTALL_DIR/rebellion2-update-helper" "$INSTALL_DIR/Rebellion2.x86_64"
+if [ -f "$INSTALL_DIR/rebellion2-editor.x86_64" ]; then
+  chmod +x "$INSTALL_DIR/rebellion2-editor.x86_64"
+fi
 if [ -f "$INSTALL_DIR/UnityCrashHandler64" ]; then
   chmod +x "$INSTALL_DIR/UnityCrashHandler64"
 fi

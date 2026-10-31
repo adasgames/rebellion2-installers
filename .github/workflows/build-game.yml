@@ -366,6 +366,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x player/Rebellion2.x86_64
+          if [ -f player/rebellion2-editor.x86_64 ]; then chmod +x player/rebellion2-editor.x86_64; fi
           if [ -f player/UnityCrashHandler64 ]; then chmod +x player/UnityCrashHandler64; fi
           node scripts/package-update-layer.mjs \
             player \

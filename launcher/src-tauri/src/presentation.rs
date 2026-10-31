@@ -253,17 +253,20 @@ pub(crate) fn required_content_pack_update_screen(
     )
 }
 
-pub(crate) fn up_to_date_screen(version: &str) -> String {
+pub(crate) fn up_to_date_screen(version: &str, editor_installed: bool) -> String {
     render(
         "Up to date",
         false,
         &format!("Version {version} is up to date."),
-        &ready_buttons("Launch game"),
+        &ready_buttons("Launch game", editor_installed),
     )
 }
 
-pub(crate) fn ready_buttons(play_label: &str) -> String {
+pub(crate) fn ready_buttons(play_label: &str, editor_installed: bool) -> String {
     let mut buttons = button(play_label, "play");
+    if editor_installed {
+        buttons.push_str(&secondary_button("Open editor", "open-editor"));
+    }
     buttons.push_str(&secondary_button("Content packs", "content-packs"));
     buttons
 }
@@ -283,18 +286,22 @@ pub(crate) fn content_pack_error_screen(title: &str, error: &str) -> String {
 }
 
 /// Builds the ready screen after staging a launcher update and checking the game.
-pub(crate) fn launcher_staged_ready_screen(version: &str) -> String {
+pub(crate) fn launcher_staged_ready_screen(version: &str, editor_installed: bool) -> String {
     render(
         "Ready to play",
         false,
         &format!(
             "Game version {version} is up to date. The launcher update will apply next time you start the launcher."
         ),
-        &ready_buttons("Play game"),
+        &ready_buttons("Play game", editor_installed),
     )
 }
 
-pub(crate) fn update_check_failed_screen(installed_version: Option<&str>, error: &str) -> String {
+pub(crate) fn update_check_failed_screen(
+    installed_version: Option<&str>,
+    error: &str,
+    editor_installed: bool,
+) -> String {
     let note = installed_version.map_or_else(
         || "Check your connection, then retry.".to_string(),
         |version| {
@@ -309,6 +316,9 @@ pub(crate) fn update_check_failed_screen(installed_version: Option<&str>, error:
     let mut buttons = button("Retry", "retry-update-check");
     if installed_version.is_some() {
         buttons.push_str(&secondary_button("Launch game", "play"));
+        if editor_installed {
+            buttons.push_str(&secondary_button("Open editor", "open-editor"));
+        }
     }
     render_with_content("Launcher", false, &note, &content, &buttons)
 }
