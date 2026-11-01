@@ -16,6 +16,7 @@ cat > "$APP_DIR/AppRun.launcher" <<'EOF'
 printf '%s\n' "$@" > "$TEST_OUTPUT"
 EOF
 printf 'game-one' > "$BOOTSTRAP/game/Rebellion2.x86_64"
+printf 'editor-one' > "$BOOTSTRAP/game/rebellion2-editor.x86_64"
 printf 'crash-one' > "$BOOTSTRAP/game/UnityCrashHandler64"
 printf 'helper-one' > "$BOOTSTRAP/rebellion2-update-helper"
 printf 'launcher-manifest-one' > "$BOOTSTRAP/.launcher-manifest.json"
@@ -32,10 +33,12 @@ TEST_OUTPUT="$OUTPUT" \
 
 INSTALL_DIR="$DATA_HOME/rebellion2"
 test "$(cat "$INSTALL_DIR/Rebellion2.x86_64")" = game-one
+test "$(cat "$INSTALL_DIR/rebellion2-editor.x86_64")" = editor-one
 test "$(cat "$INSTALL_DIR/.game-version")" = game-one
 test "$(cat "$INSTALL_DIR/.launcher-version")" = launcher-one
 if [[ "$(uname -s)" != MINGW* ]]; then
   test -x "$INSTALL_DIR/Rebellion2.x86_64"
+  test -x "$INSTALL_DIR/rebellion2-editor.x86_64"
   test -x "$INSTALL_DIR/UnityCrashHandler64"
   test -x "$INSTALL_DIR/rebellion2-update-helper"
 fi
