@@ -77,6 +77,14 @@ otherwise use any files, code, artwork, audio, or other assets from *Empire at W
 owners can continue verifying *Rebellion*; players who can no longer purchase it may instead
 verify ownership of *Empire at War: Gold Pack*.
 
+### Where does Steam sign-in happen?
+
+Steam sign-in opens in your default browser on Steam's website. After ownership is verified,
+the launcher continues automatically. If you close the browser before finishing, use
+**Open browser** to reopen sign-in or **Back** to choose another sign-in method.
+
+GOG and developer sign-in currently use the launcher's embedded browser.
+
 ## License
 
 Original source code authored by David Adams for this project is available under the

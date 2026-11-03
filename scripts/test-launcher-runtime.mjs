@@ -503,6 +503,9 @@ function resetBackend() {
     blobs: new Map(),
     requests: [],
     fault: null,
+    browserOutcome: "success",
+    browserSupport: true,
+    browserAttempts: [],
     archive: null,
     oldFiles,
     newFiles,
@@ -545,9 +548,62 @@ async function serve(request, response) {
   state.requests.push(record);
   if (url.pathname.startsWith("/auth/")) {
     const done = `${base}auth/done?ok=1&url=${encodeURIComponent(`${base}archive.zip`)}&token=${encodeURIComponent(token)}`;
+    if (
+      url.pathname === "/auth/start" &&
+      url.searchParams.get("provider") === "steam" &&
+      url.searchParams.has("browser_port")
+    ) {
+      if (request.method === "HEAD") {
+        response.writeHead(302, {
+          Location: `${base}auth/`,
+          ...(state.browserSupport ? { "rebellion2-browser-signin": "1" } : {}),
+        });
+        response.end();
+        return;
+      }
+      state.browserAttempts.push(url);
+      if (state.browserOutcome === "pending") {
+        response.writeHead(200, { "Content-Type": "text/html" });
+        response.end(
+          "<title>Rebellion 2 browser sign-in test</title>Waiting for test completion.",
+        );
+        return;
+      }
+      const port = url.searchParams.get("browser_port");
+      const secret = url.searchParams.get("browser_state");
+      assert.match(port, /^\d+$/);
+      assert.match(secret, /^[a-f0-9]{64}$/);
+      const successful = state.browserOutcome === "success";
+      const values = new URLSearchParams({
+        state: secret,
+        ok: successful ? "1" : "0",
+      });
+      if (successful) {
+        values.set("url", `${base}archive.zip`);
+        values.set("token", token);
+      } else {
+        values.set("msg", "Steam verification did not complete.");
+        values.set("reason", "steam_library_unavailable");
+        values.set("profile_visibility", "public");
+      }
+      const inputs = [...values]
+        .map(
+          ([name, value]) =>
+            `<input type="hidden" name="${name}" value="${value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`,
+        )
+        .join("");
+      response.writeHead(200, {
+        "Content-Type": "text/html",
+        "Referrer-Policy": "origin",
+      });
+      response.end(
+        `<title>Rebellion 2 browser sign-in test</title><form id="complete" method="post" action="http://127.0.0.1:${port}/steam-signin">${inputs}</form><script>document.getElementById("complete").requestSubmit()</script>`,
+      );
+      return;
+    }
     response.writeHead(200, { "Content-Type": "text/html" });
     response.end(
-      `<html><body><a id="verify" href="${done}">Verify fixture ownership</a></body></html>`,
+      `<html><body><a id="verify" href="${done}">Verify fixture ownership</a><a id="steam" href="${base}auth/start?provider=steam">Verify with Steam</a></body></html>`,
     );
     return;
   }
@@ -1165,6 +1221,130 @@ try {
       null,
       2,
     ),
+  );
+
+  await scenario(
+    "Steam browser unsupported service offers recovery without opening the browser",
+    async () => {
+      state.browserSupport = false;
+      const session = await launch(
+        await seedInstall("steam-browser-unsupported", { installed: false }),
+      );
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "Steam sign-in link",
+      );
+      await evaluate(session, 'document.getElementById("steam").click(); true');
+      await screen(session, "Steam browser sign-in is unavailable");
+      assert.equal(state.browserAttempts.length, 0);
+      await click(session, "signin");
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "provider choices after unavailable service",
+      );
+    },
+  );
+
+  await scenario(
+    "Steam browser sign-in resumes a first installation",
+    async () => {
+      state.archive = zipArchive(state.newFiles);
+      const directory = await seedInstall("steam-browser-install", {
+        installed: false,
+      });
+      const session = await launch(directory);
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "Steam sign-in link",
+      );
+      await evaluate(session, 'document.getElementById("steam").click(); true');
+      await screen(session, "Ready to install");
+      assert.equal(state.browserAttempts.length, 1);
+      assert.equal(await readText(path.join(directory, ".session")), token);
+      await click(session, "install");
+      await until(
+        async () =>
+          (await readText(path.join(directory, "game-started"))) === "started",
+        "game launch after browser verification",
+      );
+      assert.equal(
+        await readText(path.join(directory, "Content/.content-version")),
+        "2.0.0",
+      );
+    },
+  );
+
+  await scenario(
+    "Steam browser privacy failure retains Retry and completes on a fresh attempt",
+    async () => {
+      state.archive = zipArchive(state.newFiles);
+      state.browserOutcome = "private";
+      const session = await launch(
+        await seedInstall("steam-browser-retry", { installed: false }),
+      );
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "Steam sign-in link",
+      );
+      await evaluate(session, 'document.getElementById("steam").click(); true');
+      await screen(
+        session,
+        "Your profile is public, but your games list is hidden.",
+      );
+      assert.equal(
+        state.requests.some((request) => request.path === "/archive.zip"),
+        false,
+      );
+      state.browserOutcome = "success";
+      await click(session, "steam-retry");
+      await screen(session, "Ready to install");
+      assert.equal(state.browserAttempts.length, 2);
+      assert.notEqual(
+        state.browserAttempts[0].searchParams.get("browser_state"),
+        state.browserAttempts[1].searchParams.get("browser_state"),
+      );
+    },
+  );
+
+  await scenario(
+    "Steam browser Back cancels the old attempt and leaves sign-in available",
+    async () => {
+      state.browserOutcome = "pending";
+      const session = await launch(
+        await seedInstall("steam-browser-cancel", { installed: false }),
+      );
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "Steam sign-in link",
+      );
+      await evaluate(session, 'document.getElementById("steam").click(); true');
+      await screen(session, "Complete sign-in in your browser");
+      await until(
+        () => state.browserAttempts.length === 1,
+        "browser opened the attempt",
+      );
+      const old = state.browserAttempts[0];
+      await click(session, "steam-browser-cancel");
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "provider choices after cancelling",
+      );
+      await until(async () => {
+        try {
+          await fetch(
+            `http://127.0.0.1:${old.searchParams.get("browser_port")}/steam-signin`,
+            { signal: AbortSignal.timeout(500) },
+          );
+          return false;
+        } catch {
+          return true;
+        }
+      }, "cancelled callback listener closes");
+      assert.equal(
+        state.requests.some((request) => request.path === "/archive.zip"),
+        false,
+      );
+    },
   );
 
   await scenario(

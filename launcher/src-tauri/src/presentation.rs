@@ -163,6 +163,17 @@ pub(crate) fn steam_verification_status(reason: Option<&str>) -> Option<&'static
     }
 }
 
+/// Keeps the launcher available while the player signs in through the system browser.
+pub(crate) fn steam_browser_signin_screen() -> String {
+    render(
+        "Sign in with Steam",
+        false,
+        "Complete sign-in in your browser. This launcher will continue automatically.",
+        &(button("Open browser", "steam-browser-open")
+            + &secondary_button("Back", "steam-browser-cancel")),
+    )
+}
+
 /// Builds a provider-specific recovery screen from the ownership service's explicit outcome.
 pub(crate) fn verification_failure_screen(
     message: Option<&str>,
@@ -475,6 +486,15 @@ pub(crate) fn progress_screen(notes: Option<&ReleaseNotes>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steam_browser_signin_screen_explains_the_wait_and_offers_reopen_and_back() {
+        let screen = steam_browser_signin_screen();
+        assert!(screen.contains("Complete sign-in in your browser"));
+        assert!(screen.contains("continue automatically"));
+        assert!(screen.contains("choice=steam-browser-open"));
+        assert!(screen.contains("choice=steam-browser-cancel"));
+    }
 
     #[test]
     fn operation_failure_status_with_full_disk_explains_storage_failure() {
