@@ -505,6 +505,7 @@ function resetBackend() {
     fault: null,
     browserOutcome: "success",
     browserSupport: true,
+    authLandingUnavailable: false,
     browserAttempts: [],
     deferGogBrowserProbe: false,
     gogBrowserProbes: [],
@@ -552,6 +553,13 @@ async function serve(request, response) {
   };
   state.requests.push(record);
   if (url.pathname.startsWith("/auth/")) {
+    if (url.pathname === "/auth/" && state.authLandingUnavailable) {
+      response.writeHead(503, { "Content-Type": "text/html" });
+      response.end(
+        "<title>Service unavailable</title>Ownership service unavailable.",
+      );
+      return;
+    }
     const done = `${base}auth/done?ok=1&url=${encodeURIComponent(`${base}archive.zip`)}&token=${encodeURIComponent(token)}`;
     if (
       url.pathname === "/auth/start" &&
@@ -664,7 +672,7 @@ async function serve(request, response) {
     }
     response.writeHead(200, { "Content-Type": "text/html" });
     response.end(
-      `<html><body><a id="verify" href="${done}">Verify fixture ownership</a><a id="steam" href="${base}auth/start?provider=steam">Verify with Steam</a><a id="gog" href="${base}auth/start?provider=gog">Verify with GOG</a></body></html>`,
+      `<html><body><a id="verify" href="${done}">Verify fixture ownership</a><a id="steam" href="${base}auth/start?provider=steam">Verify with Steam</a><a id="gog" href="${base}auth/start?provider=gog">Verify with GOG</a><a href="https://launcher.invalid/act?choice=back">Return to launcher</a></body></html>`,
     );
     return;
   }
@@ -1095,10 +1103,17 @@ async function stop(session) {
 
 async function verifyOwnership(session) {
   await until(
-    () => evaluate(session, 'Boolean(document.getElementById("verify"))'),
-    "fixture ownership page",
+    () =>
+      evaluate(
+        session,
+        'Boolean(document.getElementById("verify") || document.getElementById("steam"))',
+      ),
+    "ownership verification controls",
   );
-  await evaluate(session, 'document.getElementById("verify").click(); true');
+  await evaluate(
+    session,
+    '(document.getElementById("verify") || document.getElementById("steam")).click(); true',
+  );
 }
 
 async function ready(session) {
@@ -1298,6 +1313,75 @@ try {
       null,
       2,
     ),
+  );
+
+  await scenario(
+    "store choices survive an unavailable remote landing page",
+    async () => {
+      state.authLandingUnavailable = true;
+      const session = await launch(
+        await seedInstall("signin-landing-unavailable", { installed: false }),
+      );
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "store choices while the remote landing is unavailable",
+        5000,
+      );
+      assert.equal(
+        await evaluate(session, "location.origin"),
+        "http://tauri.localhost",
+      );
+      await evaluate(session, 'document.getElementById("steam").click(); true');
+      await screen(session, "Ready to install");
+      assert.equal(
+        state.requests.some((request) => request.path === "/auth/"),
+        false,
+      );
+    },
+  );
+
+  await scenario(
+    "returning from the remote gate restores bundled launcher controls",
+    async () => {
+      const session = await launch(
+        await seedInstall("signin-return-local", { installed: false }),
+      );
+      await until(
+        () =>
+          evaluate(
+            session,
+            'Boolean(document.getElementById("verify") || document.querySelector("a[href*=\\\"choice=github-signin\\\"]"))',
+          ),
+        "initial ownership controls",
+      );
+      if (
+        !(await evaluate(session, 'Boolean(document.getElementById("verify"))'))
+      ) {
+        await click(session, "github-signin");
+      }
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("verify"))'),
+        "remote developer sign-in fixture",
+      );
+      await click(session, "back");
+      await screen(
+        session,
+        "Sign in to verify ownership and download the game.",
+      );
+      assert.equal(
+        await evaluate(session, "location.origin"),
+        "http://tauri.localhost",
+      );
+      await click(session, "signin");
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
+        "store choices after returning to the launcher",
+      );
+      assert.equal(
+        await evaluate(session, "location.origin"),
+        "http://tauri.localhost",
+      );
+    },
   );
 
   await scenario(
@@ -1971,7 +2055,7 @@ try {
         assert(
           state.requests.some(
             (request) =>
-              request.path === "/auth/" && request.version === "3.0.0",
+              request.path === "/auth/start" && request.version === "3.0.0",
           ),
         );
         assert.equal(
@@ -2548,14 +2632,7 @@ try {
       );
       state.fault = null;
       await click(session, "signin");
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("verify"))'),
-        "fixture ownership page",
-      );
-      await evaluate(
-        session,
-        'document.getElementById("verify").click(); true',
-      );
+      await verifyOwnership(session);
       await ready(session);
     },
   );

@@ -163,6 +163,21 @@ pub(crate) fn steam_verification_status(reason: Option<&str>) -> Option<&'static
     }
 }
 
+/// Keeps provider selection available independently of the ownership service's website.
+pub(crate) fn sign_in_choices_screen() -> String {
+    let buttons = format!(
+        r#"<a id="steam" class="b primary" href="{ACT}?choice=steam-signin">Sign in with Steam</a>
+        <a id="gog" class="b primary" href="{ACT}?choice=gog-signin">Sign in with GOG</a>
+        <a class="b secondary" href="{ACT}?choice=github-signin">Developer sign-in</a>"#,
+    ) + &secondary_button("Back", "back");
+    render(
+        "Ownership verification",
+        false,
+        "Sign in with the store that owns your game. Sign-in opens in your browser.",
+        &buttons,
+    )
+}
+
 /// Keeps the launcher available while the player signs in through the system browser.
 pub(crate) fn steam_browser_signin_screen() -> String {
     render(
@@ -516,6 +531,16 @@ pub(crate) fn progress_screen(notes: Option<&ReleaseNotes>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_choices_screen_routes_each_provider_through_launcher_controls() {
+        let screen = sign_in_choices_screen();
+        for choice in ["steam-signin", "gog-signin", "github-signin", "back"] {
+            assert!(screen.contains(&format!("{ACT}?choice={choice}")));
+        }
+        assert!(!screen.contains("type=\"password\""));
+        assert!(!screen.contains("/start?provider="));
+    }
 
     #[test]
     fn gog_browser_signin_screen_uses_a_local_completion_form_and_escapes_the_attempt_id() {

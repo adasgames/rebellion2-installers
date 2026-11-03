@@ -199,7 +199,7 @@ static GAME_UPDATE_AUTH_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set while ownership verification returns the remote webview to bundled launcher content.
 static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 /// The failure screen waiting for the ownership webview to return to bundled content.
-static GATE_FAILURE_PENDING: Mutex<Option<String>> = Mutex::new(None);
+static LOCAL_SCREEN_PENDING: Mutex<Option<String>> = Mutex::new(None);
 /// The single browser sign-in whose completion may resume this launcher.
 static BROWSER_SIGN_IN: Mutex<Option<browser_signin::Control>> = Mutex::new(None);
 /// Set until the bundled launcher page is ready for its first channel scan.
@@ -508,39 +508,23 @@ fn main() {
                     .as_ref()
                     .is_some_and(|state| state.first_install_url.is_some());
 
-            let window = if need_signin {
-                // Open the gate; on_nav captures the token from /done, then scans.
-                let navigation_handle = handle.clone();
-                let page_load_handle = handle.clone();
-                WebviewWindowBuilder::new(
-                    app,
-                    "main",
-                    WebviewUrl::External(gate_landing().parse().unwrap()),
-                )
-                .title("Rebellion 2 Launcher")
-                .inner_size(520.0, 700.0)
-                .resizable(false)
-                .visible(resume.is_none())
-                .on_navigation(move |url| on_nav(&navigation_handle, url))
-                .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                .build()?
+            if need_signin {
+                *LOCAL_SCREEN_PENDING.lock().unwrap() =
+                    Some(presentation::sign_in_choices_screen());
             } else {
-                // Installed (or already signed in) — go straight to the scan. A scan
-                // failure can still offer the installed game when its content matches.
-                let page_load_handle = handle.clone();
                 INITIAL_SCAN_PENDING.store(true, Ordering::Relaxed);
+            }
+            let navigation_handle = handle.clone();
+            let page_load_handle = handle.clone();
+            let window =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
                     .resizable(false)
                     .visible(resume.is_none())
-                    .on_navigation({
-                        let h = handle.clone();
-                        move |url| on_nav(&h, url)
-                    })
+                    .on_navigation(move |url| on_nav(&navigation_handle, url))
                     .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                    .build()?
-            };
+                    .build()?;
             if let Some(resume) = &resume {
                 if let Some((x, y)) = resume.window_position {
                     if let Err(error) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
@@ -851,7 +835,7 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
         return;
     }
 
-    if let Some(screen) = GATE_FAILURE_PENDING.lock().unwrap().take() {
+    if let Some(screen) = LOCAL_SCREEN_PENDING.lock().unwrap().take() {
         write_screen(handle, &screen);
     } else if let Some(active) = BROWSER_SIGN_IN.lock().unwrap().as_ref() {
         let screen = match active.provider {
@@ -906,15 +890,7 @@ fn on_gate_result(
             reason.as_deref(),
             profile_visibility.as_deref(),
         );
-        *GATE_FAILURE_PENDING.lock().unwrap() = Some(screen);
-        let handle = handle.clone();
-        thread::spawn(move || {
-            if !navigate_to_local_app(&handle) {
-                if let Some(screen) = GATE_FAILURE_PENDING.lock().unwrap().take() {
-                    write_screen(&handle, &screen);
-                }
-            }
-        });
+        show_local_screen(handle, screen);
         return;
     }
     log_line("[launcher] VERIFIED via the ownership service.");
@@ -1048,6 +1024,27 @@ fn navigate_to_local_app(handle: &tauri::AppHandle) -> bool {
     }
 }
 
+/// Renders queued launcher content after returning from any provider-owned page.
+fn show_local_screen(handle: &tauri::AppHandle, screen: String) {
+    *LOCAL_SCREEN_PENDING.lock().unwrap() = Some(screen);
+    let handle = handle.clone();
+    thread::spawn(move || {
+        if !navigate_to_local_app(&handle) {
+            if let Some(screen) = LOCAL_SCREEN_PENDING.lock().unwrap().take() {
+                write_screen(&handle, &screen);
+            }
+        }
+    });
+}
+
+/// Offers store choices without depending on the ownership service's landing page.
+fn show_sign_in_choices(handle: &tauri::AppHandle) {
+    cancel_browser_sign_in();
+    GATE_RETURN_PENDING.store(false, Ordering::Relaxed);
+    INITIAL_SCAN_PENDING.store(false, Ordering::Relaxed);
+    show_local_screen(handle, presentation::sign_in_choices_screen());
+}
+
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     if ["steam-browser-open", "gog-browser-open"].contains(&choice) {
@@ -1058,12 +1055,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         return;
     }
     if ["steam-browser-cancel", "gog-browser-cancel"].contains(&choice) {
-        cancel_browser_sign_in();
-        if let Some(window) = handle.get_webview_window("main") {
-            if let Ok(url) = gate_landing().parse() {
-                let _ = window.navigate(url);
-            }
-        }
+        show_sign_in_choices(handle);
         return;
     }
     if ["back", "signin", "quit"].contains(&choice) {
@@ -1230,15 +1222,19 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 .map(|d| d.join("Content").join("catalog.xml").is_file())
                 .unwrap_or(false);
             if installed {
-                show_status_page(handle);
-                let handle = handle.clone();
-                thread::spawn(move || scan_and_prompt(&handle));
+                *LOCAL_SCREEN_PENDING.lock().unwrap() = None;
+                GATE_RETURN_PENDING.store(false, Ordering::Relaxed);
+                INITIAL_SCAN_PENDING.store(true, Ordering::Relaxed);
+                navigate_to_local_app(handle);
             } else {
-                show_message(
+                show_local_screen(
                     handle,
-                    "Sign in",
-                    "Sign in to verify ownership and download the game.",
-                    Some(("Sign in", "signin")),
+                    render(
+                        "Sign in",
+                        false,
+                        "Sign in to verify ownership and download the game.",
+                        &button("Sign in", "signin"),
+                    ),
                 );
             }
         }
@@ -1260,14 +1256,21 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 }
             }
         }
-        // Reopen the ownership gate (sign-in screens).
-        "signin" => {
+        "steam-signin" => start_browser_sign_in(handle, browser_signin::Provider::Steam),
+        "gog-signin" => start_browser_sign_in(handle, browser_signin::Provider::Gog),
+        "github-signin" => {
+            cancel_browser_sign_in();
             if let Some(window) = handle.get_webview_window("main") {
-                if let Ok(url) = gate_landing().parse() {
+                let mut url = format!("{}start?provider=github", auth_base());
+                if let Some(version) = requested_content_version() {
+                    url.push_str(&format!("&v={}", urlencoding::encode(&version)));
+                }
+                if let Ok(url) = url.parse() {
                     let _ = window.navigate(url);
                 }
             }
         }
+        "signin" => show_sign_in_choices(handle),
         _ => {}
     }
 }
@@ -4092,40 +4095,11 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn gate_landing() -> String {
-    let auth_base = auth_base();
-    match requested_content_version() {
-        Some(version) => format!("{auth_base}?v={}", urlencoding::encode(&version)),
-        _ => auth_base,
-    }
-}
-
 /// Requests a fresh authorized archive for the game version already committed to disk.
 fn request_content_archive(handle: &tauri::AppHandle) {
     *PENDING.lock().unwrap() = None;
     log_line("[launcher] Content is missing; requesting its matching full archive instead of individual blobs.");
-    show_status_page(handle);
-    let result = gate_landing()
-        .parse()
-        .map_err(|error| format!("{error}"))
-        .and_then(|url| {
-            handle
-                .get_webview_window("main")
-                .ok_or_else(|| "launcher window is unavailable".to_string())?
-                .navigate(url)
-                .map_err(|error| error.to_string())
-        });
-    if let Err(error) = result {
-        log_line(&format!(
-            "[launcher] could not request the Content archive: {error}"
-        ));
-        show_message(
-            handle,
-            "Sign in required",
-            "Verify ownership to download the matching game content.",
-            Some(("Sign in", "signin")),
-        );
-    }
+    show_sign_in_choices(handle);
 }
 
 /// Builds a fresh Steam verification request while preserving the required content version.
