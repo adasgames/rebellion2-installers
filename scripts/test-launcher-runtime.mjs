@@ -506,6 +506,8 @@ function resetBackend() {
     browserOutcome: "success",
     browserSupport: true,
     browserAttempts: [],
+    deferGogBrowserProbe: false,
+    gogBrowserProbes: [],
     gogOutcome: "success",
     gogSubmissions: [],
     gogReplies: [],
@@ -557,11 +559,17 @@ async function serve(request, response) {
       url.searchParams.get("browser") === "manual"
     ) {
       if (request.method === "HEAD") {
-        response.writeHead(302, {
-          Location: `${base}auth/`,
-          ...(state.browserSupport ? { "rebellion2-browser-signin": "2" } : {}),
-        });
-        response.end();
+        const reply = () => {
+          response.writeHead(302, {
+            Location: `${base}auth/`,
+            ...(state.browserSupport
+              ? { "rebellion2-browser-signin": "2" }
+              : {}),
+          });
+          response.end();
+        };
+        if (state.deferGogBrowserProbe) state.gogBrowserProbes.push(reply);
+        else reply();
         return;
       }
       state.browserAttempts.push(url);
@@ -1252,7 +1260,7 @@ try {
   )
     .split(/\r?\n/)
     .filter((file) =>
-      /^(launcher\/.*\.(rs|toml|lock|html|css|json)|packaging\/windows\/.*\.iss|scripts\/(test-launcher-runtime\.mjs|fixtures\/.*\.(rs|ps1)))$/.test(
+      /^(launcher\/.*\.(rs|toml|lock|html|css|json|js)|packaging\/windows\/.*\.iss|scripts\/(test-launcher-runtime\.mjs|fixtures\/.*\.(rs|ps1)))$/.test(
         file,
       ),
     )
@@ -1491,6 +1499,41 @@ try {
         await readText(path.join(directory, "Content/.content-version")),
         "2.0.0",
       );
+    },
+  );
+
+  await scenario(
+    "GOG browser completion cancels a delayed browser reopen",
+    async () => {
+      const session = await launch(
+        await seedInstall("gog-browser-late-reopen", { installed: false }),
+      );
+      await openGogSignIn(session);
+      await until(
+        () => state.browserAttempts.length === 1,
+        "initial GOG browser launch",
+      );
+      state.deferGogBrowserProbe = true;
+      await click(session, "gog-browser-open");
+      await until(
+        () => state.gogBrowserProbes.length === 1,
+        "delayed browser capability check",
+      );
+      await submitGogLink(
+        session,
+        "https://embed.gog.com/on_login_success?code=fixture",
+      );
+      await screen(session, "Ready to install");
+      state.gogBrowserProbes[0]();
+      await assert.rejects(
+        until(
+          () => state.browserAttempts.length > 1,
+          "obsolete browser reopening",
+          2000,
+        ),
+      );
+      assert.equal(state.browserAttempts.length, 1);
+      await screen(session, "Ready to install");
     },
   );
 

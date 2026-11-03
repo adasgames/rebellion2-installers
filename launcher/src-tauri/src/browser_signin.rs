@@ -258,9 +258,9 @@ impl Control {
         *self.cancellation.borrow()
     }
 
-    /// Invalidates this attempt even when its listener task has not started yet.
+    /// Invalidates this attempt even after its callback or timeout has finished.
     pub fn cancel(&self) {
-        let _ = self.cancellation.send(true);
+        self.cancellation.send_replace(true);
     }
 
     /// Exchanges one pasted GOG return link without putting its code in launcher navigation.
@@ -720,6 +720,28 @@ mod tests {
         assert!(control
             .submit_gog("https://embed.gog.com/on_login_success?code=test")
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_after_steam_timeout_remains_visible() {
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        assert!(matches!(
+            attempt.wait(Duration::from_millis(1)).await,
+            Outcome::TimedOut
+        ));
+        control.cancel();
+        assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_after_gog_timeout_remains_visible() {
+        let (attempt, control) = ManualAttempt::prepare("https://gate.example/", None).unwrap();
+        assert!(matches!(
+            attempt.wait(Duration::from_millis(1)).await,
+            Outcome::TimedOut
+        ));
+        control.cancel();
+        assert!(control.is_cancelled());
     }
 
     #[tokio::test]
