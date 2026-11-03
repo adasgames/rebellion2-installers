@@ -77,13 +77,19 @@ otherwise use any files, code, artwork, audio, or other assets from *Empire at W
 owners can continue verifying *Rebellion*; players who can no longer purchase it may instead
 verify ownership of *Empire at War: Gold Pack*.
 
-### Where does Steam sign-in happen?
+### Where does store sign-in happen?
 
 Steam sign-in opens in your default browser on Steam's website. After ownership is verified,
 the launcher continues automatically. If you close the browser before finishing, use
 **Open browser** to reopen sign-in or **Back** to choose another sign-in method.
 
-GOG and developer sign-in currently use the launcher's embedded browser.
+GOG sign-in also opens in your default browser. Once signed in, copy the full return link
+from the browser's address bar, paste it into the launcher's **GOG return link** field,
+and choose **Continue**. Your GOG password is entered only on GOG's website. Use
+**Open browser** to reopen sign-in, or **Back** to choose another method. Failed or expired
+attempts let you try again.
+
+Developer sign-in uses the launcher's embedded browser.
 
 ## License
 
