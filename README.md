@@ -83,11 +83,8 @@ Steam sign-in opens in your default browser on Steam's website. After ownership 
 the launcher continues automatically. If you close the browser before finishing, use
 **Open browser** to reopen sign-in or **Back** to choose another sign-in method.
 
-GOG sign-in also opens in your default browser. Once signed in, copy the full return link
-from the browser's address bar, paste it into the launcher's **GOG return link** field,
-and choose **Continue**. Your GOG password is entered only on GOG's website. Use
-**Open browser** to reopen sign-in, or **Back** to choose another method. Failed or expired
-attempts let you try again.
+GOG sign-in opens GOG's website inside the launcher. After ownership is verified,
+the launcher continues automatically. No return link needs to be copied or pasted.
 
 Developer sign-in uses the launcher's embedded browser.
 

@@ -179,36 +179,6 @@ pub(crate) fn steam_browser_signin_screen() -> String {
     )
 }
 
-/// Explains GOG's browser handoff without displaying a store login form in the launcher.
-pub(crate) fn gog_browser_signin_screen(attempt_id: &str) -> String {
-    let content = format!(
-        r#"<section class="gog-signin">
-        <ol>
-          <li>Sign in with GOG in your browser.</li>
-          <li>After signing in, copy the full link from the browser's address bar.</li>
-          <li>Paste it below and choose <b>Continue</b>.</li>
-        </ol>
-        <form id="gog-signin" data-attempt-id="{}">
-          <label for="gog-return-url">GOG return link</label>
-          <input id="gog-return-url" type="url" required maxlength="16384" autocomplete="off" spellcheck="false" placeholder="https://embed.gog.com/on_login_success?…">
-          <p id="gog-error" role="alert" hidden></p>
-        </form>
-        </section><script>{}</script>"#,
-        html_escape(attempt_id),
-        include_str!("../../ui/gog-signin.js"),
-    );
-    let buttons = "<button id=\"gog-continue\" class=\"b primary\" type=\"submit\" form=\"gog-signin\">Continue</button>".to_string()
-        + &secondary_button("Open browser", "gog-browser-open")
-        + &secondary_button("Back", "gog-browser-cancel");
-    render_with_content(
-        "Sign in with GOG",
-        false,
-        "Your GOG password stays in your browser.",
-        &content,
-        &buttons,
-    )
-}
-
 /// Builds a provider-specific recovery screen from the ownership service's explicit outcome.
 pub(crate) fn verification_failure_screen(
     message: Option<&str>,
@@ -530,18 +500,6 @@ mod tests {
         }
         assert!(!screen.contains("type=\"password\""));
         assert!(!screen.contains("/start?provider="));
-    }
-
-    #[test]
-    fn gog_browser_signin_screen_uses_a_local_completion_form_and_escapes_the_attempt_id() {
-        let screen = gog_browser_signin_screen("\"><script>alert(1)</script>");
-        assert!(screen.contains("GOG return link"));
-        assert!(screen.contains("&quot;&gt;&lt;script&gt;"));
-        assert!(screen.contains("complete_gog_sign_in"));
-        assert!(screen.contains("choice=gog-browser-open"));
-        assert!(screen.contains("choice=gog-browser-cancel"));
-        assert!(!screen.contains("type=\"password\""));
-        assert!(!screen.contains("<script>alert(1)"));
     }
 
     #[test]

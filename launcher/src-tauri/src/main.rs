@@ -482,7 +482,6 @@ fn main() {
     }
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![complete_gog_sign_in])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.handle().plugin(
@@ -595,14 +594,25 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     let target = url.as_str();
     let auth_base = auth_base();
 
-    for provider in [
-        browser_signin::Provider::Steam,
-        browser_signin::Provider::Gog,
-    ] {
-        if browser_signin::is_start(url, &auth_base, provider) {
-            start_browser_sign_in(handle, provider);
-            return false;
+    if browser_signin::is_steam_start(url, &auth_base) {
+        start_steam_browser_sign_in(handle);
+        return false;
+    }
+
+    if let Some(code) = gog_callback_code(url) {
+        if let Some(window) = handle.get_webview_window("main") {
+            let mut callback = format!(
+                "{auth_base}callback/gog?code={}",
+                urlencoding::encode(&code)
+            );
+            if let Some(version) = requested_content_version() {
+                callback.push_str(&format!("&v={}", urlencoding::encode(&version)));
+            }
+            if let Ok(callback) = callback.parse() {
+                let _ = window.navigate(callback);
+            }
         }
+        return false;
     }
 
     // Gate result: /done?ok=1&url=<presigned>&token=<session>
@@ -639,6 +649,26 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     true
 }
 
+/// Extracts one authorization code from GOG's exact HTTPS completion page.
+fn gog_callback_code(url: &tauri::Url) -> Option<String> {
+    if url.origin().ascii_serialization() != "https://embed.gog.com"
+        || url.path() != "/on_login_success"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut codes = url
+        .query_pairs()
+        .filter_map(|(key, value)| (key == "code").then_some(value));
+    let code = codes.next()?;
+    if code.trim().is_empty() || codes.next().is_some() {
+        return None;
+    }
+    Some(code.into_owned())
+}
+
 /// Matches the configured gate's exact completion origin and path.
 fn is_gate_completion(url: &tauri::Url, base: &str) -> bool {
     tauri::Url::parse(base)
@@ -646,60 +676,34 @@ fn is_gate_completion(url: &tauri::Url, base: &str) -> bool {
         .is_ok_and(|expected| url.origin() == expected.origin() && url.path() == expected.path())
 }
 
-/// Starts the selected store's browser workflow while keeping recovery controls in the launcher.
-fn start_browser_sign_in(handle: &tauri::AppHandle, provider: browser_signin::Provider) {
+/// Opens Steam in the system browser after establishing a private callback listener.
+fn start_steam_browser_sign_in(handle: &tauri::AppHandle) {
     cancel_browser_sign_in();
-    let base = auth_base();
-    let version = requested_content_version();
-    let timeout = Duration::from_secs(300);
-    let result = match provider {
-        browser_signin::Provider::Steam => {
-            browser_signin::Attempt::prepare(&base, version.as_deref()).map(|(attempt, control)| {
-                await_browser_sign_in(handle, control, attempt.wait(timeout));
-            })
-        }
-        browser_signin::Provider::Gog => {
-            browser_signin::ManualAttempt::prepare(&base, version.as_deref()).map(
-                |(attempt, control)| {
-                    await_browser_sign_in(handle, control, attempt.wait(timeout));
-                },
-            )
+    let prepared =
+        browser_signin::Attempt::prepare(&auth_base(), requested_content_version().as_deref());
+    let (attempt, control) = match prepared {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            browser_sign_in_failed(handle, "Could not start Steam sign-in. Please try again.");
+            return;
         }
     };
-    if result.is_err() {
-        browser_sign_in_failed(
-            handle,
-            &format!(
-                "Could not start {} sign-in. Please try again.",
-                provider.name()
-            ),
-        );
-    }
-}
-
-/// Owns the pending sign-in until its callback, cancellation, or timeout finishes.
-fn await_browser_sign_in(
-    handle: &tauri::AppHandle,
-    control: browser_signin::Control,
-    completion: impl std::future::Future<Output = browser_signin::Outcome> + Send + 'static,
-) {
     let id = control.id.clone();
-    let provider = control.provider;
     *BROWSER_SIGN_IN.lock().unwrap() = Some(control.clone());
     navigate_to_local_app(handle);
     let app = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let outcome = completion.await;
+        let outcome = attempt.wait(Duration::from_secs(300)).await;
         let callback_app = app.clone();
         let _ = app.run_on_main_thread(move || {
-            finish_browser_sign_in(&callback_app, &id, provider, outcome);
+            finish_steam_browser_sign_in(&callback_app, &id, outcome);
         });
     });
-    open_sign_in_browser(handle, control);
+    open_steam_browser(handle, control);
 }
 
 /// Opens or reopens the browser without replacing the attempt that owns its callback.
-fn open_sign_in_browser(handle: &tauri::AppHandle, control: browser_signin::Control) {
+fn open_steam_browser(handle: &tauri::AppHandle, control: browser_signin::Control) {
     let app = handle.clone();
     thread::spawn(move || {
         let supported = control.is_supported();
@@ -707,12 +711,9 @@ fn open_sign_in_browser(handle: &tauri::AppHandle, control: browser_signin::Cont
             return;
         }
         let message = if !supported {
-            Some(format!(
-                "{} browser sign-in is unavailable. Please try again later.",
-                control.provider.name()
-            ))
+            Some("Steam browser sign-in is unavailable. Please try again later.")
         } else if open::that(&control.url).is_err() {
-            Some("Could not open your browser. Please try again.".to_string())
+            Some("Could not open your browser. Please try again.")
         } else {
             None
         };
@@ -721,7 +722,7 @@ fn open_sign_in_browser(handle: &tauri::AppHandle, control: browser_signin::Cont
             let _ = app.run_on_main_thread(move || {
                 if let Some(active) = take_browser_sign_in(&control.id) {
                     active.cancel();
-                    browser_sign_in_failed(&callback_app, &message);
+                    browser_sign_in_failed(&callback_app, message);
                 }
             });
         }
@@ -729,10 +730,9 @@ fn open_sign_in_browser(handle: &tauri::AppHandle, control: browser_signin::Cont
 }
 
 /// Applies completion on the UI thread so a newer attempt cannot be replaced between checks.
-fn finish_browser_sign_in(
+fn finish_steam_browser_sign_in(
     handle: &tauri::AppHandle,
     id: &str,
-    provider: browser_signin::Provider,
     outcome: browser_signin::Outcome,
 ) {
     let Some(active) = take_browser_sign_in(id) else {
@@ -749,47 +749,17 @@ fn finish_browser_sign_in(
             result.reason,
             result.profile_visibility,
         ),
-        browser_signin::Outcome::TimedOut => browser_sign_in_failed(
-            handle,
-            &format!("{} sign-in timed out. Please try again.", provider.name()),
-        ),
-        browser_signin::Outcome::Unavailable => browser_sign_in_failed(
-            handle,
-            &format!(
-                "Could not receive {} sign-in. Please try again.",
-                provider.name()
-            ),
-        ),
+        browser_signin::Outcome::TimedOut => {
+            browser_sign_in_failed(handle, "Steam sign-in timed out. Please try again.")
+        }
+        browser_signin::Outcome::Unavailable => {
+            browser_sign_in_failed(handle, "Could not receive Steam sign-in. Please try again.")
+        }
         browser_signin::Outcome::Cancelled => return,
     }
     if let Some(window) = handle.get_webview_window("main") {
         let _ = window.set_focus();
     }
-}
-
-/// Accepts a return link only from the bundled main window and its current GOG attempt.
-#[tauri::command]
-async fn complete_gog_sign_in(
-    window: tauri::WebviewWindow,
-    attempt_id: String,
-    return_url: String,
-) -> Result<(), String> {
-    if window.label() != "main" || !window.url().is_ok_and(|url| is_local_app_url(&url)) {
-        return Err("Sign-in is only available in the launcher.".into());
-    }
-    let active = BROWSER_SIGN_IN
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|active| {
-            active.id == attempt_id && active.provider == browser_signin::Provider::Gog
-        })
-        .cloned()
-        .ok_or("This sign-in has ended. Please try again.")?;
-    tauri::async_runtime::spawn_blocking(move || active.submit_gog(&return_url))
-        .await
-        .map_err(|_| "Could not complete sign-in. Please try again.".to_string())?
-        .map_err(str::to_string)
 }
 
 /// Removes an attempt only if it still owns the launcher, ignoring stale completions.
@@ -837,12 +807,8 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
 
     if let Some(screen) = LOCAL_SCREEN_PENDING.lock().unwrap().take() {
         write_screen(handle, &screen);
-    } else if let Some(active) = BROWSER_SIGN_IN.lock().unwrap().as_ref() {
-        let screen = match active.provider {
-            browser_signin::Provider::Steam => presentation::steam_browser_signin_screen(),
-            browser_signin::Provider::Gog => presentation::gog_browser_signin_screen(&active.id),
-        };
-        write_screen(handle, &screen);
+    } else if BROWSER_SIGN_IN.lock().unwrap().is_some() {
+        write_screen(handle, &presentation::steam_browser_signin_screen());
     } else if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
         resume_after_gate(handle);
     } else if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
@@ -1047,14 +1013,14 @@ fn show_sign_in_choices(handle: &tauri::AppHandle) {
 
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
-    if ["steam-browser-open", "gog-browser-open"].contains(&choice) {
+    if choice == "steam-browser-open" {
         let active = BROWSER_SIGN_IN.lock().unwrap().clone();
         if let Some(active) = active {
-            open_sign_in_browser(handle, active);
+            open_steam_browser(handle, active);
         }
         return;
     }
-    if ["steam-browser-cancel", "gog-browser-cancel"].contains(&choice) {
+    if choice == "steam-browser-cancel" {
         show_sign_in_choices(handle);
         return;
     }
@@ -1256,12 +1222,12 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 }
             }
         }
-        "steam-signin" => start_browser_sign_in(handle, browser_signin::Provider::Steam),
-        "gog-signin" => start_browser_sign_in(handle, browser_signin::Provider::Gog),
-        "github-signin" => {
+        "steam-signin" => start_steam_browser_sign_in(handle),
+        "gog-signin" | "github-signin" => {
             cancel_browser_sign_in();
             if let Some(window) = handle.get_webview_window("main") {
-                let mut url = format!("{}start?provider=github", auth_base());
+                let provider = choice.trim_end_matches("-signin");
+                let mut url = format!("{}start?provider={provider}", auth_base());
                 if let Some(version) = requested_content_version() {
                     url.push_str(&format!("&v={}", urlencoding::encode(&version)));
                 }
@@ -5529,6 +5495,34 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gog_callback_code_accepts_one_code_on_the_registered_https_page() {
+        let url = tauri::Url::parse(
+            "https://embed.gog.com/on_login_success?origin=client&code=one%2Btwo",
+        )
+        .unwrap();
+        assert_eq!(gog_callback_code(&url).as_deref(), Some("one+two"));
+    }
+
+    #[test]
+    fn gog_callback_code_rejects_spoofed_or_malformed_completion_urls() {
+        for address in [
+            "http://embed.gog.com/on_login_success?code=test",
+            "https://embed.gog.com.evil.example/on_login_success?code=test",
+            "https://embed.gog.com:1234/on_login_success?code=test",
+            "https://user:password@embed.gog.com/on_login_success?code=test",
+            "https://embed.gog.com/on_login_success/other?code=test",
+            "https://embed.gog.com/on_login_success?code=",
+            "https://embed.gog.com/on_login_success?code=%20",
+            "https://embed.gog.com/on_login_success?code=test&code=other",
+            "https://embed.gog.com/on_login_success?error=access_denied",
+            "https://embed.gog.com/on_login_success?code=test#fragment",
+        ] {
+            let url = tauri::Url::parse(address).unwrap();
+            assert_eq!(gog_callback_code(&url), None, "Accepted {address}");
+        }
+    }
 
     #[test]
     fn is_gate_completion_requires_the_exact_configured_origin_and_path() {

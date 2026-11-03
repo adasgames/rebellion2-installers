@@ -507,11 +507,9 @@ function resetBackend() {
     browserSupport: true,
     authLandingUnavailable: false,
     browserAttempts: [],
-    deferGogBrowserProbe: false,
-    gogBrowserProbes: [],
+    gogStarts: [],
     gogOutcome: "success",
     gogSubmissions: [],
-    gogReplies: [],
     archive: null,
     oldFiles,
     newFiles,
@@ -563,58 +561,32 @@ async function serve(request, response) {
     const done = `${base}auth/done?ok=1&url=${encodeURIComponent(`${base}archive.zip`)}&token=${encodeURIComponent(token)}`;
     if (
       url.pathname === "/auth/start" &&
-      url.searchParams.get("provider") === "gog" &&
-      url.searchParams.get("browser") === "manual"
+      url.searchParams.get("provider") === "gog"
     ) {
-      if (request.method === "HEAD") {
-        const reply = () => {
-          response.writeHead(302, {
-            Location: `${base}auth/`,
-            ...(state.browserSupport
-              ? { "rebellion2-browser-signin": "2" }
-              : {}),
-          });
-          response.end();
-        };
-        if (state.deferGogBrowserProbe) state.gogBrowserProbes.push(reply);
-        else reply();
-        return;
-      }
-      state.browserAttempts.push(url);
+      state.gogStarts.push(url);
+      const code = `fixture-${state.gogStarts.length}+code`;
+      const callback = `https://embed.gog.com/on_login_success?origin=client&code=${encodeURIComponent(code)}`;
       response.writeHead(200, { "Content-Type": "text/html" });
       response.end(
-        "<title>Rebellion 2 GOG browser sign-in test</title>GOG return-link fixture. Return to the launcher to complete sign-in.",
+        `<title>GOG sign-in fixture</title><h1>GOG sign-in fixture</h1><a id="gog-return" href="${callback}">Complete sign-in</a><a href="https://launcher.invalid/act?choice=back">Return to launcher</a>`,
       );
       return;
     }
-    if (url.pathname === "/auth/callback/gog" && request.method === "POST") {
-      assert.equal(url.search, "");
-      let body = "";
-      for await (const chunk of request) body += chunk;
-      state.gogSubmissions.push(Object.fromEntries(new URLSearchParams(body)));
-      const reply = () => {
-        response.writeHead(200, {
-          "Content-Type": "application/json",
-          "Cache-Control": "no-store",
-        });
-        response.end(
-          JSON.stringify(
-            state.gogOutcome === "success"
-              ? {
-                  ok: "1",
-                  msg: "Verified via GOG.",
-                  url: `${base}archive.zip`,
-                  token,
-                }
-              : {
-                  ok: "0",
-                  msg: "That GOG account doesn't own either eligible game.",
-                },
-          ),
-        );
-      };
-      if (state.gogOutcome === "pending") state.gogReplies.push(reply);
-      else reply();
+    if (url.pathname === "/auth/callback/gog" && request.method === "GET") {
+      state.gogSubmissions.push(Object.fromEntries(url.searchParams));
+      const values = new URLSearchParams({
+        ok: state.gogOutcome === "success" ? "1" : "0",
+        msg:
+          state.gogOutcome === "missing"
+            ? "That GOG account doesn't own either eligible game."
+            : "GOG could not complete sign-in. Please try again.",
+      });
+      if (state.gogOutcome === "success") {
+        values.set("url", `${base}archive.zip`);
+        values.set("token", token);
+      }
+      response.writeHead(302, { Location: `${base}auth/done?${values}` });
+      response.end();
       return;
     }
     if (
@@ -1042,13 +1014,13 @@ async function openGogSignIn(session) {
     "GOG sign-in link",
   );
   await evaluate(session, 'document.getElementById("gog").click(); true');
-  await screen(session, "GOG return link");
+  await screen(session, "GOG sign-in fixture");
 }
 
-async function submitGogLink(session, returnUrl) {
+async function completeGogSignIn(session) {
   await evaluate(
     session,
-    `document.getElementById("gog-return-url").value = ${JSON.stringify(returnUrl)}; document.getElementById("gog-signin").requestSubmit(); true`,
+    'document.getElementById("gog-return").click(); true',
   );
 }
 
@@ -1509,75 +1481,36 @@ try {
   );
 
   await scenario(
-    "GOG browser sign-in completes through the local return-link form and installs",
+    "GOG in-app sign-in captures the registered return and installs",
     async () => {
       state.archive = zipArchive(state.newFiles);
-      const directory = await seedInstall("gog-browser-install", {
+      const directory = await seedInstall("gog-inapp-install", {
         installed: false,
       });
+      await fs.unlink(path.join(directory, ".session"));
       const session = await launch(directory);
       await openGogSignIn(session);
-      await until(
-        () => state.browserAttempts.length === 1,
-        "GOG opened in the system browser",
-      );
-      const attemptId = await evaluate(
-        session,
-        'document.getElementById("gog-signin").dataset.attemptId',
-      );
-      await click(session, "gog-browser-open");
-      await until(
-        () => state.browserAttempts.length === 2,
-        "GOG browser reopened",
-      );
       assert.equal(
-        await evaluate(
-          session,
-          'document.getElementById("gog-signin").dataset.attemptId',
-        ),
-        attemptId,
+        await evaluate(session, "location.origin"),
+        new URL(base).origin,
       );
+      assert.equal(state.browserAttempts.length, 0);
+      assert.equal(state.gogStarts[0].searchParams.get("browser"), null);
+      await completeGogSignIn(session);
+      await screen(session, "Ready to install");
+      assert.deepEqual(state.gogSubmissions, [
+        { code: "fixture-1+code", v: "2.0.0" },
+      ]);
+      assert.equal(await readText(path.join(directory, ".session")), token);
       assert.equal(
         await evaluate(session, "location.origin"),
         "http://tauri.localhost",
       );
-      assert.equal(
-        await evaluate(
-          session,
-          'document.querySelectorAll("input[type=password], iframe").length',
-        ),
-        0,
-      );
-      assert.equal(
-        await evaluate(
-          session,
-          '[...document.querySelectorAll(".btns .b, #gog-return-url")].every(element => {const box = element.getBoundingClientRect(); return box.top >= 0 && box.bottom <= innerHeight;})',
-        ),
-        true,
-      );
-      const screenshot = await debuggerCommand(
-        session,
-        "Page.captureScreenshot",
-        { format: "png" },
-      );
-      await fs.writeFile(
-        path.join(scratch, "gog-browser-signin.png"),
-        Buffer.from(screenshot.data, "base64"),
-      );
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?origin=client&code=fixture%2Bcode",
-      );
-      await screen(session, "Ready to install");
-      assert.deepEqual(state.gogSubmissions, [
-        { code: "fixture+code", v: "2.0.0" },
-      ]);
-      assert.equal(await readText(path.join(directory, ".session")), token);
       await click(session, "install");
       await until(
         async () =>
           (await readText(path.join(directory, "game-started"))) === "started",
-        "game launch after GOG browser sign-in",
+        "game launch after in-app GOG sign-in",
       );
       assert.equal(
         await readText(path.join(directory, "Content/.content-version")),
@@ -1586,186 +1519,39 @@ try {
     },
   );
 
-  await scenario(
-    "GOG browser completion cancels a delayed browser reopen",
-    async () => {
-      const session = await launch(
-        await seedInstall("gog-browser-late-reopen", { installed: false }),
-      );
-      await openGogSignIn(session);
-      await until(
-        () => state.browserAttempts.length === 1,
-        "initial GOG browser launch",
-      );
-      state.deferGogBrowserProbe = true;
-      await click(session, "gog-browser-open");
-      await until(
-        () => state.gogBrowserProbes.length === 1,
-        "delayed browser capability check",
-      );
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?code=fixture",
-      );
-      await screen(session, "Ready to install");
-      state.gogBrowserProbes[0]();
-      await assert.rejects(
-        until(
-          () => state.browserAttempts.length > 1,
-          "obsolete browser reopening",
-          2000,
-        ),
-      );
-      assert.equal(state.browserAttempts.length, 1);
-      await screen(session, "Ready to install");
-    },
-  );
-
-  await scenario(
-    "GOG browser invalid return links stay recoverable without contacting the gate",
-    async () => {
-      const session = await launch(
-        await seedInstall("gog-browser-invalid", { installed: false }),
-      );
-      await openGogSignIn(session);
-      await submitGogLink(
-        session,
-        "https://evil.example/on_login_success?code=fixture",
-      );
-      await screen(session, "Paste the complete GOG return link");
-      assert.equal(state.gogSubmissions.length, 0);
-      assert.equal(
-        await evaluate(
+  for (const failure of ["missing", "unavailable"]) {
+    await scenario(
+      `GOG in-app ${failure} result offers a fresh sign-in`,
+      async () => {
+        state.gogOutcome = failure;
+        const directory = await seedInstall(`gog-inapp-${failure}`, {
+          installed: false,
+        });
+        await fs.unlink(path.join(directory, ".session"));
+        const session = await launch(directory);
+        await openGogSignIn(session);
+        await completeGogSignIn(session);
+        await screen(
           session,
-          'document.getElementById("gog-continue").disabled',
-        ),
-        false,
-      );
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?code=fixture",
-      );
-      await screen(session, "Ready to install");
-      assert.equal(state.gogSubmissions.length, 1);
-    },
-  );
-
-  await scenario(
-    "GOG browser ownership failures offer another sign-in with a fresh attempt",
-    async () => {
-      state.gogOutcome = "missing";
-      const session = await launch(
-        await seedInstall("gog-browser-retry", { installed: false }),
-      );
-      await openGogSignIn(session);
-      const oldId = await evaluate(
-        session,
-        'document.getElementById("gog-signin").dataset.attemptId',
-      );
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?code=fixture",
-      );
-      await screen(
-        session,
-        "That GOG account doesn't own either eligible game.",
-      );
-      assert.equal(
-        state.requests.some((request) => request.path === "/archive.zip"),
-        false,
-      );
-      await click(session, "signin");
-      state.gogOutcome = "success";
-      await openGogSignIn(session);
-      assert.notEqual(
-        await evaluate(
-          session,
-          'document.getElementById("gog-signin").dataset.attemptId',
-        ),
-        oldId,
-      );
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?code=fixture-new",
-      );
-      await screen(session, "Ready to install");
-      assert.equal(state.gogSubmissions.length, 2);
-    },
-  );
-
-  await scenario(
-    "GOG browser Back ignores a late exchange and rejects a stale completion",
-    async () => {
-      state.gogOutcome = "pending";
-      const session = await launch(
-        await seedInstall("gog-browser-cancel", { installed: false }),
-      );
-      await openGogSignIn(session);
-      const oldId = await evaluate(
-        session,
-        'document.getElementById("gog-signin").dataset.attemptId',
-      );
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?code=fixture-old",
-      );
-      await until(() => state.gogReplies.length === 1, "pending GOG exchange");
-      await click(session, "gog-browser-cancel");
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("gog"))'),
-        "provider choices after GOG Back",
-      );
-      await openGogSignIn(session);
-      const newId = await evaluate(
-        session,
-        'document.getElementById("gog-signin").dataset.attemptId',
-      );
-      assert.notEqual(newId, oldId);
-      state.gogOutcome = "success";
-      state.gogReplies[0]();
-      const staleResult = await debuggerCommand(session, "Runtime.evaluate", {
-        expression: `window.__TAURI__.core.invoke("complete_gog_sign_in", {attemptId:${JSON.stringify(oldId)},returnUrl:"https://embed.gog.com/on_login_success?code=fixture-stale"}).then(() => "unexpected", error => String(error))`,
-        returnByValue: true,
-        awaitPromise: true,
-      });
-      assert.match(staleResult.result.value, /sign-in has ended/);
-      assert.equal(
-        await evaluate(
-          session,
-          'document.getElementById("gog-signin").dataset.attemptId',
-        ),
-        newId,
-      );
-      assert.equal(state.gogSubmissions.length, 1);
-      await submitGogLink(
-        session,
-        "https://embed.gog.com/on_login_success?code=fixture-new",
-      );
-      await screen(session, "Ready to install");
-    },
-  );
-
-  await scenario(
-    "GOG browser unsupported services leave provider choices available",
-    async () => {
-      state.browserSupport = false;
-      const session = await launch(
-        await seedInstall("gog-browser-unsupported", { installed: false }),
-      );
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("gog"))'),
-        "GOG sign-in link",
-      );
-      await evaluate(session, 'document.getElementById("gog").click(); true');
-      await screen(session, "GOG browser sign-in is unavailable");
-      assert.equal(state.browserAttempts.length, 0);
-      await click(session, "signin");
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("gog"))'),
-        "provider choices after unavailable GOG service",
-      );
-    },
-  );
+          failure === "missing"
+            ? "That GOG account doesn't own either eligible game."
+            : "GOG could not complete sign-in. Please try again.",
+        );
+        assert.equal(await readText(path.join(directory, ".session")), null);
+        assert.equal(
+          state.requests.some((request) => request.path === "/archive.zip"),
+          false,
+        );
+        await click(session, "signin");
+        state.gogOutcome = "success";
+        await openGogSignIn(session);
+        await completeGogSignIn(session);
+        await screen(session, "Ready to install");
+        assert.equal(state.gogStarts.length, 2);
+        assert.equal(state.gogSubmissions[1].code, "fixture-2+code");
+      },
+    );
+  }
 
   await scenario(
     "content editor launches from the ready screen and survives launcher exit",

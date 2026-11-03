@@ -11,23 +11,6 @@ use subtle::ConstantTimeEq;
 use tauri::Url;
 use tokio::sync::{oneshot, watch};
 
-/// The store whose website performs sign-in in the player's browser.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Provider {
-    Steam,
-    Gog,
-}
-
-impl Provider {
-    /// Returns the store name used in launcher messages.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Steam => "Steam",
-            Self::Gog => "GOG",
-        }
-    }
-}
-
 /// One browser attempt whose listener is allocated before the browser opens.
 pub struct Attempt {
     listener: TcpListener,
@@ -41,22 +24,13 @@ pub struct Attempt {
 pub struct Control {
     pub url: String,
     pub id: String,
-    pub provider: Provider,
     cancellation: watch::Sender<bool>,
-    manual: Option<Arc<Mutex<Option<oneshot::Sender<Completion>>>>>,
-}
-
-/// Waits for a GOG return link supplied through the bundled launcher's form.
-pub struct ManualAttempt {
-    completion: oneshot::Receiver<Completion>,
-    cancellation: watch::Receiver<bool>,
 }
 
 /// The gate's existing ownership result, delivered in a POST body rather than a URL.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Completion {
-    #[serde(default)]
     state: String,
     pub ok: String,
     pub msg: Option<String>,
@@ -85,7 +59,16 @@ struct CallbackState {
 impl Attempt {
     /// Binds exclusively to IPv4 loopback and creates an unguessable per-attempt secret.
     pub fn prepare(base: &str, version: Option<&str>) -> io::Result<(Self, Control)> {
-        let base = sign_in_base(base)?;
+        let base = Url::parse(base).map_err(io::Error::other)?;
+        if (base.scheme() != "https"
+            && !(cfg!(debug_assertions)
+                && base.scheme() == "http"
+                && base.host_str() == Some("127.0.0.1")))
+            || !base.username().is_empty()
+            || base.password().is_some()
+        {
+            return Err(io::Error::other("Invalid sign-in service address"));
+        }
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let mut secret = [0; 32];
@@ -112,9 +95,7 @@ impl Attempt {
             Control {
                 url: url.into(),
                 id,
-                provider: Provider::Steam,
                 cancellation: sender,
-                manual: None,
             },
         ))
     }
@@ -172,68 +153,6 @@ impl Attempt {
     }
 }
 
-impl ManualAttempt {
-    /// Creates an independent browser attempt without changing GOG's registered redirect.
-    pub fn prepare(base: &str, version: Option<&str>) -> io::Result<(Self, Control)> {
-        let mut url = sign_in_base(base)?
-            .join("start")
-            .map_err(io::Error::other)?;
-        url.query_pairs_mut()
-            .append_pair("provider", "gog")
-            .append_pair("browser", "manual");
-        if let Some(version) = version {
-            url.query_pairs_mut().append_pair("v", version);
-        }
-        let mut secret = [0; 32];
-        getrandom::fill(&mut secret).map_err(|error| io::Error::other(error.to_string()))?;
-        let (sender, cancellation) = watch::channel(false);
-        let (complete, completion) = oneshot::channel();
-        Ok((
-            Self {
-                completion,
-                cancellation,
-            },
-            Control {
-                url: url.into(),
-                id: hex::encode(secret),
-                provider: Provider::Gog,
-                cancellation: sender,
-                manual: Some(Arc::new(Mutex::new(Some(complete)))),
-            },
-        ))
-    }
-
-    /// Discards late exchanges after cancellation or expiry.
-    pub async fn wait(mut self, timeout: Duration) -> Outcome {
-        if *self.cancellation.borrow() {
-            return Outcome::Cancelled;
-        }
-        tokio::select! {
-            result = &mut self.completion => match result {
-                Ok(result) => Outcome::Completed(result),
-                Err(_) => Outcome::Unavailable,
-            },
-            _ = self.cancellation.changed() => Outcome::Cancelled,
-            _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
-        }
-    }
-}
-
-/// Accepts only the configured HTTPS service, with loopback HTTP allowed in debug fixtures.
-fn sign_in_base(base: &str) -> io::Result<Url> {
-    let base = Url::parse(base).map_err(io::Error::other)?;
-    if (base.scheme() != "https"
-        && !(cfg!(debug_assertions)
-            && base.scheme() == "http"
-            && base.host_str() == Some("127.0.0.1")))
-        || !base.username().is_empty()
-        || base.password().is_some()
-    {
-        return Err(io::Error::other("Invalid sign-in service address"));
-    }
-    Ok(base)
-}
-
 impl Control {
     /// Detects gate support before opening a browser that an older service cannot return from.
     pub fn is_supported(&self) -> bool {
@@ -245,11 +164,7 @@ impl Control {
             .call()
             .is_ok_and(|response| {
                 response.status() == 302
-                    && response.header("rebellion2-browser-signin")
-                        == Some(match self.provider {
-                            Provider::Steam => "1",
-                            Provider::Gog => "2",
-                        })
+                    && response.header("rebellion2-browser-signin") == Some("1")
             })
     }
 
@@ -262,37 +177,10 @@ impl Control {
     pub fn cancel(&self) {
         self.cancellation.send_replace(true);
     }
-
-    /// Exchanges one pasted GOG return link without putting its code in launcher navigation.
-    pub fn submit_gog(&self, return_url: &str) -> Result<(), &'static str> {
-        let code = gog_code(return_url)?;
-        if self.is_cancelled() {
-            return Err("This sign-in has ended. Please try again.");
-        }
-        let sender = self
-            .manual
-            .as_ref()
-            .and_then(|manual| manual.lock().unwrap().take())
-            .ok_or("This sign-in is already being checked. Please wait.")?;
-        if sender.is_closed() {
-            return Err("This sign-in has ended. Please try again.");
-        }
-        let result = exchange_gog(&self.url, &code).unwrap_or_else(|_| Completion {
-            state: String::new(),
-            ok: "0".into(),
-            msg: Some("GOG could not complete sign-in. Please try again.".into()),
-            url: None,
-            token: None,
-            reason: None,
-            profile_visibility: None,
-        });
-        let _ = sender.send(result);
-        Ok(())
-    }
 }
 
-/// Matches a store's start action on the configured gate origin and path.
-pub fn is_start(url: &Url, base: &str, provider: Provider) -> bool {
+/// Matches only Steam's start action on the configured gate origin and path.
+pub fn is_steam_start(url: &Url, base: &str) -> bool {
     Url::parse(base)
         .and_then(|base| base.join("start"))
         .is_ok_and(|expected| {
@@ -303,81 +191,8 @@ pub fn is_start(url: &Url, base: &str, provider: Provider) -> bool {
                     .filter(|(key, _)| key == "provider")
                     .map(|(_, value)| value.into_owned())
                     .collect::<Vec<_>>()
-                    == [match provider {
-                        Provider::Steam => "steam",
-                        Provider::Gog => "gog",
-                    }]
+                    == ["steam"]
         })
-}
-
-/// Extracts a single authorization code only from GOG's HTTPS return page.
-fn gog_code(return_url: &str) -> Result<String, &'static str> {
-    const MESSAGE: &str = "Paste the complete GOG return link from your browser's address bar.";
-    if return_url.len() > 16 * 1024 {
-        return Err(MESSAGE);
-    }
-    let url = Url::parse(return_url.trim()).map_err(|_| MESSAGE)?;
-    if url.origin().ascii_serialization() != "https://embed.gog.com"
-        || url.path() != "/on_login_success"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(MESSAGE);
-    }
-    let codes: Vec<_> = url.query_pairs().filter(|(key, _)| key == "code").collect();
-    if codes.len() != 1 || codes[0].1.trim().is_empty() {
-        return Err(MESSAGE);
-    }
-    Ok(codes[0].1.to_string())
-}
-
-/// Sends the one-time code to the configured service and bounds the ownership response.
-fn exchange_gog(start: &str, code: &str) -> Result<Completion, Box<dyn std::error::Error>> {
-    use std::io::Read;
-    let start = Url::parse(start)?;
-    let callback = start.join("callback/gog")?;
-    let version = start
-        .query_pairs()
-        .find(|(key, _)| key == "v")
-        .map(|(_, value)| value.into_owned());
-    let mut fields = vec![("code", code)];
-    if let Some(version) = version.as_deref() {
-        fields.push(("v", version));
-    }
-    let response = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .post(callback.as_str())
-        .send_form(&fields)?;
-    if response.status() != 200 {
-        return Err("Unexpected sign-in response".into());
-    }
-    let mut body = Vec::new();
-    response
-        .into_reader()
-        .take(16 * 1024 + 1)
-        .read_to_end(&mut body)?;
-    if body.len() > 16 * 1024 {
-        return Err("Sign-in response too large".into());
-    }
-    let result: Completion = serde_json::from_slice(&body)?;
-    if !valid_completion(&result) {
-        return Err("Incomplete sign-in response".into());
-    }
-    Ok(result)
-}
-
-/// Requires an explicit outcome and complete download credentials for a successful check.
-fn valid_completion(result: &Completion) -> bool {
-    ["0", "1"].contains(&result.ok.as_str())
-        && (result.ok == "0"
-            || (result
-                .token
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-                && result.url.as_deref().is_some_and(|value| !value.is_empty())))
 }
 
 /// Validates the origin, request host, attempt secret, and result before consuming the callback.
@@ -404,7 +219,11 @@ async fn receive(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !valid_completion(&result) {
+    if !["0", "1"].contains(&result.ok.as_str())
+        || (result.ok == "1"
+            && (result.token.as_deref().is_none_or(str::is_empty)
+                || result.url.as_deref().is_none_or(str::is_empty)))
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let Some(sender) = state.completion.lock().unwrap().take() else {
@@ -444,10 +263,7 @@ mod tests {
             ("https://other.example/auth/start?provider=steam", false),
             ("http://gate.example/auth/start?provider=steam", false),
         ] {
-            assert_eq!(
-                is_start(&Url::parse(url).unwrap(), base, Provider::Steam),
-                expected
-            );
+            assert_eq!(is_steam_start(&Url::parse(url).unwrap(), base), expected);
         }
     }
 
@@ -625,103 +441,6 @@ mod tests {
         assert!(std::net::TcpStream::connect(("127.0.0.1", url.port().unwrap())).is_err());
     }
 
-    #[test]
-    fn is_start_matches_gog_without_accepting_other_origins_or_duplicate_providers() {
-        for (url, expected) in [
-            ("https://gate.example/start?provider=gog", true),
-            ("https://gate.example/start?provider=steam", false),
-            (
-                "https://gate.example/start?provider=gog&provider=gog",
-                false,
-            ),
-            ("https://other.example/start?provider=gog", false),
-        ] {
-            assert_eq!(
-                is_start(
-                    &Url::parse(url).unwrap(),
-                    "https://gate.example/",
-                    Provider::Gog
-                ),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn gog_code_accepts_only_a_single_code_on_the_exact_https_return_page() {
-        assert_eq!(
-            gog_code(" https://embed.gog.com/on_login_success?origin=client&code=one%2Btwo ")
-                .unwrap(),
-            "one+two"
-        );
-        for url in [
-            "one-time-code",
-            "http://embed.gog.com/on_login_success?code=test",
-            "https://embed.gog.com.evil.example/on_login_success?code=test",
-            "https://embed.gog.com:1234/on_login_success?code=test",
-            "https://user:password@embed.gog.com/on_login_success?code=test",
-            "https://embed.gog.com/other?code=test",
-            "https://embed.gog.com/on_login_success?code=",
-            "https://embed.gog.com/on_login_success?code=test&code=other",
-            "https://embed.gog.com/on_login_success?error=access_denied",
-            "https://embed.gog.com/on_login_success?code=test#fragment",
-        ] {
-            assert!(gog_code(url).is_err(), "Accepted {url}");
-        }
-    }
-
-    #[test]
-    fn manual_prepare_preserves_the_version_and_uses_distinct_attempts() {
-        let (_, first) = ManualAttempt::prepare("https://gate.example/", Some("0.1.0")).unwrap();
-        let (_, second) = ManualAttempt::prepare("https://gate.example/", None).unwrap();
-        let url = Url::parse(&first.url).unwrap();
-        assert_eq!(
-            url.query_pairs().find(|(key, _)| key == "v").unwrap().1,
-            "0.1.0"
-        );
-        assert_eq!(
-            url.query_pairs()
-                .find(|(key, _)| key == "browser")
-                .unwrap()
-                .1,
-            "manual"
-        );
-        assert_eq!(first.provider, Provider::Gog);
-        assert_ne!(first.id, second.id);
-        assert!(ManualAttempt::prepare("http://gate.example/", None).is_err());
-    }
-
-    #[tokio::test]
-    async fn manual_wait_cancels_before_or_after_starting() {
-        let (attempt, control) = ManualAttempt::prepare("https://gate.example/", None).unwrap();
-        control.cancel();
-        assert!(matches!(
-            attempt.wait(Duration::from_secs(5)).await,
-            Outcome::Cancelled
-        ));
-        assert!(control
-            .submit_gog("https://embed.gog.com/on_login_success?code=test")
-            .is_err());
-
-        let (attempt, control) = ManualAttempt::prepare("https://gate.example/", None).unwrap();
-        let waiting = tokio::spawn(attempt.wait(Duration::from_secs(5)));
-        tokio::task::yield_now().await;
-        control.cancel();
-        assert!(matches!(waiting.await.unwrap(), Outcome::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn manual_wait_times_out_and_rejects_a_late_link_without_exchanging_it() {
-        let (attempt, control) = ManualAttempt::prepare("https://gate.example/", None).unwrap();
-        assert!(matches!(
-            attempt.wait(Duration::from_millis(10)).await,
-            Outcome::TimedOut
-        ));
-        assert!(control
-            .submit_gog("https://embed.gog.com/on_login_success?code=test")
-            .is_err());
-    }
-
     #[tokio::test]
     async fn cancel_after_steam_timeout_remains_visible() {
         let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
@@ -731,104 +450,6 @@ mod tests {
         ));
         control.cancel();
         assert!(control.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn cancel_after_gog_timeout_remains_visible() {
-        let (attempt, control) = ManualAttempt::prepare("https://gate.example/", None).unwrap();
-        assert!(matches!(
-            attempt.wait(Duration::from_millis(1)).await,
-            Outcome::TimedOut
-        ));
-        control.cancel();
-        assert!(control.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn submit_gog_posts_the_code_once_and_preserves_the_ownership_result() {
-        let (base, server) = gog_server(
-            r#"{"ok":"1","msg":"Verified via GOG.","url":"https://content.example/archive.zip","token":"test-token"}"#,
-        );
-        let (attempt, control) = ManualAttempt::prepare(&base, Some("0.1.0")).unwrap();
-        assert!(control
-            .submit_gog("https://evil.example/?code=test")
-            .is_err());
-        control
-            .submit_gog("https://embed.gog.com/on_login_success?code=one%2Btwo")
-            .unwrap();
-        assert!(control
-            .submit_gog("https://embed.gog.com/on_login_success?code=one%2Btwo")
-            .is_err());
-        let Outcome::Completed(result) = attempt.wait(Duration::from_secs(1)).await else {
-            panic!("No GOG result")
-        };
-        assert_eq!(result.token.as_deref(), Some("test-token"));
-        let (path, body) = server.join().unwrap();
-        assert_eq!(path, "/auth/callback/gog");
-        let fields: Vec<_> = Url::parse(&format!("https://fixture/?{body}"))
-            .unwrap()
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        assert_eq!(
-            fields,
-            [
-                ("code".into(), "one+two".into()),
-                ("v".into(), "0.1.0".into())
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_gog_turns_invalid_service_responses_into_recoverable_failures() {
-        for response in ["not JSON", r#"{"ok":"1"}"#, r#"{"ok":"unexpected"}"#] {
-            let (base, server) = gog_server(response);
-            let (attempt, control) = ManualAttempt::prepare(&base, None).unwrap();
-            control
-                .submit_gog("https://embed.gog.com/on_login_success?code=test")
-                .unwrap();
-            let Outcome::Completed(result) = attempt.wait(Duration::from_secs(1)).await else {
-                panic!("No GOG result")
-            };
-            assert_eq!(result.ok, "0");
-            assert!(result.msg.unwrap().contains("try again"));
-            assert!(result.token.is_none());
-            server.join().unwrap();
-        }
-    }
-
-    fn gog_server(response: &str) -> (String, std::thread::JoinHandle<(String, String)>) {
-        use std::io::{BufRead, BufReader, Read, Write};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}/auth/", listener.local_addr().unwrap());
-        let response = response.to_string();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let (path, body) = {
-                let mut reader = BufReader::new(&mut socket);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                assert!(line.starts_with("POST "));
-                let path = line.split_whitespace().nth(1).unwrap().to_string();
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                (path, String::from_utf8(body).unwrap())
-            };
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
-            (path, body)
-        });
-        (base, server)
     }
 
     fn callback_url(control: &Control) -> String {
