@@ -16,6 +16,7 @@
 mod content_packs;
 mod downloads;
 mod manifests;
+mod player_session;
 mod presentation;
 mod release_notes;
 mod versions;
@@ -60,7 +61,7 @@ use std::io::{Read, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
@@ -141,6 +142,7 @@ const LAUNCHER_FILE_NAME: &str = "rebellion2-launcher";
 const LAUNCHER_FILE_NAME: &str = "Rebellion2-launcher-Linux.AppImage";
 /// Cached ownership session token, stored next to the launcher.
 const SESSION_FILE: &str = ".session";
+static PLAYER_SIGN_IN: OnceLock<player_session::SignIn> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 const GAME_EXE: &str = "Rebellion2.exe";
@@ -398,6 +400,18 @@ fn default_blobs() -> String {
 }
 
 fn main() {
+    match player_session::sign_in_arguments(&std::env::args().collect::<Vec<_>>()) {
+        Ok(Some(request)) => {
+            let _ = PLAYER_SIGN_IN.set(request);
+            run_player_sign_in();
+            return;
+        }
+        Ok(None) => {}
+        Err(message) => {
+            log_line(message);
+            std::process::exit(2);
+        }
+    }
     let _installation = match install_dir()
         .and_then(|directory| InstallationLock::try_acquire(&directory))
     {
@@ -559,6 +573,47 @@ fn main() {
         .expect("error while running the Rebellion II launcher");
 }
 
+/// Opens only the requested store sign-in without locking or updating the installation.
+fn run_player_sign_in() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let page_handle = handle.clone();
+            WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::External(player_gate_landing().parse()?),
+            )
+            .title("Rebellion 2 sign in")
+            .inner_size(520.0, 700.0)
+            .resizable(false)
+            .on_navigation(move |url| on_nav(&handle, url))
+            .on_page_load(move |_, payload| on_page_load(&page_handle, &payload))
+            .build()?;
+            Ok(())
+        })
+        .run(launcher_context())
+        .expect("error while running player sign-in");
+}
+
+/// Selects the requested store's player-token flow, retaining the ordinary ownership flow otherwise.
+fn player_gate_landing() -> String {
+    match PLAYER_SIGN_IN.get() {
+        Some(request) => format!(
+            "{}start?provider={}&flow=player",
+            auth_base(),
+            request.provider
+        ),
+        None => gate_landing(),
+    }
+}
+
+/// Matches only the configured gate's completion origin and exact path.
+fn is_gate_completion(url: &tauri::Url, base: &str) -> bool {
+    tauri::Url::parse(&format!("{base}done"))
+        .is_ok_and(|expected| url.origin() == expected.origin() && url.path() == expected.path())
+}
+
 /// Creates the launcher context and embeds platform metadata once.
 fn launcher_context() -> tauri::Context<tauri::Wry> {
     tauri::generate_context!()
@@ -618,6 +673,9 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
                 if let Some(v) = requested_content_version() {
                     callback.push_str(&format!("&v={}", urlencoding::encode(&v)));
                 }
+                if PLAYER_SIGN_IN.get().is_some() {
+                    callback.push_str("&flow=player");
+                }
                 if let Ok(parsed) = callback.parse() {
                     let _ = window.navigate(parsed);
                 }
@@ -627,8 +685,47 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     }
 
     // Gate result: /done?ok=1&url=<presigned>&token=<session>
-    if target.starts_with(&format!("{auth_base}done")) {
+    if is_gate_completion(url, &auth_base) {
         let ok = url.query_pairs().any(|(k, v)| k == "ok" && v == "1");
+        if ok {
+            let mut fragment = url.clone();
+            fragment.set_query(url.fragment());
+            fragment.set_fragment(None);
+            if let Some(token) = query(&fragment, "player_token") {
+                let path = PLAYER_SIGN_IN
+                    .get()
+                    .map(|request| request.session_file.clone())
+                    .or_else(|| {
+                        install_dir()
+                            .ok()
+                            .map(|base| base.join(player_session::FILE_NAME))
+                    });
+                if let Some(path) = path {
+                    match player_session::save(&path, &token) {
+                        Ok(()) if PLAYER_SIGN_IN.get().is_some() => {
+                            handle.exit(0);
+                            return false;
+                        }
+                        Ok(()) => {}
+                        Err(_) => log_line("[launcher] Could not save the player session."),
+                    }
+                }
+            }
+            if PLAYER_SIGN_IN.get().is_some() {
+                handle.exit(2);
+                return false;
+            }
+        } else if PLAYER_SIGN_IN.get().is_some() {
+            let message = query(url, "msg").unwrap_or_else(|| "Store sign-in failed.".to_string());
+            *GATE_FAILURE_PENDING.lock().unwrap() = Some(retryable_failure_screen(
+                "Sign in failed",
+                &message,
+                "signin",
+                Some(("Cancel", "back")),
+            ));
+            navigate_to_local_app(handle);
+            return false;
+        }
         let message = query(url, "msg");
         let presigned = query(url, "url");
         let token = query(url, "token");
@@ -858,6 +955,18 @@ fn navigate_to_local_app(handle: &tauri::AppHandle) -> bool {
 
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
+    if PLAYER_SIGN_IN.get().is_some() {
+        if choice == "back" {
+            handle.exit(1);
+        } else if ["signin", "steam-retry"].contains(&choice) {
+            if let Some(window) = handle.get_webview_window("main") {
+                if let Ok(url) = player_gate_landing().parse() {
+                    let _ = window.navigate(url);
+                }
+            }
+        }
+        return;
+    }
     #[cfg(debug_assertions)]
     if PREVIEW_UPDATE_FLOW.load(Ordering::Relaxed) {
         on_preview_choice(handle, choice);
@@ -5299,6 +5408,7 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     log_line(&format!("[launcher] launching {}", exe.display()));
+    let player_arguments = player_session::launch_arguments(&base, &launcher_path()?);
 
     #[cfg(target_os = "macos")]
     std::process::Command::new("/usr/bin/open")
@@ -5306,12 +5416,16 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
         .arg("--args")
         .arg("-contentPath")
         .arg(base.join("Content"))
+        .args(&player_arguments)
         .spawn()?;
 
     #[cfg(target_os = "linux")]
     {
         ensure_linux_player_executables(&base)?;
-        std::process::Command::new(exe).current_dir(&base).spawn()?;
+        std::process::Command::new(exe)
+            .current_dir(&base)
+            .args(&player_arguments)
+            .spawn()?;
     }
 
     // On Windows the launcher runs inside a WebView2 job object that kills child
@@ -5327,6 +5441,7 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         let spawned = std::process::Command::new(exe)
             .current_dir(&base)
+            .args(&player_arguments)
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
             .spawn();
         if let Err(err) = spawned {
@@ -5354,6 +5469,7 @@ mod tests {
             ".approved-content-update",
             ".launcher-resume.json",
             ".rebellion2-install.lock",
+            ".player-session.json",
         ] {
             let manifest = Manifest {
                 version: "1.0.0".to_string(),
@@ -7507,6 +7623,28 @@ mod tests {
                     ],
                 },
             ],
+        }
+    }
+    #[test]
+    fn is_gate_completion_accepts_only_the_configured_origin_and_path() {
+        let base = "https://gate.example/auth/";
+        assert!(is_gate_completion(
+            &"https://gate.example/auth/done?ok=1#player_token=value"
+                .parse()
+                .unwrap(),
+            base
+        ));
+        for value in [
+            "https://other.example/auth/done",
+            "http://gate.example/auth/done",
+            "https://gate.example/auth/done-extra",
+            "https://gate.example/auth/done/child",
+            "https://gate.example/done",
+        ] {
+            assert!(
+                !is_gate_completion(&value.parse().unwrap(), base),
+                "{value}"
+            );
         }
     }
 }
