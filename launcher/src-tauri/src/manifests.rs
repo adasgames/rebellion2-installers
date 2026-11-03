@@ -109,6 +109,7 @@ fn is_update_state_path(path: &Path) -> bool {
             | ".content-install-staging"
             | ".download-cache"
             | ".session"
+            | ".player-session.json"
             | "launcher.log"
     )
 }
