@@ -202,21 +202,6 @@ exercise Windows only; macOS and Linux require their own native validation.
 For a software-rendered test run, set `REB2_RUNTIME_BROWSER_ARGUMENTS=--disable-gpu` in the test
 process's environment. The report records that override; it does not change launcher release builds.
 
-## Steam browser sign-in
-
-Deploy the companion content-gate change before releasing this launcher. A HEAD request to the
-Steam start URL checks for `rebellion2-browser-signin: 1`; older or unavailable gates show a
-recoverable error without opening the browser.
-
-The launcher binds an ephemeral IPv4 loopback port before opening the system browser. The gate
-posts the ownership result to that listener. Completion requires the configured gate origin,
-the loopback request host, and the attempt's random 256-bit secret. Each listener accepts one
-result and closes on completion, cancellation, or a five-minute timeout. Results are applied
-on the UI thread only while their attempt still owns the flow.
-
-The native runtime suite includes Steam browser installation, privacy recovery, cancellation,
-and an older-service compatibility case. GOG and developer sign-in retain their embedded flows.
-
 ## Steam verification recovery
 
 Steam visibility failures use the ownership service's `reason` query parameter on `/done`:

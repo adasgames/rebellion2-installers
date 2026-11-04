@@ -503,13 +503,6 @@ function resetBackend() {
     blobs: new Map(),
     requests: [],
     fault: null,
-    browserOutcome: "success",
-    browserSupport: true,
-    authLandingUnavailable: false,
-    browserAttempts: [],
-    gogStarts: [],
-    gogOutcome: "success",
-    gogSubmissions: [],
     archive: null,
     oldFiles,
     newFiles,
@@ -551,100 +544,10 @@ async function serve(request, response) {
   };
   state.requests.push(record);
   if (url.pathname.startsWith("/auth/")) {
-    if (url.pathname === "/auth/" && state.authLandingUnavailable) {
-      response.writeHead(503, { "Content-Type": "text/html" });
-      response.end(
-        "<title>Service unavailable</title>Ownership service unavailable.",
-      );
-      return;
-    }
     const done = `${base}auth/done?ok=1&url=${encodeURIComponent(`${base}archive.zip`)}&token=${encodeURIComponent(token)}`;
-    if (
-      url.pathname === "/auth/start" &&
-      url.searchParams.get("provider") === "gog"
-    ) {
-      state.gogStarts.push(url);
-      const code = `fixture-${state.gogStarts.length}+code`;
-      const callback = `https://embed.gog.com/on_login_success?origin=client&code=${encodeURIComponent(code)}`;
-      response.writeHead(200, { "Content-Type": "text/html" });
-      response.end(
-        `<title>GOG sign-in fixture</title><h1>GOG sign-in fixture</h1><a id="gog-return" href="${callback}">Complete sign-in</a><a href="https://launcher.invalid/act?choice=back">Return to launcher</a>`,
-      );
-      return;
-    }
-    if (url.pathname === "/auth/callback/gog" && request.method === "GET") {
-      state.gogSubmissions.push(Object.fromEntries(url.searchParams));
-      const values = new URLSearchParams({
-        ok: state.gogOutcome === "success" ? "1" : "0",
-        msg:
-          state.gogOutcome === "missing"
-            ? "That GOG account doesn't own either eligible game."
-            : "GOG could not complete sign-in. Please try again.",
-      });
-      if (state.gogOutcome === "success") {
-        values.set("url", `${base}archive.zip`);
-        values.set("token", token);
-      }
-      response.writeHead(302, { Location: `${base}auth/done?${values}` });
-      response.end();
-      return;
-    }
-    if (
-      url.pathname === "/auth/start" &&
-      url.searchParams.get("provider") === "steam" &&
-      url.searchParams.has("browser_port")
-    ) {
-      if (request.method === "HEAD") {
-        response.writeHead(302, {
-          Location: `${base}auth/`,
-          ...(state.browserSupport ? { "rebellion2-browser-signin": "1" } : {}),
-        });
-        response.end();
-        return;
-      }
-      state.browserAttempts.push(url);
-      if (state.browserOutcome === "pending") {
-        response.writeHead(200, { "Content-Type": "text/html" });
-        response.end(
-          "<title>Rebellion 2 browser sign-in test</title>Waiting for test completion.",
-        );
-        return;
-      }
-      const port = url.searchParams.get("browser_port");
-      const secret = url.searchParams.get("browser_state");
-      assert.match(port, /^\d+$/);
-      assert.match(secret, /^[a-f0-9]{64}$/);
-      const successful = state.browserOutcome === "success";
-      const values = new URLSearchParams({
-        state: secret,
-        ok: successful ? "1" : "0",
-      });
-      if (successful) {
-        values.set("url", `${base}archive.zip`);
-        values.set("token", token);
-      } else {
-        values.set("msg", "Steam verification did not complete.");
-        values.set("reason", "steam_library_unavailable");
-        values.set("profile_visibility", "public");
-      }
-      const inputs = [...values]
-        .map(
-          ([name, value]) =>
-            `<input type="hidden" name="${name}" value="${value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`,
-        )
-        .join("");
-      response.writeHead(200, {
-        "Content-Type": "text/html",
-        "Referrer-Policy": "origin",
-      });
-      response.end(
-        `<title>Rebellion 2 browser sign-in test</title><form id="complete" method="post" action="http://127.0.0.1:${port}/steam-signin">${inputs}</form><script>document.getElementById("complete").requestSubmit()</script>`,
-      );
-      return;
-    }
     response.writeHead(200, { "Content-Type": "text/html" });
     response.end(
-      `<html><body><a id="verify" href="${done}">Verify fixture ownership</a><a id="steam" href="${base}auth/start?provider=steam">Verify with Steam</a><a id="gog" href="${base}auth/start?provider=gog">Verify with GOG</a><a href="https://launcher.invalid/act?choice=back">Return to launcher</a></body></html>`,
+      `<html><body><a id="verify" href="${done}">Verify fixture ownership</a></body></html>`,
     );
     return;
   }
@@ -1008,22 +911,6 @@ async function click(session, choice) {
   );
 }
 
-async function openGogSignIn(session) {
-  await until(
-    () => evaluate(session, 'Boolean(document.getElementById("gog"))'),
-    "GOG sign-in link",
-  );
-  await evaluate(session, 'document.getElementById("gog").click(); true');
-  await screen(session, "GOG sign-in fixture");
-}
-
-async function completeGogSignIn(session) {
-  await evaluate(
-    session,
-    'document.getElementById("gog-return").click(); true',
-  );
-}
-
 async function expectEditorLaunch(session) {
   await until(
     async () =>
@@ -1075,17 +962,10 @@ async function stop(session) {
 
 async function verifyOwnership(session) {
   await until(
-    () =>
-      evaluate(
-        session,
-        'Boolean(document.getElementById("verify") || document.getElementById("steam"))',
-      ),
-    "ownership verification controls",
+    () => evaluate(session, 'Boolean(document.getElementById("verify"))'),
+    "fixture ownership page",
   );
-  await evaluate(
-    session,
-    '(document.getElementById("verify") || document.getElementById("steam")).click(); true',
-  );
+  await evaluate(session, 'document.getElementById("verify").click(); true');
 }
 
 async function ready(session) {
@@ -1247,7 +1127,7 @@ try {
   )
     .split(/\r?\n/)
     .filter((file) =>
-      /^(launcher\/.*\.(rs|toml|lock|html|css|json|js)|packaging\/windows\/.*\.iss|scripts\/(test-launcher-runtime\.mjs|fixtures\/.*\.(rs|ps1)))$/.test(
+      /^(launcher\/.*\.(rs|toml|lock|html|css|json)|packaging\/windows\/.*\.iss|scripts\/(test-launcher-runtime\.mjs|fixtures\/.*\.(rs|ps1)))$/.test(
         file,
       ),
     )
@@ -1286,272 +1166,6 @@ try {
       2,
     ),
   );
-
-  await scenario(
-    "store choices survive an unavailable remote landing page",
-    async () => {
-      state.authLandingUnavailable = true;
-      const session = await launch(
-        await seedInstall("signin-landing-unavailable", { installed: false }),
-      );
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "store choices while the remote landing is unavailable",
-        5000,
-      );
-      assert.equal(
-        await evaluate(session, "location.origin"),
-        "http://tauri.localhost",
-      );
-      await evaluate(session, 'document.getElementById("steam").click(); true');
-      await screen(session, "Ready to install");
-      assert.equal(
-        state.requests.some((request) => request.path === "/auth/"),
-        false,
-      );
-    },
-  );
-
-  await scenario(
-    "returning from the remote gate restores bundled launcher controls",
-    async () => {
-      const session = await launch(
-        await seedInstall("signin-return-local", { installed: false }),
-      );
-      await until(
-        () =>
-          evaluate(
-            session,
-            'Boolean(document.getElementById("verify") || document.querySelector("a[href*=\\\"choice=github-signin\\\"]"))',
-          ),
-        "initial ownership controls",
-      );
-      if (
-        !(await evaluate(session, 'Boolean(document.getElementById("verify"))'))
-      ) {
-        await click(session, "github-signin");
-      }
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("verify"))'),
-        "remote developer sign-in fixture",
-      );
-      await click(session, "back");
-      await screen(
-        session,
-        "Sign in to verify ownership and download the game.",
-      );
-      assert.equal(
-        await evaluate(session, "location.origin"),
-        "http://tauri.localhost",
-      );
-      await click(session, "signin");
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "store choices after returning to the launcher",
-      );
-      assert.equal(
-        await evaluate(session, "location.origin"),
-        "http://tauri.localhost",
-      );
-    },
-  );
-
-  await scenario(
-    "Steam browser unsupported service offers recovery without opening the browser",
-    async () => {
-      state.browserSupport = false;
-      const session = await launch(
-        await seedInstall("steam-browser-unsupported", { installed: false }),
-      );
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "Steam sign-in link",
-      );
-      await evaluate(session, 'document.getElementById("steam").click(); true');
-      await screen(session, "Steam browser sign-in is unavailable");
-      assert.equal(state.browserAttempts.length, 0);
-      await click(session, "signin");
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "provider choices after unavailable service",
-      );
-    },
-  );
-
-  await scenario(
-    "Steam browser sign-in resumes a first installation",
-    async () => {
-      state.archive = zipArchive(state.newFiles);
-      const directory = await seedInstall("steam-browser-install", {
-        installed: false,
-      });
-      const session = await launch(directory);
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "Steam sign-in link",
-      );
-      await evaluate(session, 'document.getElementById("steam").click(); true');
-      await screen(session, "Ready to install");
-      assert.equal(state.browserAttempts.length, 1);
-      assert.equal(await readText(path.join(directory, ".session")), token);
-      await click(session, "install");
-      await until(
-        async () =>
-          (await readText(path.join(directory, "game-started"))) === "started",
-        "game launch after browser verification",
-      );
-      assert.equal(
-        await readText(path.join(directory, "Content/.content-version")),
-        "2.0.0",
-      );
-    },
-  );
-
-  await scenario(
-    "Steam browser privacy failure retains Retry and completes on a fresh attempt",
-    async () => {
-      state.archive = zipArchive(state.newFiles);
-      state.browserOutcome = "private";
-      const session = await launch(
-        await seedInstall("steam-browser-retry", { installed: false }),
-      );
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "Steam sign-in link",
-      );
-      await evaluate(session, 'document.getElementById("steam").click(); true');
-      await screen(
-        session,
-        "Your profile is public, but your games list is hidden.",
-      );
-      assert.equal(
-        state.requests.some((request) => request.path === "/archive.zip"),
-        false,
-      );
-      state.browserOutcome = "success";
-      await click(session, "steam-retry");
-      await screen(session, "Ready to install");
-      assert.equal(state.browserAttempts.length, 2);
-      assert.notEqual(
-        state.browserAttempts[0].searchParams.get("browser_state"),
-        state.browserAttempts[1].searchParams.get("browser_state"),
-      );
-    },
-  );
-
-  await scenario(
-    "Steam browser Back cancels the old attempt and leaves sign-in available",
-    async () => {
-      state.browserOutcome = "pending";
-      const session = await launch(
-        await seedInstall("steam-browser-cancel", { installed: false }),
-      );
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "Steam sign-in link",
-      );
-      await evaluate(session, 'document.getElementById("steam").click(); true');
-      await screen(session, "Complete sign-in in your browser");
-      await until(
-        () => state.browserAttempts.length === 1,
-        "browser opened the attempt",
-      );
-      const old = state.browserAttempts[0];
-      await click(session, "steam-browser-cancel");
-      await until(
-        () => evaluate(session, 'Boolean(document.getElementById("steam"))'),
-        "provider choices after cancelling",
-      );
-      await until(async () => {
-        try {
-          await fetch(
-            `http://127.0.0.1:${old.searchParams.get("browser_port")}/steam-signin`,
-            { signal: AbortSignal.timeout(500) },
-          );
-          return false;
-        } catch {
-          return true;
-        }
-      }, "cancelled callback listener closes");
-      assert.equal(
-        state.requests.some((request) => request.path === "/archive.zip"),
-        false,
-      );
-    },
-  );
-
-  await scenario(
-    "GOG in-app sign-in captures the registered return and installs",
-    async () => {
-      state.archive = zipArchive(state.newFiles);
-      const directory = await seedInstall("gog-inapp-install", {
-        installed: false,
-      });
-      await fs.unlink(path.join(directory, ".session"));
-      const session = await launch(directory);
-      await openGogSignIn(session);
-      assert.equal(
-        await evaluate(session, "location.origin"),
-        new URL(base).origin,
-      );
-      assert.equal(state.browserAttempts.length, 0);
-      assert.equal(state.gogStarts[0].searchParams.get("browser"), null);
-      await completeGogSignIn(session);
-      await screen(session, "Ready to install");
-      assert.deepEqual(state.gogSubmissions, [
-        { code: "fixture-1+code", v: "2.0.0" },
-      ]);
-      assert.equal(await readText(path.join(directory, ".session")), token);
-      assert.equal(
-        await evaluate(session, "location.origin"),
-        "http://tauri.localhost",
-      );
-      await click(session, "install");
-      await until(
-        async () =>
-          (await readText(path.join(directory, "game-started"))) === "started",
-        "game launch after in-app GOG sign-in",
-      );
-      assert.equal(
-        await readText(path.join(directory, "Content/.content-version")),
-        "2.0.0",
-      );
-    },
-  );
-
-  for (const failure of ["missing", "unavailable"]) {
-    await scenario(
-      `GOG in-app ${failure} result offers a fresh sign-in`,
-      async () => {
-        state.gogOutcome = failure;
-        const directory = await seedInstall(`gog-inapp-${failure}`, {
-          installed: false,
-        });
-        await fs.unlink(path.join(directory, ".session"));
-        const session = await launch(directory);
-        await openGogSignIn(session);
-        await completeGogSignIn(session);
-        await screen(
-          session,
-          failure === "missing"
-            ? "That GOG account doesn't own either eligible game."
-            : "GOG could not complete sign-in. Please try again.",
-        );
-        assert.equal(await readText(path.join(directory, ".session")), null);
-        assert.equal(
-          state.requests.some((request) => request.path === "/archive.zip"),
-          false,
-        );
-        await click(session, "signin");
-        state.gogOutcome = "success";
-        await openGogSignIn(session);
-        await completeGogSignIn(session);
-        await screen(session, "Ready to install");
-        assert.equal(state.gogStarts.length, 2);
-        assert.equal(state.gogSubmissions[1].code, "fixture-2+code");
-      },
-    );
-  }
 
   await scenario(
     "content editor launches from the ready screen and survives launcher exit",
@@ -1841,7 +1455,7 @@ try {
         assert(
           state.requests.some(
             (request) =>
-              request.path === "/auth/start" && request.version === "3.0.0",
+              request.path === "/auth/" && request.version === "3.0.0",
           ),
         );
         assert.equal(
@@ -2418,7 +2032,14 @@ try {
       );
       state.fault = null;
       await click(session, "signin");
-      await verifyOwnership(session);
+      await until(
+        () => evaluate(session, 'Boolean(document.getElementById("verify"))'),
+        "fixture ownership page",
+      );
+      await evaluate(
+        session,
+        'document.getElementById("verify").click(); true',
+      );
       await ready(session);
     },
   );

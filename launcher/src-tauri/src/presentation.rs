@@ -163,22 +163,6 @@ pub(crate) fn steam_verification_status(reason: Option<&str>) -> Option<&'static
     }
 }
 
-/// Keeps provider selection available independently of the ownership service's website.
-pub(crate) fn sign_in_choices_screen() -> String {
-    include_str!("../../ui/ownership.html").replace("@@ACT@@", ACT)
-}
-
-/// Keeps the launcher available while the player signs in through the system browser.
-pub(crate) fn steam_browser_signin_screen() -> String {
-    render(
-        "Sign in with Steam",
-        false,
-        "Complete sign-in in your browser. This launcher will continue automatically.",
-        &(button("Open browser", "steam-browser-open")
-            + &secondary_button("Back", "steam-browser-cancel")),
-    )
-}
-
 /// Builds a provider-specific recovery screen from the ownership service's explicit outcome.
 pub(crate) fn verification_failure_screen(
     message: Option<&str>,
@@ -491,25 +475,6 @@ pub(crate) fn progress_screen(notes: Option<&ReleaseNotes>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sign_in_choices_screen_routes_each_provider_through_launcher_controls() {
-        let screen = sign_in_choices_screen();
-        for choice in ["steam-signin", "gog-signin", "github-signin", "back"] {
-            assert!(screen.contains(&format!("{ACT}?choice={choice}")));
-        }
-        assert!(!screen.contains("type=\"password\""));
-        assert!(!screen.contains("/start?provider="));
-    }
-
-    #[test]
-    fn steam_browser_signin_screen_explains_the_wait_and_offers_reopen_and_back() {
-        let screen = steam_browser_signin_screen();
-        assert!(screen.contains("Complete sign-in in your browser"));
-        assert!(screen.contains("continue automatically"));
-        assert!(screen.contains("choice=steam-browser-open"));
-        assert!(screen.contains("choice=steam-browser-cancel"));
-    }
 
     #[test]
     fn operation_failure_status_with_full_disk_explains_storage_failure() {
