@@ -1,0 +1,13 @@
+<footer class="community">
+  <a class="community-link" href="@@ACT@@?choice=discord">
+    @@DISCORD_ICON@@
+    <span>Join Star Wars: Rebellion on Discord</span>
+  </a>
+  <p class="community-status" id="community-status" role="status"></p>
+</footer>
+<script>
+  window.rebSetCommunityStatus = function (label) {
+    var status = document.getElementById("community-status");
+    if (status) status.textContent = label;
+  };
+</script>
