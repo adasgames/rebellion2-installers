@@ -12,8 +12,8 @@
   color: #b9c2da;
   font-size: 12px;
   line-height: 1.5;
-  text-decoration: none;
-  border-radius: 4px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .community-link svg {
   flex: none;
@@ -21,14 +21,13 @@
   height: 20px;
   fill: currentColor;
 }
-.community-link:hover {
+.community-link:hover,
+.community-link:focus-visible {
   color: #ffcf4d;
-  text-decoration: underline;
-  text-underline-offset: 3px;
 }
 .community-link:focus-visible {
-  outline: 2px solid #ffcf4d;
-  outline-offset: 3px;
+  outline: none;
+  text-decoration-thickness: 2px;
 }
 .community-status {
   margin: 6px 0 0;
