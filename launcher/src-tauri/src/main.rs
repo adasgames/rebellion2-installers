@@ -27,7 +27,8 @@ use manifests::validate_application_manifest;
 use manifests::validate_macos_game_archive_manifest;
 use manifests::{
     is_base_content_path, validate_base_content_manifest, validate_base_content_release_manifest,
-    validate_game_manifest, validate_launcher_manifest,
+    validate_game_manifest, validate_launcher_manifest, verify_base_content_definitions,
+    verify_installed_content_definitions,
 };
 
 #[cfg(test)]
@@ -1079,7 +1080,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                     show_message(
                         handle,
                         "Couldn't start",
-                        &format!("The {name} failed to start — see launcher.log."),
+                        &format!("The {name} failed to start: {err}"),
                         Some(("Retry", choice)),
                     );
                 }
@@ -3230,7 +3231,8 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
 }
 
 /// Verifies installations without a completed verification record. Ordinary launches reuse a record
-/// bound to the exact installed manifest; updates and explicit repairs always verify all files again.
+/// bound to the exact installed manifest and recheck startup definitions. Updates and explicit repairs
+/// always verify all files again.
 fn installed_content_matches_release(
     base: &str,
     latest: &Latest,
@@ -3243,7 +3245,7 @@ fn installed_content_matches_release(
                 if fs::read_to_string(content_dir.join(CONTENT_VERIFICATION_FILE))
                     .is_ok_and(|record| record == rebellion2_update_core::sha256_hex(&canonical))
                 {
-                    return Ok(true);
+                    return Ok(verify_base_content_definitions(content_dir, &local)?);
                 }
             }
         }
@@ -5443,6 +5445,26 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "the installed game and content versions do not match; finish the update before launching",
+        ));
+    }
+    let content_dir = base.join("Content");
+    let definitions_match = verify_installed_content_definitions(
+        &content_dir,
+        content_version.as_deref().unwrap_or_default(),
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Content definitions could not be verified in {}: {error}. Run the launcher with --repair.",
+                content_dir.display()
+            ),
+        )
+    })?;
+    if !definitions_match {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Content definitions are missing or damaged. Run the launcher with --repair before launching.",
         ));
     }
     if !exe.exists() {
