@@ -490,12 +490,20 @@ function publishLegacy(version, launcherChanged) {
 }
 
 function resetBackend() {
+  const basePack = [
+    "Packs/ClassicGalacticCivilWar/pack.xml",
+    Buffer.from(
+      '<ContentPack><ID>classic-galactic-civil-war</ID><Version>1.0.0</Version></ContentPack>',
+    ),
+  ];
   const oldFiles = new Map([
     ["catalog.xml", Buffer.from('<Catalog version="old"/>')],
+    basePack,
     ["Application/obsolete.bin", Buffer.from("obsolete")],
   ]);
   const newFiles = new Map([
     ["catalog.xml", Buffer.from('<Catalog version="new"/>')],
+    basePack,
     ["Application/runtime.bin", Buffer.alloc(2 * 1024 * 1024, 23)],
   ]);
   state = {
@@ -1963,6 +1971,52 @@ try {
           await fs.readFile(path.join(directory, "Content/.manifest.json")),
         ),
       );
+    },
+  );
+
+  for (const damage of ["deleted", "changed"]) {
+    await scenario(
+      `cached verification rejects a ${damage} startup definition`,
+      async () => {
+        const directory = await seedInstall(`damaged-definition-${damage}`, {
+          contentVersion: "2.0.0",
+        });
+        const first = await launch(directory);
+        await ready(first);
+        await stop(first);
+        const relative = "Packs/ClassicGalacticCivilWar/pack.xml";
+        const definition = path.join(directory, "Content", relative);
+        if (damage === "deleted") await fs.unlink(definition);
+        else {
+          const bytes = state.newFiles.get(relative);
+          await fs.writeFile(definition, Buffer.alloc(bytes.length, 90));
+        }
+
+        const second = await launch(directory);
+        await screen(second, "Update available");
+        assert.equal(await readText(path.join(directory, "game-started")), null);
+        await click(second, "update");
+        await ready(second);
+      },
+    );
+  }
+
+  await scenario(
+    "startup definition removed after the ready screen blocks launch",
+    async () => {
+      const directory = await seedInstall("definition-removed-before-play", {
+        contentVersion: "2.0.0",
+      });
+      const session = await launch(directory);
+      await ready(session);
+      await fs.unlink(
+        path.join(directory, "Content/Packs/ClassicGalacticCivilWar/pack.xml"),
+      );
+
+      await click(session, "play");
+
+      await screen(session, "Content definitions are missing or damaged");
+      assert.equal(await readText(path.join(directory, "game-started")), null);
     },
   );
 
