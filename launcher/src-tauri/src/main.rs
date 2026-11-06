@@ -819,6 +819,7 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
     } else if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
         resume_after_gate(handle);
     } else if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
+        show_status_page(handle);
         let handle = handle.clone();
         thread::spawn(move || scan_and_prompt(&handle));
     }
