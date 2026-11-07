@@ -163,6 +163,8 @@ const MACOS_GAME_APP_NAME: &str = "Rebellion2 Game.app";
 const RELEASES_URL: &str = "https://github.com/adasgames/rebellion2-installers/releases/latest";
 /// Steam's settings page for the account signed in to the player's browser.
 const STEAM_PRIVACY_URL: &str = "https://steamcommunity.com/my/edit/settings";
+/// The community's maintained invitation to the Star Wars: Rebellion Discord.
+const DISCORD_URL: &str = "https://swrebellion.link/discord";
 
 /// Internal URL scheme the in-window buttons navigate to; intercepted in on_nav so
 /// the HTML can drive Rust without extra IPC wiring.
@@ -575,7 +577,11 @@ fn show_startup_error(message: String) {
                 })
                 .on_navigation(move |url| {
                     if url.as_str().starts_with(ACT) {
-                        navigation_handle.exit(0);
+                        if query(url, "choice").as_deref() == Some("discord") {
+                            on_choice(&navigation_handle, "discord");
+                        } else {
+                            navigation_handle.exit(0);
+                        }
                         return false;
                     }
                     true
@@ -813,6 +819,7 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
     } else if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
         resume_after_gate(handle);
     } else if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
+        show_status_page(handle);
         let handle = handle.clone();
         thread::spawn(move || scan_and_prompt(&handle));
     }
@@ -1014,6 +1021,23 @@ fn show_sign_in_choices(handle: &tauri::AppHandle) {
 
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
+    if choice == "discord" {
+        let handle = handle.clone();
+        thread::spawn(move || {
+            let status = match open::that(DISCORD_URL) {
+                Ok(()) => String::new(),
+                Err(_) => format!("Could not open your browser. Visit {DISCORD_URL}."),
+            };
+            window_eval(
+                &handle,
+                &format!(
+                    "window.rebSetCommunityStatus&&window.rebSetCommunityStatus({});",
+                    js_string(&status)
+                ),
+            );
+        });
+        return;
+    }
     if choice == "steam-browser-open" {
         let active = BROWSER_SIGN_IN.lock().unwrap().clone();
         if let Some(active) = active {

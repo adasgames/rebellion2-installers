@@ -86,9 +86,14 @@ pub(crate) fn render_card(
     } else {
         "card has-content"
     };
+    let styles = format!(
+        "{}\n{}",
+        include_str!("../../ui/launcher.css"),
+        include_str!("../../ui/community.css")
+    );
     format!(
         include_str!("../../ui/screen.html"),
-        styles = include_str!("../../ui/launcher.css"),
+        styles = styles,
         kicker = kicker,
         status = status,
         spin = spin,
@@ -96,7 +101,15 @@ pub(crate) fn render_card(
         card_class = card_class,
         status_class = status_class,
         buttons = buttons,
+        community = community_footer(),
     )
+}
+
+/// Renders the community link shared by provider selection and launcher screens.
+fn community_footer() -> String {
+    include_str!("../../ui/community.html")
+        .replace("@@ACT@@", ACT)
+        .replace("@@DISCORD_ICON@@", include_str!("../../ui/discord.svg"))
 }
 
 pub(crate) fn button(label: &str, choice: &str) -> String {
@@ -165,7 +178,13 @@ pub(crate) fn steam_verification_status(reason: Option<&str>) -> Option<&'static
 
 /// Keeps provider selection available independently of the ownership service's website.
 pub(crate) fn sign_in_choices_screen() -> String {
-    include_str!("../../ui/ownership.html").replace("@@ACT@@", ACT)
+    include_str!("../../ui/ownership.html")
+        .replace("@@ACT@@", ACT)
+        .replace(
+            "@@COMMUNITY_STYLES@@",
+            include_str!("../../ui/community.css"),
+        )
+        .replace("@@COMMUNITY@@", &community_footer())
 }
 
 /// Keeps the launcher available while the player signs in through the system browser.
