@@ -86,9 +86,14 @@ pub(crate) fn render_card(
     } else {
         "card has-content"
     };
+    let styles = format!(
+        "{}\n{}",
+        include_str!("../../ui/launcher.css"),
+        include_str!("../../ui/community.css")
+    );
     format!(
         include_str!("../../ui/screen.html"),
-        styles = include_str!("../../ui/launcher.css"),
+        styles = styles,
         kicker = kicker,
         status = status,
         spin = spin,
@@ -96,7 +101,15 @@ pub(crate) fn render_card(
         card_class = card_class,
         status_class = status_class,
         buttons = buttons,
+        community = community_footer(),
     )
+}
+
+/// Renders the community link shared by provider selection and launcher screens.
+fn community_footer() -> String {
+    include_str!("../../ui/community.html")
+        .replace("@@ACT@@", ACT)
+        .replace("@@DISCORD_ICON@@", include_str!("../../ui/discord.svg"))
 }
 
 pub(crate) fn button(label: &str, choice: &str) -> String {
@@ -161,6 +174,28 @@ pub(crate) fn steam_verification_status(reason: Option<&str>) -> Option<&'static
         }
         _ => None,
     }
+}
+
+/// Keeps provider selection available independently of the ownership service's website.
+pub(crate) fn sign_in_choices_screen() -> String {
+    include_str!("../../ui/ownership.html")
+        .replace("@@ACT@@", ACT)
+        .replace(
+            "@@COMMUNITY_STYLES@@",
+            include_str!("../../ui/community.css"),
+        )
+        .replace("@@COMMUNITY@@", &community_footer())
+}
+
+/// Keeps the launcher available while the player signs in through the system browser.
+pub(crate) fn steam_browser_signin_screen() -> String {
+    render(
+        "Sign in with Steam",
+        false,
+        "Complete sign-in in your browser. This launcher will continue automatically.",
+        &(button("Open browser", "steam-browser-open")
+            + &secondary_button("Back", "steam-browser-cancel")),
+    )
 }
 
 /// Builds a provider-specific recovery screen from the ownership service's explicit outcome.
@@ -475,6 +510,25 @@ pub(crate) fn progress_screen(notes: Option<&ReleaseNotes>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_choices_screen_routes_each_provider_through_launcher_controls() {
+        let screen = sign_in_choices_screen();
+        for choice in ["steam-signin", "gog-signin", "github-signin", "back"] {
+            assert!(screen.contains(&format!("{ACT}?choice={choice}")));
+        }
+        assert!(!screen.contains("type=\"password\""));
+        assert!(!screen.contains("/start?provider="));
+    }
+
+    #[test]
+    fn steam_browser_signin_screen_explains_the_wait_and_offers_reopen_and_back() {
+        let screen = steam_browser_signin_screen();
+        assert!(screen.contains("Complete sign-in in your browser"));
+        assert!(screen.contains("continue automatically"));
+        assert!(screen.contains("choice=steam-browser-open"));
+        assert!(screen.contains("choice=steam-browser-cancel"));
+    }
 
     #[test]
     fn operation_failure_status_with_full_disk_explains_storage_failure() {

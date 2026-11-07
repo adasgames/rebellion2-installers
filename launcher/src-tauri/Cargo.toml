@@ -20,6 +20,10 @@ ed25519-dalek = "2"
 hex = "0.4"
 quick-xml = { version = "0.41", features = ["serialize"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+axum = { version = "0.8", default-features = false, features = ["form", "http1", "tokio"] }
+getrandom = "0.3"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-plugin-updater = "2"

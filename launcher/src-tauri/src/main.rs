@@ -13,6 +13,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod browser_signin;
 mod content_packs;
 mod downloads;
 mod manifests;
@@ -27,7 +28,8 @@ use manifests::validate_application_manifest;
 use manifests::validate_macos_game_archive_manifest;
 use manifests::{
     is_base_content_path, validate_base_content_manifest, validate_base_content_release_manifest,
-    validate_game_manifest, validate_launcher_manifest,
+    validate_game_manifest, validate_launcher_manifest, verify_base_content_definitions,
+    verify_installed_content_definitions,
 };
 
 #[cfg(test)]
@@ -163,6 +165,8 @@ const MACOS_GAME_APP_NAME: &str = "Rebellion2 Game.app";
 const RELEASES_URL: &str = "https://github.com/adasgames/rebellion2-installers/releases/latest";
 /// Steam's settings page for the account signed in to the player's browser.
 const STEAM_PRIVACY_URL: &str = "https://steamcommunity.com/my/edit/settings";
+/// The community's maintained invitation to the Star Wars: Rebellion Discord.
+const DISCORD_URL: &str = "https://swrebellion.link/discord";
 
 /// Internal URL scheme the in-window buttons navigate to; intercepted in on_nav so
 /// the HTML can drive Rust without extra IPC wiring.
@@ -200,7 +204,9 @@ static GAME_UPDATE_AUTH_PENDING: AtomicBool = AtomicBool::new(false);
 /// Set while ownership verification returns the remote webview to bundled launcher content.
 static GATE_RETURN_PENDING: AtomicBool = AtomicBool::new(false);
 /// The failure screen waiting for the ownership webview to return to bundled content.
-static GATE_FAILURE_PENDING: Mutex<Option<String>> = Mutex::new(None);
+static LOCAL_SCREEN_PENDING: Mutex<Option<String>> = Mutex::new(None);
+/// The single browser sign-in whose completion may resume this launcher.
+static BROWSER_SIGN_IN: Mutex<Option<browser_signin::Control>> = Mutex::new(None);
 /// Set until the bundled launcher page is ready for its first channel scan.
 static INITIAL_SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 /// Prevents overlapping installer operations from sharing transaction and download state.
@@ -518,39 +524,23 @@ fn main() {
                     .as_ref()
                     .is_some_and(|state| state.first_install_url.is_some());
 
-            let window = if need_signin {
-                // Open the gate; on_nav captures the token from /done, then scans.
-                let navigation_handle = handle.clone();
-                let page_load_handle = handle.clone();
-                WebviewWindowBuilder::new(
-                    app,
-                    "main",
-                    WebviewUrl::External(gate_landing().parse().unwrap()),
-                )
-                .title("Rebellion 2 Launcher")
-                .inner_size(520.0, 700.0)
-                .resizable(false)
-                .visible(resume.is_none())
-                .on_navigation(move |url| on_nav(&navigation_handle, url))
-                .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                .build()?
+            if need_signin {
+                *LOCAL_SCREEN_PENDING.lock().unwrap() =
+                    Some(presentation::sign_in_choices_screen());
             } else {
-                // Installed (or already signed in) — go straight to the scan. A scan
-                // failure can still offer the installed game when its content matches.
-                let page_load_handle = handle.clone();
                 INITIAL_SCAN_PENDING.store(true, Ordering::Relaxed);
+            }
+            let navigation_handle = handle.clone();
+            let page_load_handle = handle.clone();
+            let window =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
                     .resizable(false)
                     .visible(resume.is_none())
-                    .on_navigation({
-                        let h = handle.clone();
-                        move |url| on_nav(&h, url)
-                    })
+                    .on_navigation(move |url| on_nav(&navigation_handle, url))
                     .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
-                    .build()?
-            };
+                    .build()?;
             if let Some(resume) = &resume {
                 if let Some((x, y)) = resume.window_position {
                     if let Err(error) = window.set_position(tauri::PhysicalPosition::new(x, y)) {
@@ -579,39 +569,42 @@ fn run_player_sign_in() {
         .setup(|app| {
             let handle = app.handle().clone();
             let page_handle = handle.clone();
-            WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::External(player_gate_landing().parse()?),
-            )
-            .title("Rebellion 2 sign in")
-            .inner_size(520.0, 700.0)
-            .resizable(false)
-            .on_navigation(move |url| on_nav(&handle, url))
-            .on_page_load(move |_, payload| on_page_load(&page_handle, &payload))
-            .build()?;
+            let navigation_handle = handle.clone();
+            let steam = PLAYER_SIGN_IN
+                .get()
+                .is_some_and(|request| request.provider == "steam");
+            let initial_page = if steam {
+                WebviewUrl::App("index.html".into())
+            } else {
+                WebviewUrl::External(
+                    player_gate_landing(
+                        &PLAYER_SIGN_IN
+                            .get()
+                            .expect("Player sign-in was initialized")
+                            .provider,
+                    )
+                    .parse()?,
+                )
+            };
+            WebviewWindowBuilder::new(app, "main", initial_page)
+                .title("Rebellion 2 sign in")
+                .inner_size(520.0, 700.0)
+                .resizable(false)
+                .on_navigation(move |url| on_nav(&navigation_handle, url))
+                .on_page_load(move |_, payload| on_page_load(&page_handle, &payload))
+                .build()?;
+            if steam {
+                start_steam_browser_sign_in(&handle);
+            }
             Ok(())
         })
         .run(launcher_context())
         .expect("error while running player sign-in");
 }
 
-/// Selects the requested store's player-token flow, retaining the ordinary ownership flow otherwise.
-fn player_gate_landing() -> String {
-    match PLAYER_SIGN_IN.get() {
-        Some(request) => format!(
-            "{}start?provider={}&flow=player",
-            auth_base(),
-            request.provider
-        ),
-        None => gate_landing(),
-    }
-}
-
-/// Matches only the configured gate's completion origin and exact path.
-fn is_gate_completion(url: &tauri::Url, base: &str) -> bool {
-    tauri::Url::parse(&format!("{base}done"))
-        .is_ok_and(|expected| url.origin() == expected.origin() && url.path() == expected.path())
+/// Selects the requested store's dedicated player-token flow.
+fn player_gate_landing(provider: &str) -> String {
+    format!("{}start?provider={provider}&flow=player", auth_base())
 }
 
 /// Creates the launcher context and embeds platform metadata once.
@@ -642,7 +635,11 @@ fn show_startup_error(message: String) {
                 })
                 .on_navigation(move |url| {
                     if url.as_str().starts_with(ACT) {
-                        navigation_handle.exit(0);
+                        if query(url, "choice").as_deref() == Some("discord") {
+                            on_choice(&navigation_handle, "discord");
+                        } else {
+                            navigation_handle.exit(0);
+                        }
                         return false;
                     }
                     true
@@ -662,69 +659,45 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     let target = url.as_str();
     let auth_base = auth_base();
 
-    // GOG bounces the ?code= via its own page — capture and hand to the gate.
-    if target.starts_with("https://embed.gog.com/on_login_success") {
-        if let Some(code) = query(url, "code") {
-            if let Some(window) = handle.get_webview_window("main") {
-                let mut callback = format!(
-                    "{auth_base}callback/gog?code={}",
-                    urlencoding::encode(&code)
-                );
-                if let Some(v) = requested_content_version() {
-                    callback.push_str(&format!("&v={}", urlencoding::encode(&v)));
-                }
-                if PLAYER_SIGN_IN.get().is_some() {
-                    callback.push_str("&flow=player");
-                }
-                if let Ok(parsed) = callback.parse() {
-                    let _ = window.navigate(parsed);
-                }
+    if browser_signin::is_steam_start(url, &auth_base) {
+        start_steam_browser_sign_in(handle);
+        return false;
+    }
+
+    if let Some(code) = gog_callback_code(url) {
+        if let Some(window) = handle.get_webview_window("main") {
+            let mut callback = format!(
+                "{auth_base}callback/gog?code={}",
+                urlencoding::encode(&code)
+            );
+            if let Some(version) = requested_content_version() {
+                callback.push_str(&format!("&v={}", urlencoding::encode(&version)));
             }
-            return false;
+            if PLAYER_SIGN_IN.get().is_some() {
+                callback.push_str("&flow=player");
+            }
+            if let Ok(callback) = callback.parse() {
+                let _ = window.navigate(callback);
+            }
         }
+        return false;
     }
 
     // Gate result: /done?ok=1&url=<presigned>&token=<session>
     if is_gate_completion(url, &auth_base) {
+        if BROWSER_SIGN_IN.lock().unwrap().is_some() {
+            return false;
+        }
         let ok = url.query_pairs().any(|(k, v)| k == "ok" && v == "1");
         if ok {
-            let mut fragment = url.clone();
-            fragment.set_query(url.fragment());
-            fragment.set_fragment(None);
-            if let Some(token) = query(&fragment, "player_token") {
-                let path = PLAYER_SIGN_IN
-                    .get()
-                    .map(|request| request.session_file.clone())
-                    .or_else(|| {
-                        install_dir()
-                            .ok()
-                            .map(|base| base.join(player_session::FILE_NAME))
-                    });
-                if let Some(path) = path {
-                    match player_session::save(&path, &token) {
-                        Ok(()) if PLAYER_SIGN_IN.get().is_some() => {
-                            handle.exit(0);
-                            return false;
-                        }
-                        Ok(()) => {}
-                        Err(_) => log_line("[launcher] Could not save the player session."),
-                    }
-                }
-            }
-            if PLAYER_SIGN_IN.get().is_some() {
-                handle.exit(2);
+            let player_token = url.fragment().and_then(|fragment| {
+                tauri::Url::parse(&format!("https://local.invalid/?{fragment}"))
+                    .ok()
+                    .and_then(|parameters| query(&parameters, "player_token"))
+            });
+            if complete_player_session(handle, player_token.as_deref()) {
                 return false;
             }
-        } else if PLAYER_SIGN_IN.get().is_some() {
-            let message = query(url, "msg").unwrap_or_else(|| "Store sign-in failed.".to_string());
-            *GATE_FAILURE_PENDING.lock().unwrap() = Some(retryable_failure_screen(
-                "Sign in failed",
-                &message,
-                "signin",
-                Some(("Cancel", "back")),
-            ));
-            navigate_to_local_app(handle);
-            return false;
         }
         let message = query(url, "msg");
         let presigned = query(url, "url");
@@ -754,6 +727,178 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     true
 }
 
+/// Caches one store identity and reports whether the dedicated sign-in has finished.
+fn complete_player_session(handle: &tauri::AppHandle, token: Option<&str>) -> bool {
+    let result = token
+        .ok_or_else(|| io::Error::other("Missing player identity"))
+        .and_then(|token| {
+            let path = match PLAYER_SIGN_IN.get() {
+                Some(request) => request.session_file.clone(),
+                None => install_dir()?.join(player_session::FILE_NAME),
+            };
+            player_session::save(&path, token)
+        });
+    if PLAYER_SIGN_IN.get().is_some() {
+        handle.exit(if result.is_ok() { 0 } else { 2 });
+        return true;
+    }
+    if token.is_some() && result.is_err() {
+        log_line("[launcher] Could not save the player session.");
+    }
+    false
+}
+
+/// Extracts one authorization code from GOG's exact HTTPS completion page.
+fn gog_callback_code(url: &tauri::Url) -> Option<String> {
+    if url.origin().ascii_serialization() != "https://embed.gog.com"
+        || url.path() != "/on_login_success"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut codes = url
+        .query_pairs()
+        .filter_map(|(key, value)| (key == "code").then_some(value));
+    let code = codes.next()?;
+    if code.trim().is_empty() || codes.next().is_some() {
+        return None;
+    }
+    Some(code.into_owned())
+}
+
+/// Matches the configured gate's exact completion origin and path.
+fn is_gate_completion(url: &tauri::Url, base: &str) -> bool {
+    tauri::Url::parse(base)
+        .and_then(|base| base.join("done"))
+        .is_ok_and(|expected| url.origin() == expected.origin() && url.path() == expected.path())
+}
+
+/// Opens Steam in the system browser after establishing a private callback listener.
+fn start_steam_browser_sign_in(handle: &tauri::AppHandle) {
+    cancel_browser_sign_in();
+    let prepared = browser_signin::Attempt::prepare(
+        &auth_base(),
+        requested_content_version().as_deref(),
+        PLAYER_SIGN_IN.get().is_some(),
+    );
+    let (attempt, control) = match prepared {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            browser_sign_in_failed(handle, "Could not start Steam sign-in. Please try again.");
+            return;
+        }
+    };
+    let id = control.id.clone();
+    *BROWSER_SIGN_IN.lock().unwrap() = Some(control.clone());
+    navigate_to_local_app(handle);
+    let app = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = attempt.wait(Duration::from_secs(300)).await;
+        let callback_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            finish_steam_browser_sign_in(&callback_app, &id, outcome);
+        });
+    });
+    open_steam_browser(handle, control);
+}
+
+/// Opens or reopens the browser without replacing the attempt that owns its callback.
+fn open_steam_browser(handle: &tauri::AppHandle, control: browser_signin::Control) {
+    let app = handle.clone();
+    thread::spawn(move || {
+        let supported = control.is_supported();
+        if control.is_cancelled() {
+            return;
+        }
+        let message = if !supported {
+            Some("Steam browser sign-in is unavailable. Please try again later.")
+        } else if open::that(&control.url).is_err() {
+            Some("Could not open your browser. Please try again.")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            let callback_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(active) = take_browser_sign_in(&control.id) {
+                    active.cancel();
+                    browser_sign_in_failed(&callback_app, message);
+                }
+            });
+        }
+    });
+}
+
+/// Applies completion on the UI thread so a newer attempt cannot be replaced between checks.
+fn finish_steam_browser_sign_in(
+    handle: &tauri::AppHandle,
+    id: &str,
+    outcome: browser_signin::Outcome,
+) {
+    let Some(active) = take_browser_sign_in(id) else {
+        return;
+    };
+    active.cancel();
+    match outcome {
+        browser_signin::Outcome::Completed(result) => {
+            if result.ok == "1" && complete_player_session(handle, result.player_token.as_deref()) {
+                return;
+            }
+            on_gate_result(
+                handle,
+                result.ok == "1",
+                result.msg,
+                result.url,
+                result.token,
+                result.reason,
+                result.profile_visibility,
+            );
+        }
+        browser_signin::Outcome::TimedOut => {
+            browser_sign_in_failed(handle, "Steam sign-in timed out. Please try again.")
+        }
+        browser_signin::Outcome::Unavailable => {
+            browser_sign_in_failed(handle, "Could not receive Steam sign-in. Please try again.")
+        }
+        browser_signin::Outcome::Cancelled => return,
+    }
+    if let Some(window) = handle.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+}
+
+/// Removes an attempt only if it still owns the launcher, ignoring stale completions.
+fn take_browser_sign_in(id: &str) -> Option<browser_signin::Control> {
+    let mut active = BROWSER_SIGN_IN.lock().unwrap();
+    if active.as_ref().is_some_and(|attempt| attempt.id == id) {
+        active.take()
+    } else {
+        None
+    }
+}
+
+/// Stops a pending browser callback before switching to another sign-in or leaving the flow.
+fn cancel_browser_sign_in() {
+    if let Some(active) = BROWSER_SIGN_IN.lock().unwrap().take() {
+        active.cancel();
+    }
+}
+
+/// Routes local browser errors through the same recovery flow as ownership failures.
+fn browser_sign_in_failed(handle: &tauri::AppHandle, message: &str) {
+    on_gate_result(
+        handle,
+        false,
+        Some(message.to_string()),
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
 /// Starts launcher work after bundled content finishes loading.
 fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
     if payload.event() != PageLoadEvent::Finished || !is_local_app_url(payload.url()) {
@@ -767,11 +912,14 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
         return;
     }
 
-    if let Some(screen) = GATE_FAILURE_PENDING.lock().unwrap().take() {
+    if let Some(screen) = LOCAL_SCREEN_PENDING.lock().unwrap().take() {
         write_screen(handle, &screen);
+    } else if BROWSER_SIGN_IN.lock().unwrap().is_some() {
+        write_screen(handle, &presentation::steam_browser_signin_screen());
     } else if GATE_RETURN_PENDING.swap(false, Ordering::Relaxed) {
         resume_after_gate(handle);
     } else if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
+        show_status_page(handle);
         let handle = handle.clone();
         thread::spawn(move || scan_and_prompt(&handle));
     }
@@ -779,7 +927,12 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
 
 /// Returns whether a URL belongs to the bundled Tauri application.
 fn is_local_app_url(url: &tauri::Url) -> bool {
-    url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost")
+    url.origin().ascii_serialization() == "http://tauri.localhost"
+        || (url.scheme() == "tauri"
+            && url.host_str() == Some("localhost")
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none())
 }
 
 fn query(url: &tauri::Url, key: &str) -> Option<String> {
@@ -811,15 +964,7 @@ fn on_gate_result(
             reason.as_deref(),
             profile_visibility.as_deref(),
         );
-        *GATE_FAILURE_PENDING.lock().unwrap() = Some(screen);
-        let handle = handle.clone();
-        thread::spawn(move || {
-            if !navigate_to_local_app(&handle) {
-                if let Some(screen) = GATE_FAILURE_PENDING.lock().unwrap().take() {
-                    write_screen(&handle, &screen);
-                }
-            }
-        });
+        show_local_screen(handle, screen);
         return;
     }
     log_line("[launcher] VERIFIED via the ownership service.");
@@ -953,14 +1098,75 @@ fn navigate_to_local_app(handle: &tauri::AppHandle) -> bool {
     }
 }
 
+/// Renders queued launcher content after returning from any provider-owned page.
+fn show_local_screen(handle: &tauri::AppHandle, screen: String) {
+    *LOCAL_SCREEN_PENDING.lock().unwrap() = Some(screen);
+    let handle = handle.clone();
+    thread::spawn(move || {
+        if !navigate_to_local_app(&handle) {
+            if let Some(screen) = LOCAL_SCREEN_PENDING.lock().unwrap().take() {
+                write_screen(&handle, &screen);
+            }
+        }
+    });
+}
+
+/// Offers store choices without depending on the ownership service's landing page.
+fn show_sign_in_choices(handle: &tauri::AppHandle) {
+    cancel_browser_sign_in();
+    GATE_RETURN_PENDING.store(false, Ordering::Relaxed);
+    INITIAL_SCAN_PENDING.store(false, Ordering::Relaxed);
+    show_local_screen(handle, presentation::sign_in_choices_screen());
+}
+
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
-    if PLAYER_SIGN_IN.get().is_some() {
+    if choice == "discord" {
+        let handle = handle.clone();
+        thread::spawn(move || {
+            let status = match open::that(DISCORD_URL) {
+                Ok(()) => String::new(),
+                Err(_) => format!("Could not open your browser. Visit {DISCORD_URL}."),
+            };
+            window_eval(
+                &handle,
+                &format!(
+                    "window.rebSetCommunityStatus&&window.rebSetCommunityStatus({});",
+                    js_string(&status)
+                ),
+            );
+        });
+        return;
+    }
+    if choice == "steam-browser-open" {
+        let active = BROWSER_SIGN_IN.lock().unwrap().clone();
+        if let Some(active) = active {
+            open_steam_browser(handle, active);
+        }
+        return;
+    }
+    if choice == "steam-browser-cancel" {
+        if PLAYER_SIGN_IN.get().is_some() {
+            cancel_browser_sign_in();
+            handle.exit(1);
+        } else {
+            show_sign_in_choices(handle);
+        }
+        return;
+    }
+    if ["back", "signin", "quit"].contains(&choice) {
+        cancel_browser_sign_in();
+    }
+    if let Some(request) = PLAYER_SIGN_IN.get() {
         if choice == "back" {
             handle.exit(1);
         } else if ["signin", "steam-retry"].contains(&choice) {
+            if request.provider == "steam" {
+                start_steam_browser_sign_in(handle);
+                return;
+            }
             if let Some(window) = handle.get_webview_window("main") {
-                if let Ok(url) = player_gate_landing().parse() {
+                if let Ok(url) = player_gate_landing(&request.provider).parse() {
                     let _ = window.navigate(url);
                 }
             }
@@ -1019,7 +1225,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                     show_message(
                         handle,
                         "Couldn't start",
-                        &format!("The {name} failed to start — see launcher.log."),
+                        &format!("The {name} failed to start: {err}"),
                         Some(("Retry", choice)),
                     );
                 }
@@ -1128,15 +1334,19 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 .map(|d| d.join("Content").join("catalog.xml").is_file())
                 .unwrap_or(false);
             if installed {
-                show_status_page(handle);
-                let handle = handle.clone();
-                thread::spawn(move || scan_and_prompt(&handle));
+                *LOCAL_SCREEN_PENDING.lock().unwrap() = None;
+                GATE_RETURN_PENDING.store(false, Ordering::Relaxed);
+                INITIAL_SCAN_PENDING.store(true, Ordering::Relaxed);
+                navigate_to_local_app(handle);
             } else {
-                show_message(
+                show_local_screen(
                     handle,
-                    "Sign in",
-                    "Sign in to verify ownership and download the game.",
-                    Some(("Sign in", "signin")),
+                    render(
+                        "Sign in",
+                        false,
+                        "Sign in to verify ownership and download the game.",
+                        &button("Sign in", "signin"),
+                    ),
                 );
             }
         }
@@ -1158,14 +1368,21 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 }
             }
         }
-        // Reopen the ownership gate (sign-in screens).
-        "signin" => {
+        "steam-signin" => start_steam_browser_sign_in(handle),
+        "gog-signin" | "github-signin" => {
+            cancel_browser_sign_in();
             if let Some(window) = handle.get_webview_window("main") {
-                if let Ok(url) = gate_landing().parse() {
+                let provider = choice.trim_end_matches("-signin");
+                let mut url = format!("{}start?provider={provider}", auth_base());
+                if let Some(version) = requested_content_version() {
+                    url.push_str(&format!("&v={}", urlencoding::encode(&version)));
+                }
+                if let Ok(url) = url.parse() {
                     let _ = window.navigate(url);
                 }
             }
         }
+        "signin" => show_sign_in_choices(handle),
         _ => {}
     }
 }
@@ -3159,7 +3376,8 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
 }
 
 /// Verifies installations without a completed verification record. Ordinary launches reuse a record
-/// bound to the exact installed manifest; updates and explicit repairs always verify all files again.
+/// bound to the exact installed manifest and recheck startup definitions. Updates and explicit repairs
+/// always verify all files again.
 fn installed_content_matches_release(
     base: &str,
     latest: &Latest,
@@ -3172,7 +3390,7 @@ fn installed_content_matches_release(
                 if fs::read_to_string(content_dir.join(CONTENT_VERIFICATION_FILE))
                     .is_ok_and(|record| record == rebellion2_update_core::sha256_hex(&canonical))
                 {
-                    return Ok(true);
+                    return Ok(verify_base_content_definitions(content_dir, &local)?);
                 }
             }
         }
@@ -3990,40 +4208,11 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn gate_landing() -> String {
-    let auth_base = auth_base();
-    match requested_content_version() {
-        Some(version) => format!("{auth_base}?v={}", urlencoding::encode(&version)),
-        _ => auth_base,
-    }
-}
-
 /// Requests a fresh authorized archive for the game version already committed to disk.
 fn request_content_archive(handle: &tauri::AppHandle) {
     *PENDING.lock().unwrap() = None;
     log_line("[launcher] Content is missing; requesting its matching full archive instead of individual blobs.");
-    show_status_page(handle);
-    let result = gate_landing()
-        .parse()
-        .map_err(|error| format!("{error}"))
-        .and_then(|url| {
-            handle
-                .get_webview_window("main")
-                .ok_or_else(|| "launcher window is unavailable".to_string())?
-                .navigate(url)
-                .map_err(|error| error.to_string())
-        });
-    if let Err(error) = result {
-        log_line(&format!(
-            "[launcher] could not request the Content archive: {error}"
-        ));
-        show_message(
-            handle,
-            "Sign in required",
-            "Verify ownership to download the matching game content.",
-            Some(("Sign in", "signin")),
-        );
-    }
+    show_sign_in_choices(handle);
 }
 
 /// Builds a fresh Steam verification request while preserving the required content version.
@@ -5403,6 +5592,26 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
             "the installed game and content versions do not match; finish the update before launching",
         ));
     }
+    let content_dir = base.join("Content");
+    let definitions_match = verify_installed_content_definitions(
+        &content_dir,
+        content_version.as_deref().unwrap_or_default(),
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Content definitions could not be verified in {}: {error}. Run the launcher with --repair.",
+                content_dir.display()
+            ),
+        )
+    })?;
+    if !definitions_match {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Content definitions are missing or damaged. Run the launcher with --repair before launching.",
+        ));
+    }
     if !exe.exists() {
         log_line(&format!("[launcher] player not found at {}", exe.display()));
         return Ok(false);
@@ -5459,6 +5668,52 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gog_callback_code_accepts_one_code_on_the_registered_https_page() {
+        let url = tauri::Url::parse(
+            "https://embed.gog.com/on_login_success?origin=client&code=one%2Btwo",
+        )
+        .unwrap();
+        assert_eq!(gog_callback_code(&url).as_deref(), Some("one+two"));
+    }
+
+    #[test]
+    fn gog_callback_code_rejects_spoofed_or_malformed_completion_urls() {
+        for address in [
+            "http://embed.gog.com/on_login_success?code=test",
+            "https://embed.gog.com.evil.example/on_login_success?code=test",
+            "https://embed.gog.com:1234/on_login_success?code=test",
+            "https://user:password@embed.gog.com/on_login_success?code=test",
+            "https://embed.gog.com/on_login_success/other?code=test",
+            "https://embed.gog.com/on_login_success?code=",
+            "https://embed.gog.com/on_login_success?code=%20",
+            "https://embed.gog.com/on_login_success?code=test&code=other",
+            "https://embed.gog.com/on_login_success?error=access_denied",
+            "https://embed.gog.com/on_login_success?code=test#fragment",
+        ] {
+            let url = tauri::Url::parse(address).unwrap();
+            assert_eq!(gog_callback_code(&url), None, "Accepted {address}");
+        }
+    }
+
+    #[test]
+    fn is_gate_completion_requires_the_exact_configured_origin_and_path() {
+        for (url, expected) in [
+            ("https://gate.example/auth/done?ok=1", true),
+            ("https://gate.example/auth/done-extra?ok=1", false),
+            ("https://evil.example/auth/done?ok=1", false),
+            ("http://gate.example/auth/done?ok=1", false),
+        ] {
+            assert_eq!(
+                is_gate_completion(
+                    &tauri::Url::parse(url).unwrap(),
+                    "https://gate.example/auth/"
+                ),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn validate_game_manifest_with_update_state_paths_rejects_them() {
@@ -6931,6 +7186,20 @@ mod tests {
         let url = tauri::Url::parse("https://example.invalid/done").unwrap();
 
         assert!(!is_local_app_url(&url));
+    }
+
+    #[test]
+    fn is_local_app_url_rejects_lookalike_origins_and_custom_tauri_hosts() {
+        for address in [
+            "https://tauri.localhost",
+            "http://tauri.localhost:1234",
+            "http://tauri.localhost.evil.example",
+            "tauri://evil.example",
+            "tauri://user@localhost",
+            "tauri://localhost:1234",
+        ] {
+            assert!(!is_local_app_url(&tauri::Url::parse(address).unwrap()));
+        }
     }
 
     #[test]

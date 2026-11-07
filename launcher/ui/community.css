@@ -1,0 +1,41 @@
+.community {
+  flex: none;
+  margin-top: 18px;
+}
+.community-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 4px;
+  color: #b9c2da;
+  font-size: 12px;
+  line-height: 1.5;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.community-link svg {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  fill: currentColor;
+}
+.community-link:hover,
+.community-link:focus-visible {
+  color: #ffcf4d;
+}
+.community-link:focus-visible {
+  outline: none;
+  text-decoration-thickness: 2px;
+}
+.community-status {
+  margin: 6px 0 0;
+  color: #ff6b73;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.community-status:empty {
+  display: none;
+}
