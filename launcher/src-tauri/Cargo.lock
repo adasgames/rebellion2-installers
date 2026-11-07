@@ -2778,6 +2778,7 @@ dependencies = [
  "tokio",
  "ureq",
  "urlencoding",
+ "windows",
  "zip 2.4.2",
 ]
 
