@@ -1,5 +1,6 @@
 use crate::content_packs::{self, ContentPackRelease};
 use crate::downloads::DownloadError;
+use crate::launch_settings::GraphicsApi;
 use crate::release_notes::ReleaseNotes;
 use crate::ACT;
 use std::{error::Error, io};
@@ -87,9 +88,10 @@ pub(crate) fn render_card(
         "card has-content"
     };
     let styles = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         include_str!("../../ui/launcher.css"),
-        include_str!("../../ui/community.css")
+        include_str!("../../ui/community.css"),
+        include_str!("../../ui/options.css")
     );
     format!(
         include_str!("../../ui/screen.html"),
@@ -102,7 +104,19 @@ pub(crate) fn render_card(
         status_class = status_class,
         buttons = buttons,
         community = community_footer(),
+        options = options_controls(std::env::consts::OS),
     )
+}
+
+/// Renders one accessible options dialog with the platform's available APIs.
+fn options_controls(platform: &str) -> String {
+    let options = GraphicsApi::supported_on(platform)
+        .iter()
+        .map(|api| format!("<option value=\"{}\">{}</option>", api.value(), api.label()))
+        .collect::<String>();
+    include_str!("../../ui/options.html")
+        .replace("@@GRAPHICS_API_OPTIONS@@", &options)
+        .replace("@@ACT@@", ACT)
 }
 
 /// Renders the community link shared by provider selection and launcher screens.
@@ -185,6 +199,8 @@ pub(crate) fn sign_in_choices_screen() -> String {
             include_str!("../../ui/community.css"),
         )
         .replace("@@COMMUNITY@@", &community_footer())
+        .replace("@@OPTIONS@@", &options_controls(std::env::consts::OS))
+        .replace("@@OPTIONS_STYLES@@", include_str!("../../ui/options.css"))
 }
 
 /// Keeps the launcher available while the player signs in through the system browser.
@@ -510,6 +526,46 @@ pub(crate) fn progress_screen(notes: Option<&ReleaseNotes>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_and_sign_in_screens_offer_the_same_options_dialog() {
+        for screen in [up_to_date_screen("0.1.3", true), sign_in_choices_screen()] {
+            assert!(screen.contains(&format!("{ACT}?choice=options")));
+            assert!(screen.contains("aria-labelledby=\"options-title\""));
+            assert!(screen.contains("<label for=\"graphics-api\">Graphics API</label>"));
+            assert!(screen.contains("window.rebOpenOptions"));
+            assert!(!screen.contains("@@OPTIONS"));
+        }
+    }
+
+    #[test]
+    fn options_only_advertise_apis_included_in_the_platform_player() {
+        for (platform, included, excluded) in [
+            (
+                "windows",
+                vec!["auto", "d3d12", "d3d11"],
+                vec!["vulkan", "metal"],
+            ),
+            (
+                "linux",
+                vec!["auto", "vulkan"],
+                vec!["d3d11", "d3d12", "metal"],
+            ),
+            (
+                "macos",
+                vec!["auto", "metal"],
+                vec!["d3d11", "d3d12", "vulkan"],
+            ),
+        ] {
+            let controls = options_controls(platform);
+            for value in included {
+                assert!(controls.contains(&format!("<option value=\"{value}\">")));
+            }
+            for value in excluded {
+                assert!(!controls.contains(&format!("<option value=\"{value}\">")));
+            }
+        }
+    }
 
     #[test]
     fn sign_in_choices_screen_routes_each_provider_through_launcher_controls() {
