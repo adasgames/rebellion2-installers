@@ -65,6 +65,13 @@ content.
 
 ## FAQ
 
+### How do I change the graphics API?
+
+Open **Options** using the launcher's gear icon, choose **Graphics API**, and save.
+Windows offers DirectX 12 and DirectX 11, macOS uses Metal, and Linux uses Vulkan.
+**Automatic (recommended)** keeps the game's default selection. Your choice is saved per user
+and applies the next time you launch the game or editor.
+
 ### Why is Empire at War accepted?
 
 *Star Wars: Rebellion* is no longer available for purchase through its former digital storefronts,

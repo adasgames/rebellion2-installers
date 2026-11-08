@@ -16,7 +16,9 @@
 mod browser_signin;
 mod content_packs;
 mod downloads;
+mod launch_settings;
 mod manifests;
+mod player_launch;
 mod presentation;
 mod release_notes;
 mod versions;
@@ -71,6 +73,7 @@ use downloads::{
     clear_cache, clear_download_metadata, download_to_path, known_download_size, DownloadError,
     DownloadSpec,
 };
+use launch_settings::{GraphicsApi, LauncherSettings};
 #[cfg(test)]
 use rebellion2_update_core::sha256_hex;
 use rebellion2_update_core::FileEntry;
@@ -523,6 +526,7 @@ fn main() {
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
                     .resizable(false)
+                    .maximizable(false)
                     .visible(resume.is_none())
                     .on_navigation(move |url| on_nav(&navigation_handle, url))
                     .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
@@ -570,6 +574,7 @@ fn show_startup_error(message: String) {
                 .title("Rebellion 2 Launcher")
                 .inner_size(520.0, 700.0)
                 .resizable(false)
+                .maximizable(false)
                 .on_page_load(move |_, payload| {
                     if payload.event() == PageLoadEvent::Finished {
                         write_screen(&handle, &screen);
@@ -577,8 +582,12 @@ fn show_startup_error(message: String) {
                 })
                 .on_navigation(move |url| {
                     if url.as_str().starts_with(ACT) {
-                        if query(url, "choice").as_deref() == Some("discord") {
-                            on_choice(&navigation_handle, "discord");
+                        let choice = query(url, "choice").unwrap_or_default();
+                        if choice == "discord"
+                            || choice == "options"
+                            || choice.starts_with("save-options:")
+                        {
+                            on_choice(&navigation_handle, &choice);
                         } else {
                             navigation_handle.exit(0);
                         }
@@ -807,8 +816,9 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
 
     #[cfg(debug_assertions)]
     if PREVIEW_UPDATE_FLOW.load(Ordering::Relaxed) {
-        INITIAL_SCAN_PENDING.store(false, Ordering::Relaxed);
-        show_preview_launcher_update(handle);
+        if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
+            show_preview_launcher_update(handle);
+        }
         return;
     }
 
@@ -1019,8 +1029,71 @@ fn show_sign_in_choices(handle: &tauri::AppHandle) {
     show_local_screen(handle, presentation::sign_in_choices_screen());
 }
 
+/// Locates preferences in the user's configuration directory, outside updateable installs.
+fn launcher_settings_path(handle: &tauri::AppHandle) -> io::Result<PathBuf> {
+    handle
+        .path()
+        .app_config_dir()
+        .map(|directory| directory.join("settings.json"))
+        .map_err(io::Error::other)
+}
+
+/// Loads and validates preferences for the current desktop platform.
+fn read_launcher_settings(handle: &tauri::AppHandle) -> io::Result<LauncherSettings> {
+    LauncherSettings::load(&launcher_settings_path(handle)?, std::env::consts::OS)
+}
+
+/// Opens the options dialog without replacing the active update or sign-in screen.
+fn show_launcher_options(handle: &tauri::AppHandle) {
+    let (settings, message) = match read_launcher_settings(handle) {
+        Ok(settings) => (settings, ""),
+        Err(error) => {
+            log_line(&format!("[launcher] could not load options: {error}"));
+            (
+                LauncherSettings::default(),
+                "Saved options could not be read. Choose an API and save to reset them.",
+            )
+        }
+    };
+    window_eval(
+        handle,
+        &format!(
+            "window.rebOpenOptions({},{});",
+            js_string(settings.graphics_api.value()),
+            js_string(message),
+        ),
+    );
+}
+
+/// Validates and persists a submitted API, reporting save failures inside the dialog.
+fn save_launcher_options(handle: &tauri::AppHandle, value: &str) {
+    let result =
+        GraphicsApi::from_selection(value, std::env::consts::OS).and_then(|graphics_api| {
+            LauncherSettings { graphics_api }.save(&launcher_settings_path(handle)?)
+        });
+    let message = match result {
+        Ok(()) => "",
+        Err(error) => {
+            log_line(&format!("[launcher] could not save options: {error}"));
+            "Options could not be saved. See launcher.log for details."
+        }
+    };
+    window_eval(
+        handle,
+        &format!("window.rebOptionsSaved({});", js_string(message)),
+    );
+}
+
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
+    if choice == "options" {
+        show_launcher_options(handle);
+        return;
+    }
+    if let Some(value) = choice.strip_prefix("save-options:") {
+        save_launcher_options(handle, value);
+        return;
+    }
     if choice == "discord" {
         let handle = handle.clone();
         thread::spawn(move || {
@@ -1083,9 +1156,9 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 return;
             }
             let (name, result) = if choice == "open-editor" {
-                ("editor", launch_editor())
+                ("editor", launch_editor(handle))
             } else {
-                ("game", launch_game())
+                ("game", launch_game(handle))
             };
             match result {
                 Ok(true) => handle.exit(0),
@@ -3769,7 +3842,7 @@ fn start_install(handle: tauri::AppHandle, url: String) {
                     content_dir.display()
                 ));
                 update_progress(&handle, 100, "Starting game…");
-                match launch_game() {
+                match launch_game(&handle) {
                     Ok(true) => handle.exit(0),
                     Ok(false) => show_message(
                         &handle,
@@ -4129,7 +4202,7 @@ fn write_screen(handle: &tauri::AppHandle, html: &str) {
     let html = js_string(html);
     window_eval(
         handle,
-        &format!("document.open();document.write({html});document.close();"),
+        &format!("if(window.rebRenderScreen){{window.rebRenderScreen({html});}}else{{document.open();document.write({html});document.close();}}"),
     );
 }
 
@@ -5448,17 +5521,17 @@ fn ensure_linux_player_executables(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn launch_game() -> io::Result<bool> {
-    launch_player(&game_path()?)
+fn launch_game(handle: &tauri::AppHandle) -> io::Result<bool> {
+    launch_player(handle, &game_path()?)
 }
 
 /// Starts the editor using the same installed-content and process-lifetime rules as the game.
-fn launch_editor() -> io::Result<bool> {
-    launch_player(&editor_path()?)
+fn launch_editor(handle: &tauri::AppHandle) -> io::Result<bool> {
+    launch_player(handle, &editor_path()?)
 }
 
 /// Validates the installed player/content pair before starting a bundled Unity application.
-fn launch_player(exe: &Path) -> io::Result<bool> {
+fn launch_player(handle: &tauri::AppHandle, exe: &Path) -> io::Result<bool> {
     recover_interrupted_updates()?;
     let base = install_dir()?;
     let content_version = read_installed_version(&base.join("Content"));
@@ -5495,46 +5568,23 @@ fn launch_player(exe: &Path) -> io::Result<bool> {
         log_line(&format!("[launcher] player not found at {}", exe.display()));
         return Ok(false);
     }
-    log_line(&format!("[launcher] launching {}", exe.display()));
-
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("/usr/bin/open")
-        .arg(exe)
-        .arg("--args")
-        .arg("-contentPath")
-        .arg(base.join("Content"))
-        .spawn()?;
-
-    #[cfg(target_os = "linux")]
-    {
-        ensure_linux_player_executables(&base)?;
-        std::process::Command::new(exe).current_dir(&base).spawn()?;
-    }
-
-    // On Windows the launcher runs inside a WebView2 job object that kills child
-    // processes when the launcher exits — so a plain spawn dies the moment we
-    // close. Break the player out of the job (and detach it) so it keeps running;
-    // if the job forbids breakaway, hand off to Explorer, which starts it in its
-    // own process tree, independent of ours.
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        let spawned = std::process::Command::new(exe)
-            .current_dir(&base)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
-            .spawn();
-        if let Err(err) = spawned {
+    let settings = match read_launcher_settings(handle) {
+        Ok(settings) => settings,
+        Err(error) => {
             log_line(&format!(
-                "[launcher] breakaway spawn failed ({err}); handing off to Explorer."
+                "[launcher] could not read launch options ({error}); using Automatic."
             ));
-            std::process::Command::new("explorer.exe")
-                .arg(exe)
-                .spawn()?;
+            LauncherSettings::default()
         }
-    }
+    };
+    log_line(&format!(
+        "[launcher] launching {} using {}",
+        exe.display(),
+        settings.graphics_api.label()
+    ));
+    #[cfg(target_os = "linux")]
+    ensure_linux_player_executables(&base)?;
+    player_launch::launch(exe, &base, settings.graphics_api)?;
     Ok(true)
 }
 
