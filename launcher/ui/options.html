@@ -5,16 +5,15 @@
     <circle cx="12" cy="12.5" r="3.2" />
   </svg>
 </button>
-<dialog class="options-dialog" id="launcher-options" aria-labelledby="options-title" aria-describedby="options-description">
+<dialog class="options-dialog" id="launcher-options" aria-labelledby="options-title">
   <button class="options-close" type="button" aria-label="Close options" onclick="document.getElementById('launcher-options').close()">
     <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>
   </button>
   <h2 id="options-title">Options</h2>
-  <p id="options-description">Choose the graphics API used by the game and editor.</p>
   <form id="launcher-options-form">
     <label for="graphics-api">Graphics API</label>
     <select id="graphics-api" name="graphics-api">@@GRAPHICS_API_OPTIONS@@</select>
-    <p class="options-hint">Applies the next time you launch.</p>
+    <p class="options-hint">Applies the next time you launch the game or Content Pack Editor.</p>
     <p class="options-error" id="options-error" role="alert"></p>
     <div class="options-actions">
       <button class="b secondary" type="button" onclick="document.getElementById('launcher-options').close()">Cancel</button>

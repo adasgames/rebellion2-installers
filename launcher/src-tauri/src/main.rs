@@ -526,6 +526,7 @@ fn main() {
                     .title("Rebellion 2 Launcher")
                     .inner_size(520.0, 700.0)
                     .resizable(false)
+                    .maximizable(false)
                     .visible(resume.is_none())
                     .on_navigation(move |url| on_nav(&navigation_handle, url))
                     .on_page_load(move |_window, payload| on_page_load(&page_load_handle, &payload))
@@ -573,6 +574,7 @@ fn show_startup_error(message: String) {
                 .title("Rebellion 2 Launcher")
                 .inner_size(520.0, 700.0)
                 .resizable(false)
+                .maximizable(false)
                 .on_page_load(move |_, payload| {
                     if payload.event() == PageLoadEvent::Finished {
                         write_screen(&handle, &screen);
@@ -814,8 +816,9 @@ fn on_page_load(handle: &tauri::AppHandle, payload: &PageLoadPayload<'_>) {
 
     #[cfg(debug_assertions)]
     if PREVIEW_UPDATE_FLOW.load(Ordering::Relaxed) {
-        INITIAL_SCAN_PENDING.store(false, Ordering::Relaxed);
-        show_preview_launcher_update(handle);
+        if INITIAL_SCAN_PENDING.swap(false, Ordering::Relaxed) {
+            show_preview_launcher_update(handle);
+        }
         return;
     }
 
