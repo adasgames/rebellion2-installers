@@ -85,6 +85,7 @@ impl Attempt {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("provider", "steam");
+            query.append_pair("player_identity", "1");
             if player_sign_in {
                 query.append_pair("flow", "player");
             }
@@ -293,6 +294,13 @@ mod tests {
             "0.1.0"
         );
         assert_ne!(first.id, second.id);
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "player_identity")
+                .unwrap()
+                .1,
+            "1"
+        );
         assert_eq!(first.id.len(), 64);
     }
 

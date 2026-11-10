@@ -567,29 +567,26 @@ fn main() {
         .expect("error while running the Rebellion II launcher");
 }
 
-/// Opens only the requested store sign-in without locking or updating the installation.
+/// Opens store selection or the requested sign-in without locking or updating the installation.
 fn run_player_sign_in() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
             let page_handle = handle.clone();
             let navigation_handle = handle.clone();
-            let steam = PLAYER_SIGN_IN
+            let provider = PLAYER_SIGN_IN
                 .get()
-                .is_some_and(|request| request.provider == "steam");
-            let initial_page = if steam {
-                WebviewUrl::App("index.html".into())
-            } else {
-                WebviewUrl::External(
-                    player_gate_landing(
-                        &PLAYER_SIGN_IN
-                            .get()
-                            .expect("Player sign-in was initialized")
-                            .provider,
-                    )
-                    .parse()?,
-                )
+                .expect("Player sign-in was initialized")
+                .provider
+                .as_deref();
+            let initial_page = match provider {
+                Some("gog") => WebviewUrl::External(player_gate_landing("gog").parse()?),
+                _ => WebviewUrl::App("index.html".into()),
             };
+            if provider.is_none() {
+                *LOCAL_SCREEN_PENDING.lock().unwrap() =
+                    Some(presentation::player_sign_in_choices_screen());
+            }
             WebviewWindowBuilder::new(app, "main", initial_page)
                 .title("Rebellion 2 sign in")
                 .inner_size(520.0, 700.0)
@@ -597,7 +594,7 @@ fn run_player_sign_in() {
                 .on_navigation(move |url| on_nav(&navigation_handle, url))
                 .on_page_load(move |_, payload| on_page_load(&page_handle, &payload))
                 .build()?;
-            if steam {
+            if provider == Some("steam") {
                 start_steam_browser_sign_in(&handle);
             }
             Ok(())
@@ -1126,7 +1123,12 @@ fn show_sign_in_choices(handle: &tauri::AppHandle) {
     cancel_browser_sign_in();
     GATE_RETURN_PENDING.store(false, Ordering::Relaxed);
     INITIAL_SCAN_PENDING.store(false, Ordering::Relaxed);
-    show_local_screen(handle, presentation::sign_in_choices_screen());
+    let screen = if PLAYER_SIGN_IN.get().is_some() {
+        presentation::player_sign_in_choices_screen()
+    } else {
+        presentation::sign_in_choices_screen()
+    };
+    show_local_screen(handle, screen);
 }
 
 /// Locates preferences in the user's configuration directory, outside updateable installs.
@@ -1230,19 +1232,20 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     if ["back", "signin", "quit"].contains(&choice) {
         cancel_browser_sign_in();
     }
-    if let Some(request) = PLAYER_SIGN_IN.get() {
-        if choice == "back" {
-            handle.exit(1);
-        } else if ["signin", "steam-retry"].contains(&choice) {
-            if request.provider == "steam" {
-                start_steam_browser_sign_in(handle);
-                return;
-            }
-            if let Some(window) = handle.get_webview_window("main") {
-                if let Ok(url) = player_gate_landing(&request.provider).parse() {
-                    let _ = window.navigate(url);
+    if PLAYER_SIGN_IN.get().is_some() {
+        match choice {
+            "back" | "quit" => handle.exit(1),
+            "signin" => show_sign_in_choices(handle),
+            "steam-signin" | "steam-retry" => start_steam_browser_sign_in(handle),
+            "gog-signin" => {
+                cancel_browser_sign_in();
+                if let Some(window) = handle.get_webview_window("main") {
+                    if let Ok(url) = player_gate_landing("gog").parse() {
+                        let _ = window.navigate(url);
+                    }
                 }
             }
+            _ => {}
         }
         return;
     }

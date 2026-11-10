@@ -6,7 +6,7 @@ pub const FILE_NAME: &str = ".player-session.json";
 
 /// A game-requested store sign-in that does not run installation or updates.
 pub struct SignIn {
-    pub provider: String,
+    pub provider: Option<String>,
     pub session_file: PathBuf,
 }
 
@@ -27,8 +27,11 @@ pub fn sign_in_arguments(arguments: &[String]) -> Result<Option<SignIn>, &'stati
             .position(|argument| argument == key)
             .and_then(|index| arguments.get(index + 1))
     };
-    let provider = value("--provider").ok_or("Missing store provider")?;
-    if !["steam", "gog"].contains(&provider.as_str()) {
+    let provider = value("--provider");
+    if arguments.iter().any(|argument| argument == "--provider") && provider.is_none() {
+        return Err("Missing store provider");
+    }
+    if provider.is_some_and(|provider| !["steam", "gog"].contains(&provider.as_str())) {
         return Err("Unsupported store provider");
     }
     let session_file = PathBuf::from(value("--session-file").ok_or("Missing session output path")?);
@@ -36,7 +39,7 @@ pub fn sign_in_arguments(arguments: &[String]) -> Result<Option<SignIn>, &'stati
         return Err("Session output path must be absolute");
     }
     Ok(Some(SignIn {
-        provider: provider.clone(),
+        provider: provider.cloned(),
         session_file,
     }))
 }
@@ -142,8 +145,72 @@ mod tests {
             output.to_string_lossy().into_owned(),
         ];
         let request = sign_in_arguments(&args).unwrap().unwrap();
-        assert_eq!(request.provider, "gog");
+        assert_eq!(request.provider.as_deref(), Some("gog"));
         assert_eq!(request.session_file, output);
+    }
+
+    #[test]
+    fn sign_in_arguments_without_provider_opens_store_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("player session.json");
+        let args = vec![
+            "--auth-only".into(),
+            "--session-file".into(),
+            output.to_string_lossy().into_owned(),
+        ];
+
+        let request = sign_in_arguments(&args).unwrap().unwrap();
+
+        assert!(request.provider.is_none());
+        assert_eq!(request.session_file, output);
+    }
+
+    #[test]
+    fn sign_in_arguments_missing_explicit_provider_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = vec![
+            "--auth-only".into(),
+            "--session-file".into(),
+            directory
+                .path()
+                .join("session.json")
+                .to_string_lossy()
+                .into_owned(),
+            "--provider".into(),
+        ];
+
+        assert!(sign_in_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn sign_in_arguments_unsupported_provider_with_valid_output_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        for provider in ["epic", "github", ""] {
+            let args = vec![
+                "--auth-only".into(),
+                "--provider".into(),
+                provider.into(),
+                "--session-file".into(),
+                directory
+                    .path()
+                    .join("session.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+
+            assert!(sign_in_arguments(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn sign_in_arguments_without_provider_still_requires_absolute_output() {
+        let args = vec![
+            "--auth-only".into(),
+            "--session-file".into(),
+            "relative.json".into(),
+        ];
+
+        assert!(sign_in_arguments(&args).is_err());
     }
 
     #[test]
