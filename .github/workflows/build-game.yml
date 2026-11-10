@@ -635,3 +635,11 @@ jobs:
           test "$published" = "$VERSION"
           gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           trap - EXIT
+
+  macos-download:
+    name: Refresh macOS download
+    needs: publish
+    if: inputs.platform == 'all' || inputs.platform == 'macos'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/refresh-macos-download.yml
