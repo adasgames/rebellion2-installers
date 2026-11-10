@@ -1,0 +1,32 @@
+name: Refresh macOS download
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/refresh-macos-download.yml
+      - scripts/publish-macos-download.mjs
+      - scripts/semver.mjs
+
+concurrency:
+  group: macos-download
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Refresh macOS download
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Test release scripts
+        run: node --test scripts/*.test.mjs
+
+      - name: Publish the latest macOS download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/publish-macos-download.mjs "$GITHUB_REPOSITORY" --publish
