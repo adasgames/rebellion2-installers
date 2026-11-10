@@ -352,3 +352,11 @@ jobs:
               Rebellion2-macOS.zip \
               latest-macos.json
           fi
+
+  macos-download:
+    name: Refresh macOS download
+    needs: package
+    if: inputs.publish && inputs.confirm_legacy_bridge
+    permissions:
+      contents: write
+    uses: ./.github/workflows/refresh-macos-download.yml

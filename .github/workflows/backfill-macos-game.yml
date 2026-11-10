@@ -238,3 +238,10 @@ jobs:
           done
           test "$published" = true
           trap - EXIT
+
+  macos-download:
+    name: Refresh macOS download
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/refresh-macos-download.yml
