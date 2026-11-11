@@ -643,3 +643,11 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/refresh-macos-download.yml
+
+  linux-download:
+    name: Refresh Linux download
+    needs: publish
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/refresh-linux-download.yml

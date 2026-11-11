@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/refresh-macos-download.yml
       - scripts/publish-macos-download.mjs
+      - scripts/publish-platform-download.mjs
       - scripts/semver.mjs
 
 concurrency:
