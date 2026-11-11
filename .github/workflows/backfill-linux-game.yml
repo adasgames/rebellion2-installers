@@ -242,3 +242,10 @@ jobs:
           done
           test "$published" = true
           trap - EXIT
+
+  linux-download:
+    name: Refresh Linux download
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/refresh-linux-download.yml

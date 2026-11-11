@@ -27,6 +27,27 @@ The packages do not have trusted platform signatures yet, so operating systems m
 launch. Every downloaded launcher and game file is nevertheless authenticated by a signed manifest
 and a SHA-256 digest. Authenticode and Apple Developer ID signing/notarization remain on the roadmap.
 
+## Refreshing platform downloads
+
+The macOS and Linux download buttons use separate release aliases:
+
+- `latest-macos-download/Rebellion2-macOS.zip`
+- `latest-linux-download/Rebellion2-Linux-x86_64.AppImage`
+
+Each alias selects the highest stable game version containing an uploaded, nonempty package for
+its platform. The publisher verifies the source package's size and SHA-256 before uploading the
+alias and checks the published asset afterward. Alias releases are marked as prereleases and do
+not become GitHub's global latest release.
+
+Game publication and platform backfills refresh the relevant aliases automatically. Use
+**Refresh macOS download** or **Refresh Linux download** in Actions to refresh an existing package.
+The selection can also be checked without publishing:
+
+```bash
+node scripts/publish-macos-download.mjs adasgames/rebellion2-installers --dry-run
+node scripts/publish-linux-download.mjs adasgames/rebellion2-installers --dry-run
+```
+
 ## Building a launcher release
 
 Actions tab → **Build launcher** → **Run workflow**.

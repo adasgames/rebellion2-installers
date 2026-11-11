@@ -21,7 +21,7 @@ Download and install **Rebellion 2** for Windows, macOS, or Linux.
       <sub>Universal Intel + Apple Silicon app</sub>
     </td>
     <td align="center" width="33%">
-      <a href="https://github.com/adasgames/rebellion2-installers/releases/latest">
+      <a href="https://github.com/adasgames/rebellion2-installers/releases/download/latest-linux-download/Rebellion2-Linux-x86_64.AppImage">
         <img src="docs/assets/linux.svg" width="64" alt="Linux"><br>
         <strong>Download latest for Linux</strong>
       </a><br>
@@ -30,7 +30,7 @@ Download and install **Rebellion 2** for Windows, macOS, or Linux.
   </tr>
 </table>
 
-[View release notes and all assets](https://github.com/adasgames/rebellion2-installers/releases/latest).
+[View release notes and all assets](https://github.com/adasgames/rebellion2-installers/releases).
 
 The launcher verifies ownership automatically before downloading game content. You must own
 either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG** or **Steam**.
@@ -53,7 +53,7 @@ Setup offers a separate optional desktop shortcut. You can also choose **Open ed
    double-click will be blocked — you only need the right-click trick once.)
 
 ### Linux
-1. Download **`Rebellion2-<version>-x86_64.AppImage`** from the latest release.
+1. Download **`Rebellion2-Linux-x86_64.AppImage`** using the Linux button above.
 2. Make it executable with **`chmod +x Rebellion2-*-x86_64.AppImage`**.
 3. Run the AppImage. The launcher stores the installed game and update metadata in your XDG data
    directory, normally **`~/.local/share/rebellion2`**.

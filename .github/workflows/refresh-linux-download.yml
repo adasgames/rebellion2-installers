@@ -1,0 +1,33 @@
+name: Refresh Linux download
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/refresh-linux-download.yml
+      - scripts/publish-linux-download.mjs
+      - scripts/publish-platform-download.mjs
+      - scripts/semver.mjs
+
+concurrency:
+  group: linux-download
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Refresh Linux download
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Test release scripts
+        run: node --test scripts/*.test.mjs
+
+      - name: Publish the latest Linux download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/publish-linux-download.mjs "$GITHUB_REPOSITORY" --publish
