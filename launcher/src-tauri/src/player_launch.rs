@@ -84,7 +84,7 @@ fn sanitize_appimage_environment(command: &mut Command) {
     let Some(appdir) = std::env::var_os("APPDIR") else {
         return;
     };
-    sanitize_appimage_environment_from(command, Path::new(&appdir), std::env::var_os);
+    sanitize_appimage_environment_from(command, Path::new(&appdir), |name| std::env::var_os(name));
 }
 
 /// Applies AppImage environment overrides using values supplied by the launcher process.
