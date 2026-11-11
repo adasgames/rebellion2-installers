@@ -63,6 +63,13 @@ update downloads in the background, applies the next time the launcher starts, a
 the game. Game releases update the Windows, macOS, or Linux player together with its matching game
 content.
 
+## Multiplayer sign-in
+
+The game reuses the store identity cached by the launcher. When another sign-in is needed, it opens
+the launcher with `--auth-only --provider steam|gog --session-file <absolute path>`. This mode opens
+store verification without starting installation or updates. The launcher passes the installed
+session and executable paths to the game, including the outer AppImage path on Linux.
+
 ## FAQ
 
 ### How do I change the graphics API?

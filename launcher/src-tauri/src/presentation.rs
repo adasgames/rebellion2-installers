@@ -203,6 +203,18 @@ pub(crate) fn sign_in_choices_screen() -> String {
         .replace("@@OPTIONS_STYLES@@", include_str!("../../ui/options.css"))
 }
 
+/// Offers the supported multiplayer stores using the launcher's shared layout and controls.
+pub(crate) fn player_sign_in_choices_screen() -> String {
+    render(
+        "Play online",
+        false,
+        "Sign in with your Steam or GOG account. Your sign-in is remembered.",
+        &(button("Sign in with Steam", "steam-signin")
+            + &button("Sign in with GOG", "gog-signin")
+            + &secondary_button("Back", "back")),
+    )
+}
+
 /// Keeps the launcher available while the player signs in through the system browser.
 pub(crate) fn steam_browser_signin_screen() -> String {
     render(
@@ -575,6 +587,16 @@ mod tests {
         }
         assert!(!screen.contains("type=\"password\""));
         assert!(!screen.contains("/start?provider="));
+    }
+
+    #[test]
+    fn player_sign_in_choices_screen_offers_supported_stores_and_back() {
+        let screen = player_sign_in_choices_screen();
+        for choice in ["steam-signin", "gog-signin", "back"] {
+            assert!(screen.contains(&format!("{ACT}?choice={choice}")));
+        }
+        assert!(!screen.contains("github-signin"));
+        assert!(!screen.contains("type=\"password\""));
     }
 
     #[test]

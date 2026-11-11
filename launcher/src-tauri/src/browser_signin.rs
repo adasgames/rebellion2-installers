@@ -17,6 +17,7 @@ pub struct Attempt {
     secret: [u8; 32],
     origin: String,
     cancellation: watch::Receiver<bool>,
+    player_sign_in: bool,
 }
 
 /// Allows the launcher to reopen or cancel exactly one pending browser attempt.
@@ -36,6 +37,7 @@ pub struct Completion {
     pub msg: Option<String>,
     pub url: Option<String>,
     pub token: Option<String>,
+    pub player_token: Option<String>,
     pub reason: Option<String>,
     pub profile_visibility: Option<String>,
 }
@@ -53,12 +55,17 @@ struct CallbackState {
     secret: [u8; 32],
     origin: String,
     host: String,
+    player_sign_in: bool,
     completion: Mutex<Option<oneshot::Sender<Completion>>>,
 }
 
 impl Attempt {
     /// Binds exclusively to IPv4 loopback and creates an unguessable per-attempt secret.
-    pub fn prepare(base: &str, version: Option<&str>) -> io::Result<(Self, Control)> {
+    pub fn prepare(
+        base: &str,
+        version: Option<&str>,
+        player_sign_in: bool,
+    ) -> io::Result<(Self, Control)> {
         let base = Url::parse(base).map_err(io::Error::other)?;
         if (base.scheme() != "https"
             && !(cfg!(debug_assertions)
@@ -78,6 +85,10 @@ impl Attempt {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("provider", "steam");
+            query.append_pair("player_identity", "1");
+            if player_sign_in {
+                query.append_pair("flow", "player");
+            }
             if let Some(version) = version {
                 query.append_pair("v", version);
             }
@@ -91,6 +102,7 @@ impl Attempt {
                 secret,
                 origin: base.origin().ascii_serialization(),
                 cancellation,
+                player_sign_in,
             },
             Control {
                 url: url.into(),
@@ -118,6 +130,7 @@ impl Attempt {
             secret: self.secret,
             origin: self.origin,
             host,
+            player_sign_in: self.player_sign_in,
             completion: Mutex::new(Some(complete)),
         });
         let router = Router::new()
@@ -221,8 +234,12 @@ async fn receive(
     }
     if !["0", "1"].contains(&result.ok.as_str())
         || (result.ok == "1"
-            && (result.token.as_deref().is_none_or(str::is_empty)
-                || result.url.as_deref().is_none_or(str::is_empty)))
+            && if state.player_sign_in {
+                result.player_token.as_deref().is_none_or(str::is_empty)
+            } else {
+                result.token.as_deref().is_none_or(str::is_empty)
+                    || result.url.as_deref().is_none_or(str::is_empty)
+            })
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -269,14 +286,21 @@ mod tests {
 
     #[test]
     fn prepare_creates_distinct_attempts_and_preserves_the_content_version() {
-        let (_, first) = Attempt::prepare("https://gate.example/", Some("0.1.0")).unwrap();
-        let (_, second) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (_, first) = Attempt::prepare("https://gate.example/", Some("0.1.0"), false).unwrap();
+        let (_, second) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let url = Url::parse(&first.url).unwrap();
         assert_eq!(
             url.query_pairs().find(|(key, _)| key == "v").unwrap().1,
             "0.1.0"
         );
         assert_ne!(first.id, second.id);
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "player_identity")
+                .unwrap()
+                .1,
+            "1"
+        );
         assert_eq!(first.id.len(), 64);
     }
 
@@ -297,7 +321,7 @@ mod tests {
                 assert!(String::from_utf8_lossy(&bytes[..length]).starts_with("HEAD /start?"));
                 write!(socket, "HTTP/1.1 {status}\r\n{header}Location: https://steamcommunity.com/openid/login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             });
-            let (_attempt, control) = Attempt::prepare(&base, None).unwrap();
+            let (_attempt, control) = Attempt::prepare(&base, None, false).unwrap();
             assert_eq!(control.is_supported(), expected);
             server.join().unwrap();
         }
@@ -305,7 +329,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_accepts_the_matching_gate_result() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
         let response = submit(&control, "https://gate.example", &control.id, "1", None);
         assert_eq!(response, 200);
@@ -321,7 +345,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_rejects_wrong_origins_and_secrets_without_consuming_the_attempt() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
         assert_eq!(
             submit(&control, "https://evil.example", &control.id, "1", None),
@@ -341,7 +365,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_preserves_ownership_failure_and_privacy_details() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
         assert_eq!(
             submit(
@@ -364,7 +388,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_rejects_oversized_and_incomplete_results_without_consuming_the_attempt() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
         for (fields, expected) in [
             (
@@ -398,7 +422,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_closes_after_one_completion_and_rejects_replay() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
         assert_eq!(
             submit(&control, "https://gate.example", &control.id, "1", None),
@@ -413,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_cancels_an_active_listener() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
         tokio::task::yield_now().await;
         control.cancel();
@@ -422,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_cancels_an_attempt_before_its_task_starts() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         control.cancel();
         assert!(matches!(
             attempt.wait(Duration::from_secs(5)).await,
@@ -432,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_times_out_and_releases_the_listener() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         assert!(matches!(
             attempt.wait(Duration::from_millis(20)).await,
             Outcome::TimedOut
@@ -443,13 +467,83 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_after_steam_timeout_remains_visible() {
-        let (attempt, control) = Attempt::prepare("https://gate.example/", None).unwrap();
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
         assert!(matches!(
             attempt.wait(Duration::from_millis(1)).await,
             Outcome::TimedOut
         ));
         control.cancel();
         assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn prepare_player_signin_preserves_the_identity_flow() {
+        let (_, control) = Attempt::prepare("https://gate.example/", None, true).unwrap();
+        let url = Url::parse(&control.url).unwrap();
+        assert_eq!(
+            url.query_pairs().find(|(key, _)| key == "flow").unwrap().1,
+            "player"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_player_signin_accepts_identity_without_download_credentials() {
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, true).unwrap();
+        let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
+        let response = ureq::post(&callback_url(&control))
+            .set("Origin", "https://gate.example")
+            .send_form(&[
+                ("state", control.id.as_str()),
+                ("ok", "1"),
+                ("player_token", "player-credential"),
+            ])
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let Outcome::Completed(result) = pending.await.unwrap() else {
+            panic!("No completion")
+        };
+        assert_eq!(result.player_token.as_deref(), Some("player-credential"));
+        assert!(result.token.is_none());
+        assert!(result.url.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_player_signin_rejects_download_only_credentials_without_consuming_attempt() {
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, true).unwrap();
+        let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
+        assert_eq!(
+            submit(&control, "https://gate.example", &control.id, "1", None),
+            400
+        );
+        let response = ureq::post(&callback_url(&control))
+            .set("Origin", "https://gate.example")
+            .send_form(&[
+                ("state", control.id.as_str()),
+                ("ok", "1"),
+                ("player_token", "player-credential"),
+            ])
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(matches!(pending.await.unwrap(), Outcome::Completed(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_download_signin_rejects_player_only_credentials_without_consuming_attempt() {
+        let (attempt, control) = Attempt::prepare("https://gate.example/", None, false).unwrap();
+        let pending = tokio::spawn(attempt.wait(Duration::from_secs(5)));
+        let response = ureq::post(&callback_url(&control))
+            .set("Origin", "https://gate.example")
+            .send_form(&[
+                ("state", control.id.as_str()),
+                ("ok", "1"),
+                ("player_token", "player-credential"),
+            ]);
+        assert!(matches!(response, Err(ureq::Error::Status(400, _))));
+        assert_eq!(
+            submit(&control, "https://gate.example", &control.id, "1", None),
+            200
+        );
+        assert!(matches!(pending.await.unwrap(), Outcome::Completed(_)));
     }
 
     fn callback_url(control: &Control) -> String {

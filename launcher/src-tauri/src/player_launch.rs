@@ -1,9 +1,14 @@
 use crate::launch_settings::GraphicsApi;
-use std::{io, path::Path, process::Command};
+use std::{ffi::OsString, io, path::Path, process::Command};
 
 /// Starts an installed Unity player with its selected API and existing content location.
-pub(crate) fn launch(executable: &Path, base: &Path, api: GraphicsApi) -> io::Result<()> {
-    let mut command = player_command(executable, base, api);
+pub(crate) fn launch(
+    executable: &Path,
+    base: &Path,
+    api: GraphicsApi,
+    extra_arguments: &[OsString],
+) -> io::Result<()> {
+    let mut command = player_command(executable, base, api, extra_arguments);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -17,7 +22,7 @@ pub(crate) fn launch(executable: &Path, base: &Path, api: GraphicsApi) -> io::Re
             crate::log_line(&format!(
                 "[launcher] breakaway spawn failed ({error}); handing off to Explorer."
             ));
-            launch_from_explorer(executable, base, api)?;
+            launch_from_explorer(executable, base, api, extra_arguments)?;
         }
     }
     #[cfg(not(target_os = "windows"))]
@@ -26,7 +31,12 @@ pub(crate) fn launch(executable: &Path, base: &Path, api: GraphicsApi) -> io::Re
 }
 
 /// Builds process arguments without shell parsing or combining executable paths with flags.
-fn player_command(executable: &Path, base: &Path, api: GraphicsApi) -> Command {
+fn player_command(
+    executable: &Path,
+    base: &Path,
+    api: GraphicsApi,
+    extra_arguments: &[OsString],
+) -> Command {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("/usr/bin/open");
@@ -43,13 +53,19 @@ fn player_command(executable: &Path, base: &Path, api: GraphicsApi) -> Command {
     if let Some(argument) = api.argument() {
         command.arg(argument);
     }
+    command.args(extra_arguments);
     command
 }
 
 /// Asks the desktop's Explorer process to launch the player outside the launcher's job.
 /// Its shell automation API carries arguments as well as the executable and working directory.
 #[cfg(target_os = "windows")]
-fn launch_from_explorer(executable: &Path, base: &Path, api: GraphicsApi) -> io::Result<()> {
+fn launch_from_explorer(
+    executable: &Path,
+    base: &Path,
+    api: GraphicsApi,
+    extra_arguments: &[OsString],
+) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
         core::{Interface, BSTR},
@@ -98,9 +114,10 @@ fn launch_from_explorer(executable: &Path, base: &Path, api: GraphicsApi) -> io:
             let shell: IShellDispatch2 = folder.Application()?.cast()?;
             let file = BSTR::from_wide(&executable.as_os_str().encode_wide().collect::<Vec<_>>());
             let directory = BSTR::from_wide(&base.as_os_str().encode_wide().collect::<Vec<_>>());
+            let arguments = BSTR::from_wide(&explorer_arguments(api, extra_arguments));
             shell.ShellExecute(
                 &file,
-                &VARIANT::from(api.argument().unwrap_or_default()),
+                &VARIANT::from(arguments),
                 &VARIANT::from(directory),
                 &VARIANT::from("open"),
                 &VARIANT::from(1_i32),
@@ -111,6 +128,38 @@ fn launch_from_explorer(executable: &Path, base: &Path, api: GraphicsApi) -> io:
         }
         result.map_err(io::Error::other)
     }
+}
+
+/// Quotes each UTF-16 argument for the Windows process parser, preserving path separators and quotes.
+#[cfg(target_os = "windows")]
+fn explorer_arguments(api: GraphicsApi, extra_arguments: &[OsString]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut arguments = Vec::new();
+    let rendering = api.argument().map(OsString::from);
+    for argument in rendering.iter().chain(extra_arguments) {
+        if !arguments.is_empty() {
+            arguments.push(b' ' as u16);
+        }
+        arguments.push(b'"' as u16);
+        let mut slashes = 0;
+        for character in argument.encode_wide() {
+            if character == b'\\' as u16 {
+                slashes += 1;
+                continue;
+            }
+            let count = if character == b'"' as u16 {
+                slashes * 2 + 1
+            } else {
+                slashes
+            };
+            arguments.extend(std::iter::repeat_n(b'\\' as u16, count));
+            arguments.push(character);
+            slashes = 0;
+        }
+        arguments.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
+        arguments.push(b'"' as u16);
+    }
+    arguments
 }
 
 #[cfg(test)]
@@ -125,6 +174,7 @@ mod tests {
             Path::new("game with spaces"),
             Path::new("install with spaces"),
             api,
+            &[],
         );
         assert_eq!(
             command.get_current_dir(),
@@ -140,7 +190,12 @@ mod tests {
 
     #[test]
     fn automatic_does_not_force_a_graphics_api() {
-        let command = player_command(Path::new("game"), Path::new("install"), GraphicsApi::Auto);
+        let command = player_command(
+            Path::new("game"),
+            Path::new("install"),
+            GraphicsApi::Auto,
+            &[],
+        );
         assert!(!command
             .get_args()
             .any(|argument| argument.to_string_lossy().starts_with("-force-")));
@@ -153,6 +208,7 @@ mod tests {
             Path::new("Game.app"),
             Path::new("install"),
             GraphicsApi::Metal,
+            &[],
         );
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -164,5 +220,33 @@ mod tests {
                 "-force-metal"
             ]
         );
+    }
+
+    #[test]
+    fn player_session_paths_are_forwarded_as_separate_arguments() {
+        let extra = crate::player_session::launch_arguments(
+            Path::new("install with spaces"),
+            Path::new("launcher with spaces"),
+        );
+        let command = player_command(
+            Path::new("game"),
+            Path::new("install with spaces"),
+            GraphicsApi::Auto,
+            &extra,
+        );
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert!(arguments.ends_with(&extra.iter().map(OsString::as_os_str).collect::<Vec<_>>()));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn explorer_handoff_preserves_spaces_quotes_and_trailing_slashes() {
+        let extra = [
+            OsString::from("plain"),
+            OsString::from("a path\\"),
+            OsString::from("quoted\"value"),
+        ];
+        let arguments = String::from_utf16(&explorer_arguments(GraphicsApi::Auto, &extra)).unwrap();
+        assert_eq!(arguments, "\"plain\" \"a path\\\\\" \"quoted\\\"value\"");
     }
 }
