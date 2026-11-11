@@ -1,6 +1,36 @@
 use crate::launch_settings::GraphicsApi;
 use std::{io, path::Path, process::Command};
 
+#[cfg(target_os = "linux")]
+const APPIMAGE_PATH_VARIABLES: [&str; 8] = [
+    "LD_LIBRARY_PATH",
+    "PATH",
+    "PYTHONPATH",
+    "XDG_DATA_DIRS",
+    "PERLLIB",
+    "QT_PLUGIN_PATH",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+];
+
+#[cfg(target_os = "linux")]
+const APPIMAGE_RUNTIME_VARIABLES: [&str; 14] = [
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "OWD",
+    "PYTHONHOME",
+    "GSETTINGS_SCHEMA_DIR",
+    "GI_TYPELIB_PATH",
+    "GIO_MODULE_DIR",
+    "GTK_DATA_PREFIX",
+    "GTK_THEME",
+    "GTK_EXE_PREFIX",
+    "GTK_PATH",
+    "GTK_IM_MODULE_FILE",
+    "GDK_PIXBUF_MODULE_FILE",
+];
+
 /// Starts an installed Unity player with its selected API and existing content location.
 pub(crate) fn launch(executable: &Path, base: &Path, api: GraphicsApi) -> io::Result<()> {
     let mut command = player_command(executable, base, api);
@@ -43,7 +73,56 @@ fn player_command(executable: &Path, base: &Path, api: GraphicsApi) -> Command {
     if let Some(argument) = api.argument() {
         command.arg(argument);
     }
+    #[cfg(target_os = "linux")]
+    sanitize_appimage_environment(&mut command);
     command
+}
+
+/// Removes launcher-owned AppImage paths before starting the installed Linux player.
+#[cfg(target_os = "linux")]
+fn sanitize_appimage_environment(command: &mut Command) {
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    sanitize_appimage_environment_from(command, Path::new(&appdir), std::env::var_os);
+}
+
+/// Applies AppImage environment overrides using values supplied by the launcher process.
+#[cfg(target_os = "linux")]
+fn sanitize_appimage_environment_from(
+    command: &mut Command,
+    appdir: &Path,
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for variable in APPIMAGE_PATH_VARIABLES {
+        let Some(value) = environment(variable) else {
+            continue;
+        };
+        match paths_outside_appimage(&value, appdir) {
+            Some(value) => {
+                command.env(variable, value);
+            }
+            None => {
+                command.env_remove(variable);
+            }
+        }
+    }
+
+    for variable in APPIMAGE_RUNTIME_VARIABLES {
+        command.env_remove(variable);
+    }
+}
+
+/// Returns a path list without entries supplied by the launcher's AppImage.
+#[cfg(target_os = "linux")]
+fn paths_outside_appimage(value: &std::ffi::OsStr, appdir: &Path) -> Option<std::ffi::OsString> {
+    let paths = std::env::split_paths(value)
+        .filter(|path| !path.starts_with(appdir))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    std::env::join_paths(paths).ok()
 }
 
 /// Asks the desktop's Explorer process to launch the player outside the launcher's job.
@@ -144,6 +223,77 @@ mod tests {
         assert!(!command
             .get_args()
             .any(|argument| argument.to_string_lossy().starts_with("-force-")));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn paths_outside_appimage_preserves_only_host_paths() {
+        let appdir = Path::new("/tmp/.mount_rebellion2");
+        let value = std::env::join_paths([
+            appdir.join("usr/lib"),
+            Path::new("/usr/lib").to_path_buf(),
+            appdir.join("lib64"),
+            Path::new("/opt/vendor/lib").to_path_buf(),
+        ])
+        .unwrap();
+
+        let filtered = paths_outside_appimage(&value, appdir).unwrap();
+
+        assert_eq!(
+            std::env::split_paths(&filtered).collect::<Vec<_>>(),
+            [Path::new("/usr/lib"), Path::new("/opt/vendor/lib")]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn paths_outside_appimage_removes_an_appimage_only_list() {
+        let appdir = Path::new("/tmp/.mount_rebellion2");
+        let value = std::env::join_paths([appdir.join("usr/lib"), appdir.join("lib64")]).unwrap();
+
+        assert!(paths_outside_appimage(&value, appdir).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sanitize_appimage_environment_from_clears_runtime_and_filters_path_variables() {
+        use std::collections::HashMap;
+
+        let appdir = Path::new("/tmp/.mount_rebellion2");
+        let values = HashMap::from([
+            (
+                "LD_LIBRARY_PATH",
+                std::env::join_paths([appdir.join("usr/lib"), Path::new("/usr/lib").into()])
+                    .unwrap(),
+            ),
+            (
+                "GST_PLUGIN_SYSTEM_PATH_1_0",
+                std::env::join_paths([appdir.join("usr/lib/gstreamer-1.0")]).unwrap(),
+            ),
+        ]);
+        let mut command = Command::new("game");
+
+        sanitize_appimage_environment_from(&mut command, appdir, |name| values.get(name).cloned());
+
+        let overrides = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("LD_LIBRARY_PATH")),
+            Some(&Some(std::ffi::OsString::from("/usr/lib")))
+        );
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("GST_PLUGIN_SYSTEM_PATH_1_0")),
+            Some(&None)
+        );
+        for variable in APPIMAGE_RUNTIME_VARIABLES {
+            assert_eq!(
+                overrides.get(std::ffi::OsStr::new(variable)),
+                Some(&None),
+                "{variable} should not reach the player"
+            );
+        }
     }
 
     #[test]
