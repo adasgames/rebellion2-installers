@@ -27,6 +27,14 @@ on:
         required: true
       ASSET_SOURCE_REPOSITORY:
         required: true
+      EOS_LINUX_CONFIG:
+        required: true
+      EOS_MACOS_CONFIG:
+        required: true
+      EOS_PRODUCT_CONFIG:
+        required: true
+      EOS_WINDOWS_CONFIG:
+        required: true
       REBELLION2_MEDIA_SSH_KEY:
         required: true
       R2_ACCESS_KEY_ID:
@@ -48,9 +56,10 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.target == 'StandaloneWindows64' && 'windows-2022' || 'ubuntu-latest' }}
     steps:
       - name: Free disk space
+        if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
           tool-cache: true
@@ -68,6 +77,14 @@ jobs:
           persist-credentials: false
           path: game
 
+      - name: Checkout build tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: adasgames/rebellion2-installers
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: tooling
+
       - name: Checkout build assets (git only, no LFS)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -79,6 +96,7 @@ jobs:
           path: game/.ci/assets
 
       - name: Fetch build assets
+        shell: bash
         working-directory: game/.ci/assets
         env:
           ASSET_LFS_PROXY_URL: ${{ secrets.ASSET_LFS_PROXY_URL }}
@@ -119,20 +137,15 @@ jobs:
           fi
 
       - name: Install build assets
-        working-directory: game
-        run: |
-          rm -rf Assets/Content
-          mkdir -p Assets/Content/Packs Assets/Art/Models/MainMenu
-          test -f .ci/assets/Content/Application/Schemas/game-config.xsd
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Content/Application/ Assets/Content/Application/
-          cp .ci/assets/Content/catalog.xml Assets/Content/catalog.xml
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' \
-            .ci/assets/Content/Packs/ClassicGalacticCivilWar/ \
-            Assets/Content/Packs/ClassicGalacticCivilWar/
-          rsync -a --delete --exclude=.DS_Store --exclude='*.meta' .ci/assets/Models/MainMenu/ Assets/Art/Models/MainMenu/
-          rsync -a --exclude=.DS_Store .ci/assets/UnityAssets/ Assets/
-          test -f Assets/Art/MainMenu/Planet/Flare/PurpleFlareMesh.asset
-          rm -rf .ci
+        run: node tooling/scripts/install-build-assets.mjs game
+
+      - name: Install EOS configuration
+        env:
+          EOS_LINUX_CONFIG: ${{ secrets.EOS_LINUX_CONFIG }}
+          EOS_MACOS_CONFIG: ${{ secrets.EOS_MACOS_CONFIG }}
+          EOS_PRODUCT_CONFIG: ${{ secrets.EOS_PRODUCT_CONFIG }}
+          EOS_WINDOWS_CONFIG: ${{ secrets.EOS_WINDOWS_CONFIG }}
+        run: node tooling/scripts/install-eos-config.mjs game
 
       - name: Cache Library
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -161,6 +174,7 @@ jobs:
           allowDirtyBuild: true
 
       - name: Verify companion editor and runtime layout
+        shell: bash
         run: |
           if [ -f game/Tools/package_desktop.py ]; then
             python3 game/Tools/package_desktop.py \
