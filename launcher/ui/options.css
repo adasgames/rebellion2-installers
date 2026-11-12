@@ -91,6 +91,9 @@
   margin: 8px 0 0;
   font-size: 12px;
 }
+.options-field {
+  margin-top: 18px;
+}
 .options-dialog .options-error {
   margin: 12px 0 0;
   color: #ff7b83;

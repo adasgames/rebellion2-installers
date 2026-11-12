@@ -13,7 +13,8 @@
   <form id="launcher-options-form">
     <label for="graphics-api">Graphics API</label>
     <select id="graphics-api" name="graphics-api">@@GRAPHICS_API_OPTIONS@@</select>
-    <p class="options-hint">Applies the next time you launch the game or Content Pack Editor.</p>
+    @@AUDIO_OPTIONS@@
+    <p class="options-hint">Applies the next time you launch the game or content pack editor.</p>
     <p class="options-error" id="options-error" role="alert"></p>
     <div class="options-actions">
       <button class="b secondary" type="button" onclick="document.getElementById('launcher-options').close()">Cancel</button>
@@ -36,8 +37,10 @@
     document.getElementById("launcher-options").addEventListener("close", function () {
       if (pendingScreen !== null) window.rebRenderScreen(pendingScreen);
     });
-    window.rebOpenOptions = function (value, error) {
+    window.rebOpenOptions = function (value, audio, error) {
       document.getElementById("graphics-api").value = value;
+      var audioSelect = document.getElementById("audio-backend");
+      if (audioSelect) audioSelect.value = audio;
       document.getElementById("options-error").textContent = error || "";
       document.getElementById("options-save").disabled = false;
       document.getElementById("launcher-options").showModal();
@@ -55,7 +58,9 @@
       event.preventDefault();
       document.getElementById("options-save").disabled = true;
       var value = document.getElementById("graphics-api").value;
-      window.location.href = "@@ACT@@?choice=save-options:" + encodeURIComponent(value);
+      var audioSelect = document.getElementById("audio-backend");
+      var audio = audioSelect ? audioSelect.value : "auto";
+      window.location.href = "@@ACT@@?choice=save-options:" + encodeURIComponent(value + ":" + audio);
     });
   })();
 </script>

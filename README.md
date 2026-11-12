@@ -58,6 +58,21 @@ Setup offers a separate optional desktop shortcut. You can also choose **Open ed
 3. Run the AppImage. The launcher stores the installed game and update metadata in your XDG data
    directory, normally **`~/.local/share/rebellion2`**.
 
+The launcher's **Options** dialog includes **Audio output** on Linux, alongside graphics selection:
+
+- **Automatic (recommended)** keeps working system audio and tries the installed PipeWire ALSA
+  plugin after a failed PulseAudio connection. Explicit ALSA environment overrides are preserved.
+- **System default** uses Unity's normal audio selection without the launcher fallback.
+- **PipeWire** explicitly selects the PipeWire ALSA route, including when PulseAudio is working.
+  If the server or plugin is unavailable, the launcher reports an error so another option can
+  be chosen.
+
+The selection is saved for the next game or content pack editor launch. It applies only to
+the launched player process; no packages are installed or system audio settings modified.
+PipeWire requires a running server and its ALSA plugin. Automatic mode preserves normal startup
+when its preflight is unavailable or exceeds five seconds. Direct executable launches bypass
+launcher options.
+
 The launcher checks separate signed channels for launcher updates and game updates. A launcher
 update downloads in the background, applies the next time the launcher starts, and does not replace
 the game. Game releases update the Windows, macOS, or Linux player together with its matching game
