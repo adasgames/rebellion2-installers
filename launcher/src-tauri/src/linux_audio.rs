@@ -1,6 +1,7 @@
-//! Selects a per-player PipeWire ALSA fallback after a failed PulseAudio connection.
+//! Applies the saved audio selection, including an automatic PipeWire ALSA fallback.
 //! Native checks run in a disposable process so a missing or stalled audio service cannot block play.
 
+use crate::launch_settings::AudioBackend;
 use libloading::Library;
 use std::{
     ffi::{c_char, c_int, c_void, OsStr, OsString},
@@ -18,26 +19,49 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONFIG_FILE: &str = ".rebellion2-pipewire.conf";
 const CONFIG: &str = "</usr/share/alsa/alsa.conf>\npcm.!default {\n    type pipewire\n}\nctl.!default {\n    type pipewire\n}\n";
 
-/// Recognizes only the private, argument-free audio preflight invocation.
-pub(crate) fn probe_requested(arguments: impl IntoIterator<Item = OsString>) -> bool {
+/// Recognizes the private preflight invocation and its supported probe mode.
+pub(crate) fn probe_selection(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Option<AudioBackend> {
     let mut arguments = arguments.into_iter();
-    arguments.next().is_some()
-        && arguments.next().as_deref() == Some(OsStr::new(PROBE_ARGUMENT))
-        && arguments.next().is_none()
+    arguments.next()?;
+    if arguments.next().as_deref() != Some(OsStr::new(PROBE_ARGUMENT)) {
+        return None;
+    }
+    let backend = match arguments.next().as_deref().and_then(OsStr::to_str) {
+        Some("auto") => AudioBackend::Auto,
+        Some("pipewire") => AudioBackend::Pipewire,
+        _ => return None,
+    };
+    arguments.next().is_none().then_some(backend)
 }
 
-/// Applies a verified fallback to the child alone, preserving explicitly supplied ALSA configuration.
-pub(crate) fn configure(player: &mut Command, base: &Path) -> io::Result<bool> {
-    if ["ALSA_CONFIG_PATH", "ALSA_CONFIG_DIR", "ALSA_PLUGIN_DIR"]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some())
-        || !Path::new("/usr/share/alsa/alsa.conf").is_file()
+/// Applies the saved route to the player alone, preserving system settings in automatic mode.
+pub(crate) fn configure(
+    player: &mut Command,
+    base: &Path,
+    backend: AudioBackend,
+) -> io::Result<bool> {
+    if backend == AudioBackend::System {
+        return Ok(false);
+    }
+    if backend == AudioBackend::Auto
+        && ["ALSA_CONFIG_PATH", "ALSA_CONFIG_DIR", "ALSA_PLUGIN_DIR"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
     {
         return Ok(false);
     }
     let mut probe = Command::new(std::env::current_exe()?);
-    probe.arg(PROBE_ARGUMENT).current_dir(base);
+    probe
+        .arg(PROBE_ARGUMENT)
+        .arg(backend.value())
+        .current_dir(base);
     if !run_probe(&mut probe, PROBE_TIMEOUT)? {
+        if backend == AudioBackend::Pipewire {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                "PipeWire audio is unavailable. Choose Automatic or System default in Options, or install PipeWire with ALSA support."));
+        }
         return Ok(false);
     }
     let config = base.join(CONFIG_FILE);
@@ -45,10 +69,15 @@ pub(crate) fn configure(player: &mut Command, base: &Path) -> io::Result<bool> {
         crate::write_file_atomically(config.clone(), CONFIG.as_bytes())?;
     }
     player.env("ALSA_CONFIG_PATH", config);
+    if backend == AudioBackend::Pipewire {
+        // Unity tries native PulseAudio before ALSA. A non-socket endpoint bypasses it for this
+        // player, ensuring the explicitly selected PipeWire route is used even when Pulse works.
+        player.env("PULSE_SERVER", "unix:/dev/null");
+    }
     Ok(true)
 }
 
-/// Reaps the preflight, killing it on timeout; every inconclusive result retains the normal route.
+/// Reaps the preflight, killing it on timeout and accepting only a verified PipeWire route.
 fn run_probe(command: &mut Command, timeout: Duration) -> io::Result<bool> {
     let mut child = command
         .stdin(Stdio::null())
@@ -75,11 +104,17 @@ fn run_probe(command: &mut Command, timeout: Duration) -> io::Result<bool> {
     }
 }
 
-/// Reports a fallback only when PulseAudio explicitly fails and the PipeWire PCM opens successfully.
-pub(crate) fn probe_exit_code() -> i32 {
-    match pulse_ready() {
-        Ok(false) if pipewire_available().unwrap_or(false) => PIPEWIRE_AVAILABLE,
-        _ => 0,
+/// Verifies the explicit PipeWire route, or the automatic fallback after a failed Pulse connection.
+pub(crate) fn probe_exit_code(backend: AudioBackend) -> i32 {
+    let needed = match backend {
+        AudioBackend::Auto => matches!(pulse_ready(), Ok(false)),
+        AudioBackend::Pipewire => true,
+        AudioBackend::System => false,
+    };
+    if needed && pipewire_available().unwrap_or(false) {
+        PIPEWIRE_AVAILABLE
+    } else {
+        0
     }
 }
 
@@ -181,18 +216,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_requested_only_accepts_the_private_argument_alone() {
+    fn probe_selection_only_accepts_supported_probe_modes() {
         for (arguments, expected) in [
-            (vec!["launcher", PROBE_ARGUMENT], true),
-            (vec!["launcher"], false),
-            (vec!["launcher", "--player-sign-in"], false),
-            (vec!["launcher", PROBE_ARGUMENT, "extra"], false),
+            (
+                vec!["launcher", PROBE_ARGUMENT, "auto"],
+                Some(AudioBackend::Auto),
+            ),
+            (
+                vec!["launcher", PROBE_ARGUMENT, "pipewire"],
+                Some(AudioBackend::Pipewire),
+            ),
+            (vec!["launcher", PROBE_ARGUMENT], None),
+            (vec!["launcher"], None),
+            (vec!["launcher", "--player-sign-in"], None),
+            (vec!["launcher", PROBE_ARGUMENT, "system"], None),
+            (vec!["launcher", PROBE_ARGUMENT, "pipewire", "extra"], None),
         ] {
             assert_eq!(
-                probe_requested(arguments.into_iter().map(OsString::from)),
+                probe_selection(arguments.into_iter().map(OsString::from)),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn configure_system_default_does_not_change_the_player_environment() {
+        let mut player = Command::new("game");
+        assert!(!configure(
+            &mut player,
+            Path::new("/nonexistent-install"),
+            AudioBackend::System
+        )
+        .unwrap());
+        assert_eq!(player.get_envs().count(), 0);
     }
 
     #[test]

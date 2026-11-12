@@ -1,6 +1,6 @@
 use crate::content_packs::{self, ContentPackRelease};
 use crate::downloads::DownloadError;
-use crate::launch_settings::GraphicsApi;
+use crate::launch_settings::{AudioBackend, GraphicsApi};
 use crate::release_notes::ReleaseNotes;
 use crate::ACT;
 use std::{error::Error, io};
@@ -116,7 +116,30 @@ fn options_controls(platform: &str) -> String {
         .collect::<String>();
     include_str!("../../ui/options.html")
         .replace("@@GRAPHICS_API_OPTIONS@@", &options)
+        .replace("@@AUDIO_OPTIONS@@", &audio_options_controls(platform))
         .replace("@@ACT@@", ACT)
+}
+
+/// Offers an audio route only on platforms with an implemented compatibility selection.
+fn audio_options_controls(platform: &str) -> String {
+    if platform != "linux" {
+        return String::new();
+    }
+    let options = AudioBackend::supported_on(platform)
+        .iter()
+        .map(|backend| {
+            format!(
+                "<option value=\"{}\">{}</option>",
+                backend.value(),
+                backend.label()
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"options-field\"><label for=\"audio-backend\">Audio output</label>\
+         <select id=\"audio-backend\" name=\"audio-backend\" aria-describedby=\"audio-hint\">{options}</select>\
+         <p class=\"options-hint\" id=\"audio-hint\">Automatic uses system audio with a PipeWire fallback. PipeWire requires ALSA support.</p></div>"
+    )
 }
 
 /// Renders the community link shared by provider selection and launcher screens.
@@ -577,6 +600,21 @@ mod tests {
                 assert!(!controls.contains(&format!("<option value=\"{value}\">")));
             }
         }
+    }
+
+    #[test]
+    fn options_offer_audio_selection_only_on_linux() {
+        let controls = options_controls("linux");
+        assert!(controls.contains("<label for=\"audio-backend\">Audio output</label>"));
+        for backend in ["auto", "system", "pipewire"] {
+            assert!(
+                audio_options_controls("linux").contains(&format!("<option value=\"{backend}\">"))
+            );
+        }
+        for platform in ["windows", "macos"] {
+            assert!(!options_controls(platform).contains("id=\"audio-backend\""));
+        }
+        assert!(!controls.contains("@@AUDIO_OPTIONS@@"));
     }
 
     #[test]

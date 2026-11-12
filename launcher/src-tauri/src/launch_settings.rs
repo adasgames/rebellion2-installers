@@ -72,11 +72,64 @@ impl GraphicsApi {
     }
 }
 
+/// Selects the system route or the Linux PipeWire compatibility route before Unity starts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AudioBackend {
+    #[default]
+    Auto,
+    System,
+    Pipewire,
+}
+
+impl AudioBackend {
+    /// Lists the audio selections implemented for the current platform.
+    pub(crate) fn supported_on(platform: &str) -> &'static [Self] {
+        match platform {
+            "linux" => &[Self::Auto, Self::System, Self::Pipewire],
+            _ => &[Self::Auto],
+        }
+    }
+
+    /// Validates a submitted selection against the current platform's supported routes.
+    pub(crate) fn from_selection(value: &str, platform: &str) -> io::Result<Self> {
+        Self::supported_on(platform)
+            .iter()
+            .copied()
+            .find(|backend| backend.value() == value)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Choose a supported audio output.",
+                )
+            })
+    }
+
+    /// Returns the persisted and form-submitted identifier.
+    pub(crate) fn value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::System => "system",
+            Self::Pipewire => "pipewire",
+        }
+    }
+
+    /// Returns the audio selection's user-facing name.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic (recommended)",
+            Self::System => "System default",
+            Self::Pipewire => "PipeWire",
+        }
+    }
+}
+
 /// Stores launcher preferences independently of installed game and content files.
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct LauncherSettings {
     pub(crate) graphics_api: GraphicsApi,
+    pub(crate) audio_backend: AudioBackend,
 }
 
 impl LauncherSettings {
@@ -89,7 +142,17 @@ impl LauncherSettings {
         };
         let settings: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         GraphicsApi::from_selection(settings.graphics_api.value(), platform)?;
+        AudioBackend::from_selection(settings.audio_backend.value(), platform)?;
         Ok(settings)
+    }
+
+    /// Parses both options together, retaining the earlier graphics-only submission format.
+    pub(crate) fn from_selection(value: &str, platform: &str) -> io::Result<Self> {
+        let (graphics, audio) = value.split_once(':').unwrap_or((value, "auto"));
+        Ok(Self {
+            graphics_api: GraphicsApi::from_selection(graphics, platform)?,
+            audio_backend: AudioBackend::from_selection(audio, platform)?,
+        })
     }
 
     /// Atomically replaces the user preference file after creating its parent directory.
@@ -168,7 +231,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config/settings.json");
         for api in [GraphicsApi::D3d11, GraphicsApi::D3d12, GraphicsApi::Auto] {
-            let settings = LauncherSettings { graphics_api: api };
+            let settings = LauncherSettings {
+                graphics_api: api,
+                ..LauncherSettings::default()
+            };
             settings.save(&path).unwrap();
             assert_eq!(LauncherSettings::load(&path, "windows").unwrap(), settings);
         }
@@ -186,5 +252,51 @@ mod tests {
             fs::write(&path, contents).unwrap();
             assert!(LauncherSettings::load(&path, "windows").is_err());
         }
+    }
+
+    #[test]
+    fn from_selection_audio_routes_are_available_only_on_linux() {
+        for audio in ["auto", "system", "pipewire"] {
+            assert!(LauncherSettings::from_selection(&format!("vulkan:{audio}"), "linux").is_ok());
+        }
+        for selection in [
+            "auto:pipewire",
+            "auto:system",
+            "auto:unknown",
+            "auto:pipewire:extra",
+        ] {
+            assert!(LauncherSettings::from_selection(selection, "windows").is_err());
+        }
+        assert!(LauncherSettings::from_selection("vulkan:pipewire:extra", "linux").is_err());
+        assert!(LauncherSettings::from_selection("vulkan:unknown", "linux").is_err());
+    }
+
+    #[test]
+    fn load_existing_graphics_preferences_default_audio_to_automatic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"graphics_api":"vulkan"}"#).unwrap();
+        let settings = LauncherSettings::load(&path, "linux").unwrap();
+        assert_eq!(settings.graphics_api, GraphicsApi::Vulkan);
+        assert_eq!(settings.audio_backend, AudioBackend::Auto);
+    }
+
+    #[test]
+    fn save_audio_and_graphics_preferences_survive_reopening() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for audio in ["pipewire", "system", "auto"] {
+            let settings =
+                LauncherSettings::from_selection(&format!("vulkan:{audio}"), "linux").unwrap();
+            settings.save(&path).unwrap();
+            assert_eq!(LauncherSettings::load(&path, "linux").unwrap(), settings);
+        }
+    }
+
+    #[test]
+    fn from_selection_legacy_graphics_submission_retains_automatic_audio() {
+        let settings = LauncherSettings::from_selection("vulkan", "linux").unwrap();
+        assert_eq!(settings.graphics_api, GraphicsApi::Vulkan);
+        assert_eq!(settings.audio_backend, AudioBackend::Auto);
     }
 }

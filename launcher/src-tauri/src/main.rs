@@ -76,7 +76,7 @@ use downloads::{
     clear_cache, clear_download_metadata, download_to_path, known_download_size, DownloadError,
     DownloadSpec,
 };
-use launch_settings::{GraphicsApi, LauncherSettings};
+use launch_settings::LauncherSettings;
 #[cfg(test)]
 use rebellion2_update_core::sha256_hex;
 use rebellion2_update_core::FileEntry;
@@ -413,8 +413,8 @@ fn default_blobs() -> String {
 fn main() {
     // Run native audio checks in an isolated child before taking the installation lock or opening GTK.
     #[cfg(target_os = "linux")]
-    if linux_audio::probe_requested(std::env::args_os()) {
-        std::process::exit(linux_audio::probe_exit_code());
+    if let Some(backend) = linux_audio::probe_selection(std::env::args_os()) {
+        std::process::exit(linux_audio::probe_exit_code(backend));
     }
     match player_session::sign_in_arguments(&std::env::args().collect::<Vec<_>>()) {
         Ok(Some(request)) => {
@@ -1160,26 +1160,25 @@ fn show_launcher_options(handle: &tauri::AppHandle) {
             log_line(&format!("[launcher] could not load options: {error}"));
             (
                 LauncherSettings::default(),
-                "Saved options could not be read. Choose an API and save to reset them.",
+                "Saved options could not be read. Choose your options and save to reset them.",
             )
         }
     };
     window_eval(
         handle,
         &format!(
-            "window.rebOpenOptions({},{});",
+            "window.rebOpenOptions({},{},{});",
             js_string(settings.graphics_api.value()),
+            js_string(settings.audio_backend.value()),
             js_string(message),
         ),
     );
 }
 
-/// Validates and persists a submitted API, reporting save failures inside the dialog.
+/// Validates and persists the submitted graphics and audio selections together.
 fn save_launcher_options(handle: &tauri::AppHandle, value: &str) {
-    let result =
-        GraphicsApi::from_selection(value, std::env::consts::OS).and_then(|graphics_api| {
-            LauncherSettings { graphics_api }.save(&launcher_settings_path(handle)?)
-        });
+    let result = LauncherSettings::from_selection(value, std::env::consts::OS)
+        .and_then(|settings| settings.save(&launcher_settings_path(handle)?));
     let message = match result {
         Ok(()) => "",
         Err(error) => {
@@ -3986,7 +3985,7 @@ fn start_install(handle: tauri::AppHandle, url: String) {
                         show_message(
                             &handle,
                             "Couldn't start",
-                            "The game failed to start — see launcher.log.",
+                            &format!("The game failed to start: {err}"),
                             Some(("Retry", "play")),
                         );
                     }
@@ -5709,16 +5708,17 @@ fn launch_player(handle: &tauri::AppHandle, exe: &Path) -> io::Result<bool> {
         }
     };
     log_line(&format!(
-        "[launcher] launching {} using {}",
+        "[launcher] launching {} using {} graphics and {} audio",
         exe.display(),
-        settings.graphics_api.label()
+        settings.graphics_api.label(),
+        settings.audio_backend.label()
     ));
     #[cfg(target_os = "linux")]
     ensure_linux_player_executables(&base)?;
     player_launch::launch(
         exe,
         &base,
-        settings.graphics_api,
+        &settings,
         &player_session::launch_arguments(&base, &launcher_path()?),
     )?;
     Ok(true)

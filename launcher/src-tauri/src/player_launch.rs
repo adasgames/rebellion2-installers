@@ -1,20 +1,24 @@
-use crate::launch_settings::GraphicsApi;
+use crate::launch_settings::{GraphicsApi, LauncherSettings};
 use std::{ffi::OsString, io, path::Path, process::Command};
 
 /// Starts an installed Unity player with its selected API and existing content location.
 pub(crate) fn launch(
     executable: &Path,
     base: &Path,
-    api: GraphicsApi,
+    settings: &LauncherSettings,
     extra_arguments: &[OsString],
 ) -> io::Result<()> {
+    let api = settings.graphics_api;
     let mut command = player_command(executable, base, api, extra_arguments);
     #[cfg(target_os = "linux")]
-    match crate::linux_audio::configure(&mut command, base) {
-        Ok(true) => crate::log_line(
-            "[launcher] PulseAudio connection failed; using the verified PipeWire ALSA route for this player.",
-        ),
+    match crate::linux_audio::configure(&mut command, base, settings.audio_backend) {
+        Ok(true) => {
+            crate::log_line("[launcher] using the verified PipeWire ALSA route for this player.")
+        }
         Ok(false) => {}
+        Err(error) if settings.audio_backend == crate::launch_settings::AudioBackend::Pipewire => {
+            return Err(error)
+        }
         Err(error) => crate::log_line(&format!(
             "[launcher] audio preflight unavailable ({error}); preserving system audio settings."
         )),

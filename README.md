@@ -58,13 +58,20 @@ Setup offers a separate optional desktop shortcut. You can also choose **Open ed
 3. Run the AppImage. The launcher stores the installed game and update metadata in your XDG data
    directory, normally **`~/.local/share/rebellion2`**.
 
-Before starting the game or content pack editor, the Linux launcher checks its PulseAudio
-connection. If that connection fails, it tries the installed PipeWire ALSA plugin. When that
-route opens successfully, the launcher applies a private ALSA configuration to the player
-process only. This requires a working PipeWire server and its ALSA plugin; it does not install
-packages or change system audio configuration. Working PulseAudio connections and explicit
-`ALSA_CONFIG_PATH`, `ALSA_CONFIG_DIR`, or `ALSA_PLUGIN_DIR` overrides retain their normal route.
-An unavailable or stalled preflight also preserves normal startup.
+The launcher's **Options** dialog includes **Audio output** on Linux, alongside graphics selection:
+
+- **Automatic (recommended)** keeps working system audio and tries the installed PipeWire ALSA
+  plugin after a failed PulseAudio connection. Explicit ALSA environment overrides are preserved.
+- **System default** uses Unity's normal audio selection without the launcher fallback.
+- **PipeWire** explicitly selects the PipeWire ALSA route, including when PulseAudio is working.
+  If the server or plugin is unavailable, the launcher reports an error so another option can
+  be chosen.
+
+The selection is saved for the next game or content pack editor launch. It applies only to
+the launched player process; no packages are installed or system audio settings modified.
+PipeWire requires a running server and its ALSA plugin. Automatic mode preserves normal startup
+when its preflight is unavailable or exceeds five seconds. Direct executable launches bypass
+launcher options.
 
 The launcher checks separate signed channels for launcher updates and game updates. A launcher
 update downloads in the background, applies the next time the launcher starts, and does not replace
