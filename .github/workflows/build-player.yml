@@ -77,6 +77,14 @@ jobs:
           persist-credentials: false
           path: game
 
+      - name: Checkout build tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: adasgames/rebellion2-installers
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: tooling
+
       - name: Checkout build assets (git only, no LFS)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -129,7 +137,7 @@ jobs:
           fi
 
       - name: Install build assets
-        run: node scripts/install-build-assets.mjs game
+        run: node tooling/scripts/install-build-assets.mjs game
 
       - name: Install EOS configuration
         env:
@@ -137,7 +145,7 @@ jobs:
           EOS_MACOS_CONFIG: ${{ secrets.EOS_MACOS_CONFIG }}
           EOS_PRODUCT_CONFIG: ${{ secrets.EOS_PRODUCT_CONFIG }}
           EOS_WINDOWS_CONFIG: ${{ secrets.EOS_WINDOWS_CONFIG }}
-        run: node scripts/install-eos-config.mjs game
+        run: node tooling/scripts/install-eos-config.mjs game
 
       - name: Cache Library
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
