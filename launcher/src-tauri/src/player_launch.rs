@@ -9,6 +9,16 @@ pub(crate) fn launch(
     extra_arguments: &[OsString],
 ) -> io::Result<()> {
     let mut command = player_command(executable, base, api, extra_arguments);
+    #[cfg(target_os = "linux")]
+    match crate::linux_audio::configure(&mut command, base) {
+        Ok(true) => crate::log_line(
+            "[launcher] PulseAudio connection failed; using the verified PipeWire ALSA route for this player.",
+        ),
+        Ok(false) => {}
+        Err(error) => crate::log_line(&format!(
+            "[launcher] audio preflight unavailable ({error}); preserving system audio settings."
+        )),
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

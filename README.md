@@ -58,6 +58,14 @@ Setup offers a separate optional desktop shortcut. You can also choose **Open ed
 3. Run the AppImage. The launcher stores the installed game and update metadata in your XDG data
    directory, normally **`~/.local/share/rebellion2`**.
 
+Before starting the game or content pack editor, the Linux launcher checks its PulseAudio
+connection. If that connection fails, it tries the installed PipeWire ALSA plugin. When that
+route opens successfully, the launcher applies a private ALSA configuration to the player
+process only. This requires a working PipeWire server and its ALSA plugin; it does not install
+packages or change system audio configuration. Working PulseAudio connections and explicit
+`ALSA_CONFIG_PATH`, `ALSA_CONFIG_DIR`, or `ALSA_PLUGIN_DIR` overrides retain their normal route.
+An unavailable or stalled preflight also preserves normal startup.
+
 The launcher checks separate signed channels for launcher updates and game updates. A launcher
 update downloads in the background, applies the next time the launcher starts, and does not replace
 the game. Game releases update the Windows, macOS, or Linux player together with its matching game

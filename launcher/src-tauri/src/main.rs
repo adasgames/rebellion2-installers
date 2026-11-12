@@ -17,6 +17,8 @@ mod browser_signin;
 mod content_packs;
 mod downloads;
 mod launch_settings;
+#[cfg(target_os = "linux")]
+mod linux_audio;
 mod manifests;
 mod player_launch;
 mod player_session;
@@ -409,6 +411,11 @@ fn default_blobs() -> String {
 }
 
 fn main() {
+    // Run native audio checks in an isolated child before taking the installation lock or opening GTK.
+    #[cfg(target_os = "linux")]
+    if linux_audio::probe_requested(std::env::args_os()) {
+        std::process::exit(linux_audio::probe_exit_code());
+    }
     match player_session::sign_in_arguments(&std::env::args().collect::<Vec<_>>()) {
         Ok(Some(request)) => {
             let _ = PLAYER_SIGN_IN.set(request);
