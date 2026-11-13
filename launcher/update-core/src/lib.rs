@@ -622,18 +622,16 @@ fn validate_managed_path(root: &Path, relative: &str) -> io::Result<()> {
 }
 
 fn metadata_is_plain_directory(metadata: &fs::Metadata) -> bool {
-    if !metadata.file_type().is_dir() {
-        return false;
-    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        metadata.file_type().is_dir()
+            && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
     #[cfg(not(target_os = "windows"))]
     {
-        true
+        metadata.file_type().is_dir()
     }
 }
 
