@@ -25,6 +25,7 @@ pub(crate) fn launch(
     }
     #[cfg(target_os = "windows")]
     {
+        crate::windows_audio::record();
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;

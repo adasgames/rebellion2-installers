@@ -99,6 +99,33 @@ jobs:
             launcher-blobs-windows
           Compress-Archive -Path launcher-layer\* -DestinationPath Rebellion2-launcher-Windows.zip
 
+      - name: Verify Windows audio diagnostic entry point
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $audioOutput = Join-Path $env:RUNNER_TEMP 'windows-audio-diagnostic.txt'
+          $audioError = Join-Path $env:RUNNER_TEMP 'windows-audio-diagnostic-error.txt'
+          $audioProcess = Start-Process `
+            -FilePath "$PWD/launcher/src-tauri/target/release/rebellion2-launcher.exe" `
+            -ArgumentList '--probe-windows-audio' `
+            -RedirectStandardOutput $audioOutput `
+            -RedirectStandardError $audioError `
+            -PassThru
+          if (-not $audioProcess.WaitForExit(10000)) {
+            $audioProcess.Kill()
+            throw 'The Windows audio diagnostic did not finish within ten seconds.'
+          }
+          $audioProcess.Refresh()
+          if ($audioProcess.ExitCode -ne 0) {
+            Get-Content $audioError
+            throw "The Windows audio diagnostic exited with $($audioProcess.ExitCode)."
+          }
+          $audioReport = Get-Content $audioOutput -Raw
+          if (-not $audioReport.Contains('Windows output diagnostic')) {
+            throw 'The Windows audio diagnostic returned no report.'
+          }
+          Write-Output $audioReport
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: launcher-windows

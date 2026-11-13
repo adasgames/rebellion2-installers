@@ -25,6 +25,8 @@ mod player_session;
 mod presentation;
 mod release_notes;
 mod versions;
+#[cfg(any(target_os = "windows", test))]
+mod windows_audio;
 
 #[cfg(any(target_os = "windows", test))]
 use manifests::validate_application_manifest;
@@ -411,6 +413,14 @@ fn default_blobs() -> String {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if windows_audio::is_probe(std::env::args_os()) {
+        std::process::exit(if windows_audio::write_probe_report().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
     // Run native audio checks in an isolated child before taking the installation lock or opening GTK.
     #[cfg(target_os = "linux")]
     if let Some(backend) = linux_audio::probe_selection(std::env::args_os()) {
