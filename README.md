@@ -45,6 +45,12 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 When included with your game version, the Content Pack Editor also appears in the Start Menu.
 Setup offers a separate optional desktop shortcut. You can also choose **Open editor** in the launcher.
 
+Before launching the game or editor on Windows, the launcher records an audio diagnostic in
+`launcher.log` beside the launcher. It includes default output devices, their current formats,
+and Windows results for temporary shared audio streams. The check does not play sound or change
+audio settings. If its separate helper fails or exceeds five seconds, the launcher records that
+and continues launching normally.
+
 ### macOS
 1. Unzip **`Rebellion2-macOS.zip`**.
 2. Drag **`Rebellion II.app`** into your **Applications** folder. The launcher and game are both
