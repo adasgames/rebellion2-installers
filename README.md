@@ -47,9 +47,13 @@ Setup offers a separate optional desktop shortcut. You can also choose **Open ed
 
 Before launching the game or editor on Windows, the launcher records an audio diagnostic in
 `launcher.log` beside the launcher. It includes default output devices, their current formats,
-and Windows results for temporary shared audio streams. The check does not play sound or change
-audio settings. If its separate helper fails or exceeds five seconds, the launcher records that
-and continues launching normally.
+and Windows results for temporary shared audio streams. The format comparisons separate two
+versus eight channels, 16-bit versus 32-bit integer PCM, and 32-bit floating-point output at
+48 kHz. Both ordinary and event-driven opens are tested, along with the actual closest format
+Windows suggests. Players launch normally and provide the existing `launcher.log`; no separate
+diagnostic download, script or repository checkout is required. The check does not play sound or
+change audio settings. If its separate helper fails or exceeds five seconds, the launcher records
+that and continues launching normally.
 
 ### macOS
 1. Unzip **`Rebellion2-macOS.zip`**.
