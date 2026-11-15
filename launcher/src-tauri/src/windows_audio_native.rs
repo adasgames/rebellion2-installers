@@ -2,14 +2,15 @@
 
 use std::{fmt::Write, ptr};
 use windows::{
-    core::{Error, HRESULT},
+    core::{Error, GUID, HRESULT},
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Media::{
             Audio::{
                 eCommunications, eConsole, eMultimedia, eRender, IAudioClient, IMMDevice,
                 IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
-                DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+                WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
             },
             KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
         },
@@ -24,7 +25,7 @@ use windows::{
 /// Collects local endpoint evidence; the parent process owns the overall time limit.
 pub(super) fn collect() -> String {
     let mut report = String::from(
-        "Windows output diagnostic\nIndependent Core Audio checks; these results do not capture Unity's own audio-client calls.\nShared-mode streams are initialized and released without starting playback.\n",
+        "Windows output diagnostic v2\nIndependent Core Audio checks; these results do not capture Unity's own audio-client calls.\nShared-mode streams are initialized and released without starting playback.\n",
     );
     // SAFETY: This is a fresh helper thread with no existing COM users. All COM references are
     // confined to collect_endpoints and dropped before the matching CoUninitialize call.
@@ -113,7 +114,7 @@ unsafe fn friendly_name(device: &IMMDevice) -> windows::core::Result<String> {
     Ok(unsafe { text.to_string() }?)
 }
 
-/// Probes the native mix and the 48 kHz/44.1 kHz stereo PCM representations.
+/// Separates channel count, sample representation and callback mode on each endpoint.
 unsafe fn inspect_formats(device: &IMMDevice, report: &mut String) -> windows::core::Result<()> {
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
     match unsafe { client.GetMixFormat() } {
@@ -122,7 +123,16 @@ unsafe fn inspect_formats(device: &IMMDevice, report: &mut String) -> windows::c
             let _ = writeln!(report, "  Native mix: {}", unsafe {
                 describe_format(pointer)
             });
-            unsafe { initialize_shared(device, pointer, "native mix", report) };
+            let status = unsafe { initialize_client(&client, pointer, 0) };
+            let _ = writeln!(
+                report,
+                "  Initialize native mix on original client: {}",
+                status_text(status)
+            );
+            // Release the original stream before opening independent clients, keeping the
+            // comparison free of an extra concurrent initialized stream on this endpoint.
+            drop(client);
+            unsafe { inspect_format(device, pointer, "native mix", report)? };
         }
         Ok(_) => {
             let _ = writeln!(report, "  GetMixFormat returned a null format");
@@ -136,60 +146,75 @@ unsafe fn inspect_formats(device: &IMMDevice, report: &mut String) -> windows::c
         unsafe {
             inspect_format(
                 device,
-                &client,
                 &standard,
-                &format!("{rate} Hz PCM"),
+                &format!("{rate} Hz PCM, 16-bit stereo"),
                 report,
-            );
+            )?;
         }
-        let extensible = WAVEFORMATEXTENSIBLE {
-            Format: WAVEFORMATEX {
-                wFormatTag: 0xfffe,
-                cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
-                ..standard
-            },
-            Samples: WAVEFORMATEXTENSIBLE_0 {
-                wValidBitsPerSample: 16,
-            },
-            dwChannelMask: 3, // Front left and front right.
-            SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-        };
-        unsafe {
-            inspect_format(
-                device,
-                &client,
-                ptr::addr_of!(extensible.Format),
-                &format!("{rate} Hz extensible PCM"),
-                report,
-            );
+        // The 48 kHz extensible PCM16 stereo control is included in the matrix below.
+        if rate == 44_100 {
+            let format = extensible_format(rate, 2, 16, KSDATAFORMAT_SUBTYPE_PCM);
+            unsafe {
+                inspect_format(
+                    device,
+                    ptr::addr_of!(format.Format),
+                    "44100 Hz extensible PCM, 16-bit stereo",
+                    report,
+                )?;
+            }
+        }
+    }
+    for channels in [2, 8] {
+        for (encoding, bits, subtype) in [
+            (
+                "float32",
+                32,
+                GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71),
+            ),
+            ("PCM32", 32, KSDATAFORMAT_SUBTYPE_PCM),
+            ("PCM16", 16, KSDATAFORMAT_SUBTYPE_PCM),
+        ] {
+            let format = extensible_format(48_000, channels, bits, subtype);
+            unsafe {
+                inspect_format(
+                    device,
+                    ptr::addr_of!(format.Format),
+                    &format!("48000 Hz, {channels} channels, {encoding}, extensible"),
+                    report,
+                )?;
+            }
         }
     }
     Ok(())
 }
 
-/// Logs exact support status, any closest format, and the result of a fresh shared audio client.
+/// Checks support and actual opens on fresh clients, including any suggested closest format.
 unsafe fn inspect_format(
     device: &IMMDevice,
-    client: &IAudioClient,
     format: *const WAVEFORMATEX,
     label: &str,
     report: &mut String,
-) {
+) -> windows::core::Result<()> {
+    let _ = writeln!(report, "  Format {label}: {}", unsafe {
+        describe_format(format)
+    });
+    let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
     let mut closest = ptr::null_mut();
     let status =
         unsafe { client.IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, format, Some(&mut closest)) };
     let _memory = TaskMemory(closest);
-    let _ = writeln!(
-        report,
-        "  Support {label}, 16-bit stereo: {}",
-        status_text(status)
-    );
+    let _ = writeln!(report, "  Support {label}: {}", status_text(status));
     if !closest.is_null() {
         let _ = writeln!(report, "    Closest: {}", unsafe {
             describe_format(closest)
         });
+        unsafe { initialize_shared(device, closest, "closest alternative", 0, report) };
     }
-    unsafe { initialize_shared(device, format, label, report) };
+    drop(client);
+    for flags in [0, AUDCLNT_STREAMFLAGS_EVENTCALLBACK] {
+        unsafe { initialize_shared(device, format, label, flags, report) };
+    }
+    Ok(())
 }
 
 /// Opens a temporary shared stream with a 100 ms buffer, without ever calling Start.
@@ -197,22 +222,54 @@ unsafe fn initialize_shared(
     device: &IMMDevice,
     format: *const WAVEFORMATEX,
     label: &str,
+    flags: u32,
     report: &mut String,
 ) {
-    let result = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }.and_then(|client| {
-        // SAFETY: The caller owns a valid format allocation for this synchronous call. A new
-        // client is used for each attempt and released immediately without starting playback.
-        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }
-    });
-    let status = match result {
-        Ok(()) => HRESULT(0),
+    let status = match unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) } {
+        Ok(client) => unsafe { initialize_client(&client, format, flags) },
         Err(error) => error.code(),
     };
     let _ = writeln!(
         report,
-        "  Initialize shared {label}: {}",
+        "  Initialize shared {label}, flags=0x{flags:08X}: {}",
         status_text(status)
     );
+}
+
+/// Borrows one live format for synchronous initialization and preserves its exact HRESULT.
+unsafe fn initialize_client(
+    client: &IAudioClient,
+    format: *const WAVEFORMATEX,
+    flags: u32,
+) -> HRESULT {
+    // SAFETY: The caller owns the complete format allocation for this synchronous call. The
+    // client is initialized at most once and never started, including event-driven clients.
+    match unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 1_000_000, 0, format, None) }
+    {
+        Ok(()) => HRESULT(0),
+        Err(error) => error.code(),
+    }
+}
+
+/// Builds the same extensible container for the channel and sample representation comparisons.
+fn extensible_format(rate: u32, channels: u16, bits: u16, subtype: GUID) -> WAVEFORMATEXTENSIBLE {
+    let alignment = channels * bits / 8;
+    WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: 0xfffe,
+            nChannels: channels,
+            nSamplesPerSec: rate,
+            nAvgBytesPerSec: rate * u32::from(alignment),
+            nBlockAlign: alignment,
+            wBitsPerSample: bits,
+            cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
+        },
+        Samples: WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: bits,
+        },
+        dwChannelMask: if channels == 2 { 3 } else { 0x63f },
+        SubFormat: subtype,
+    }
 }
 
 /// Builds the standard 16-bit stereo representation, without changing endpoint settings.
@@ -237,8 +294,10 @@ unsafe fn describe_format(pointer: *const WAVEFORMATEX) -> String {
         format.wBitsPerSample,
         format.wFormatTag,
     );
-    let mut description =
-        format!("{rate} Hz, {channels} channels, {bits} bits, format tag 0x{tag:04X}");
+    let (alignment, byte_rate, extra) = (format.nBlockAlign, format.nAvgBytesPerSec, format.cbSize);
+    let mut description = format!(
+        "{rate} Hz, {channels} channels, {bits} bits, format tag 0x{tag:04X}, block align {alignment}, bytes/sec {byte_rate}, extra bytes {extra}"
+    );
     if tag == 0xfffe
         && usize::from(format.cbSize)
             >= size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()
@@ -252,6 +311,18 @@ unsafe fn describe_format(pointer: *const WAVEFORMATEX) -> String {
             description,
             ", {valid_bits} valid bits, channel mask 0x{mask:08X}, subtype {subtype:?}"
         );
+    }
+    // SAFETY: The caller owns the format and all cbSize extension bytes, whether allocated by
+    // Core Audio or constructed above. Record those exact bytes without changing them.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            pointer.cast::<u8>(),
+            size_of::<WAVEFORMATEX>() + usize::from(extra),
+        )
+    };
+    description.push_str(", bytes=");
+    for byte in bytes {
+        let _ = write!(description, "{byte:02X}");
     }
     description
 }
@@ -274,5 +345,66 @@ impl<T> Drop for TaskMemory<T> {
         // SAFETY: Each instance uniquely owns a CoTaskMem allocation returned by Core Audio.
         // The allocator explicitly permits a null pointer.
         unsafe { CoTaskMemFree(Some(self.0.cast())) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_payloads_match_the_captured_windows_format_bytes() {
+        // These are the six complete WAVEFORMATEXTENSIBLE payloads recorded by the native
+        // Windows control. Keep representation and channel layout independent in the probe.
+        for (channels, bits, float, expected) in [
+            (
+                2,
+                32,
+                true,
+                "FEFF020080BB000000DC05000800200016002000030000000300000000001000800000AA00389B71",
+            ),
+            (
+                2,
+                32,
+                false,
+                "FEFF020080BB000000DC05000800200016002000030000000100000000001000800000AA00389B71",
+            ),
+            (
+                2,
+                16,
+                false,
+                "FEFF020080BB000000EE02000400100016001000030000000100000000001000800000AA00389B71",
+            ),
+            (
+                8,
+                32,
+                true,
+                "FEFF080080BB00000070170020002000160020003F0600000300000000001000800000AA00389B71",
+            ),
+            (
+                8,
+                32,
+                false,
+                "FEFF080080BB00000070170020002000160020003F0600000100000000001000800000AA00389B71",
+            ),
+            (
+                8,
+                16,
+                false,
+                "FEFF080080BB000000B80B0010001000160010003F0600000100000000001000800000AA00389B71",
+            ),
+        ] {
+            let subtype = if float {
+                GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71)
+            } else {
+                KSDATAFORMAT_SUBTYPE_PCM
+            };
+            let format = extensible_format(48_000, channels, bits, subtype);
+            let description = unsafe { describe_format(ptr::addr_of!(format.Format)) };
+            assert!(
+                description.ends_with(&format!("bytes={expected}")),
+                "{description}"
+            );
+        }
     }
 }
