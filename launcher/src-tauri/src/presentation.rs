@@ -354,6 +354,7 @@ pub(crate) fn ready_buttons(play_label: &str, editor_installed: bool) -> String 
         buttons.push_str(&secondary_button("Open editor", "open-editor"));
     }
     buttons.push_str(&secondary_button("Content packs", "content-packs"));
+    buttons.push_str(&secondary_button("Mods", "mods"));
     buttons
 }
 

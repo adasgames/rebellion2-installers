@@ -76,6 +76,8 @@ jobs:
           REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
           REB2_CONTENT_PACK_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content-packs.invalid/' || secrets.REB2_CONTENT_PACK_BASE_URL }}
+          MODIO_GAME_ID: ${{ github.event_name != 'pull_request' && vars.MODIO_GAME_ID || '' }}
+          MODIO_API_KEY: ${{ github.event_name != 'pull_request' && secrets.MODIO_API_KEY || '' }}
           REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:REB2_AUTH_BASE_URL)) {
@@ -167,6 +169,8 @@ jobs:
           REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
           REB2_CONTENT_PACK_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content-packs.invalid/' || secrets.REB2_CONTENT_PACK_BASE_URL }}
+          MODIO_GAME_ID: ${{ github.event_name != 'pull_request' && vars.MODIO_GAME_ID || '' }}
+          MODIO_API_KEY: ${{ github.event_name != 'pull_request' && secrets.MODIO_API_KEY || '' }}
           REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
@@ -256,6 +260,8 @@ jobs:
           REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
           REB2_CONTENT_PACK_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content-packs.invalid/' || secrets.REB2_CONTENT_PACK_BASE_URL }}
+          MODIO_GAME_ID: ${{ github.event_name != 'pull_request' && vars.MODIO_GAME_ID || '' }}
+          MODIO_API_KEY: ${{ github.event_name != 'pull_request' && secrets.MODIO_API_KEY || '' }}
           REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail

@@ -84,6 +84,26 @@ update downloads in the background, applies the next time the launcher starts, a
 the game. Game releases update the Windows, macOS, or Linux player together with its matching game
 content.
 
+## Community mods
+
+Choose **Mods** to browse the mod.io catalog, search by name, and install or update community
+content. These actions use the public catalog and do not require a mod.io account. The launcher
+and the game's **Options > Mods** page share the same installed files and published archive
+identities, including content packs exported by the editor.
+
+Downloads are verified before extraction. Packages must contain a `pack.xml` content pack or
+a `mod.xml` overlay with its `Content` directory. Required base packs and versions must be
+installed first. Managed installs use `Mods/modio-<mod ID>` and a shared `.modio.json` record;
+manually installed mods are preserved.
+
+Development builds read `MODIO_GAME_ID` and `MODIO_API_KEY` from the environment. Release builds
+embed these public catalog credentials at compilation time. `MODIO_API_BASE_URL` optionally
+overrides the game's default API endpoint. Publishing and account access tokens are not part of
+this integration.
+
+Release automation reads the game ID from the `MODIO_GAME_ID` repository variable and the API key
+from the `MODIO_API_KEY` repository secret. Pull-request builds omit the production credentials.
+
 ## Multiplayer sign-in
 
 The game reuses the store identity cached by the launcher. When another sign-in is needed, it opens
