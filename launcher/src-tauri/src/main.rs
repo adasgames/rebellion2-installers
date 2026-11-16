@@ -20,7 +20,6 @@ mod launch_settings;
 #[cfg(target_os = "linux")]
 mod linux_audio;
 mod manifests;
-mod modio;
 mod player_launch;
 mod player_session;
 mod presentation;
@@ -190,8 +189,6 @@ static PENDING_LAUNCHER_UPDATE: Mutex<Option<PendingUpdate<LauncherUpdate>>> = M
 static PENDING_GAME_UPDATE: Mutex<Option<PendingUpdate<GameUpdate>>> = Mutex::new(None);
 /// The last validated optional-pack catalog shown by the launcher.
 static CONTENT_PACK_CATALOG: Mutex<Option<ContentPackCatalog>> = Mutex::new(None);
-static MODIO_BROWSER_STATE: Mutex<(String, usize)> = Mutex::new((String::new(), 0));
-static MODIO_BROWSER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Set after this launcher session downloads an update for its next start.
 static LAUNCHER_UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
 /// A newer application release waiting for the user to approve its installation.
@@ -745,14 +742,7 @@ fn on_nav(handle: &tauri::AppHandle, url: &tauri::Url) -> bool {
     // In-window button: intercept, don't navigate.
     if target.starts_with(ACT) {
         if let Some(choice) = query(url, "choice") {
-            if choice == "modio-search" {
-                on_choice(
-                    handle,
-                    &format!("modio-search:{}", query(url, "query").unwrap_or_default()),
-                );
-            } else {
-                on_choice(handle, &choice);
-            }
+            on_choice(handle, &choice);
         }
         return false;
     }
@@ -1214,9 +1204,6 @@ fn save_launcher_options(handle: &tauri::AppHandle, value: &str) {
 
 /// Handles a button click from any of the launcher screens.
 fn on_choice(handle: &tauri::AppHandle, choice: &str) {
-    if choice != "mods" && !choice.starts_with("modio-") {
-        MODIO_BROWSER_GENERATION.fetch_add(1, Ordering::Relaxed);
-    }
     if choice == "options" {
         show_launcher_options(handle);
         return;
@@ -1295,23 +1282,6 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         start_content_pack_install(handle, id);
         return;
     }
-    if let Some(query) = choice.strip_prefix("modio-search:") {
-        show_modio_browser(handle, query.to_string(), 0, None);
-        return;
-    }
-    if let Some(page) = choice.strip_prefix("modio-page:") {
-        if let Ok(offset) = page.parse::<usize>() {
-            let search = MODIO_BROWSER_STATE.lock().unwrap().0.clone();
-            show_modio_browser(handle, search, offset, None);
-        }
-        return;
-    }
-    if let Some(id) = choice.strip_prefix("modio-install:") {
-        if let Ok(id) = id.parse::<i64>() {
-            start_modio_install(handle, id);
-        }
-        return;
-    }
     if let Some(id) = choice.strip_prefix("content-pack-remove:") {
         start_content_pack_remove(handle, id);
         return;
@@ -1354,7 +1324,6 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             }
         }
         "content-packs" => show_content_pack_manager(handle),
-        "mods" => show_modio_browser(handle, String::new(), 0, None),
         "back-to-ready" => {
             let version = install_dir()
                 .ok()
@@ -4467,181 +4436,6 @@ fn pending_installed_content_pack_update(
     })
 }
 
-/// Loads one community catalog page without blocking the window or reviving a closed browser.
-fn show_modio_browser(
-    handle: &tauri::AppHandle,
-    search: String,
-    offset: usize,
-    notice: Option<String>,
-) {
-    let generation = MODIO_BROWSER_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    *MODIO_BROWSER_STATE.lock().unwrap() = (search.clone(), offset);
-    write_screen(
-        handle,
-        &render(
-            "Community mods",
-            true,
-            "Loading community mods…",
-            &secondary_button("Back", "back-to-ready"),
-        ),
-    );
-    let handle = handle.clone();
-    thread::spawn(move || {
-        let result = modio::Configuration::load().and_then(|configuration| {
-            let page = configuration.browse(&search, offset)?;
-            let root = install_dir()?;
-            Ok(modio_manager_screen(
-                &page,
-                &root,
-                configuration.game_id,
-                &search,
-                notice.as_deref(),
-            ))
-        });
-        if generation != MODIO_BROWSER_GENERATION.load(Ordering::Relaxed) {
-            return;
-        }
-        match result {
-            Ok(screen) => write_screen(&handle, &screen),
-            Err(error) => show_modio_error(&handle, &error),
-        }
-    });
-}
-
-/// Projects public catalog entries and shared installation records into escaped launcher cards.
-fn modio_manager_screen(
-    page: &modio::Page,
-    root: &Path,
-    game_id: i64,
-    search: &str,
-    notice: Option<&str>,
-) -> String {
-    let mut content = format!(
-        "<form class=\"mod-search\" action=\"{ACT}\" method=\"get\"><input type=\"hidden\" name=\"choice\" value=\"modio-search\"><input name=\"query\" aria-label=\"Search community mods\" placeholder=\"Search community mods\" value=\"{}\"><button class=\"b secondary\" type=\"submit\">Search</button></form>", html_escape(search));
-    if page.mods.is_empty() {
-        content.push_str("<p>No matching mods found.</p>");
-    }
-    content.push_str("<div class=\"packs\">");
-    for entry in &page.mods {
-        let local = modio::installed(root, game_id, entry.id);
-        let (metadata, action) = match &entry.modfile {
-            Some(file) => {
-                let current = local
-                    .as_ref()
-                    .is_some_and(|record| record.file_id == file.id);
-                let metadata = format!(
-                    "{} · {}",
-                    file.version.as_deref().unwrap_or("Published archive"),
-                    human_bytes(file.filesize)
-                );
-                let action = if current {
-                    disabled_button("Installed")
-                } else {
-                    button(
-                        if local.is_some() { "Update" } else { "Install" },
-                        &format!("modio-install:{}", entry.id),
-                    )
-                };
-                (metadata, action)
-            }
-            None => (
-                "No published archive".to_string(),
-                disabled_button("Unavailable"),
-            ),
-        };
-        content.push_str(&format!("<section class=\"pack\"><h2>{}</h2><p>{}</p><p class=\"meta\">{}</p><div class=\"pack-actions\">{action}</div></section>",
-            html_escape(&entry.name), html_escape(&entry.summary), html_escape(&metadata)));
-    }
-    content.push_str("</div><div class=\"pack-actions\">");
-    if page.result_offset > 0 {
-        content.push_str(&secondary_button(
-            "Previous",
-            &format!(
-                "modio-page:{}",
-                page.result_offset.saturating_sub(page.result_limit)
-            ),
-        ));
-    }
-    if page.result_limit > 0
-        && page.result_offset.saturating_add(page.result_limit) < page.result_total
-    {
-        content.push_str(&secondary_button(
-            "Next",
-            &format!("modio-page:{}", page.result_offset + page.result_limit),
-        ));
-    }
-    content.push_str("</div>");
-    let status = notice.map(str::to_string).unwrap_or_else(|| {
-        format!(
-            "{} matching mods. Installed mods are shared with the game.",
-            page.result_total
-        )
-    });
-    render_with_content(
-        "Community mods",
-        false,
-        &status,
-        &content,
-        &secondary_button("Back", "back-to-ready"),
-    )
-}
-
-/// Downloads a fresh catalog archive while holding the launcher's installation guard.
-fn start_modio_install(handle: &tauri::AppHandle, id: i64) {
-    let Some(operation) = begin_install_operation(handle) else {
-        return;
-    };
-    write_screen(
-        handle,
-        &render(
-            "Installing mod",
-            true,
-            "Checking the published archive…",
-            "",
-        ),
-    );
-    let handle = handle.clone();
-    thread::spawn(move || {
-        let result = modio::Configuration::load().and_then(|configuration| {
-            let entry = configuration.get_mod(id)?;
-            let root = install_dir()?;
-            modio::download_and_install(&root, &configuration, &entry, |received, total| {
-                let percent = (u128::from(received) * 100) / u128::from(total);
-                update_status(&handle, &format!("Downloading {}: {percent}%", entry.name));
-            })
-        });
-        drop(operation);
-        match result {
-            Ok(()) => {
-                let (search, offset) = MODIO_BROWSER_STATE.lock().unwrap().clone();
-                show_modio_browser(
-                    &handle,
-                    search,
-                    offset,
-                    Some(
-                        "Installed. Open the game's Mods page to choose your content.".to_string(),
-                    ),
-                );
-            }
-            Err(error) => show_modio_error(&handle, &error),
-        }
-    });
-}
-
-/// Keeps community-service failures inside the browser with retry and return actions.
-fn show_modio_error(handle: &tauri::AppHandle, error: &io::Error) {
-    log_line(&format!("[launcher] community mods: {error}"));
-    write_screen(
-        handle,
-        &render(
-            "Community mods unavailable",
-            false,
-            &error.to_string(),
-            &(secondary_button("Retry", "mods") + &secondary_button("Back", "back-to-ready")),
-        ),
-    );
-}
-
 fn show_content_pack_manager(handle: &tauri::AppHandle) {
     write_screen(
         handle,
@@ -7522,7 +7316,7 @@ mod tests {
     #[test]
     fn up_to_date_screen_with_installed_editor_offers_editor_launch() {
         let screen = up_to_date_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager"));
         assert!(screen.contains("choice=play\">Launch game"));
         assert!(screen.contains("choice=content-packs"));
     }
@@ -7530,7 +7324,7 @@ mod tests {
     #[test]
     fn launcher_staged_ready_screen_with_installed_editor_keeps_editor_available() {
         let screen = launcher_staged_ready_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager"));
         assert!(screen.contains("choice=play\">Play game"));
     }
 
@@ -7573,7 +7367,7 @@ mod tests {
     #[test]
     fn update_check_failed_screen_with_installed_editor_keeps_it_available_offline() {
         let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager"));
     }
 
     #[test]

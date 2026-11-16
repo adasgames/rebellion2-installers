@@ -1,22 +1,6 @@
 * {
   box-sizing: border-box;
 }
-.mod-search {
-  display: flex;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-.mod-search input {
-  flex: 1;
-  min-width: 0;
-  padding: 10px;
-  border: 1px solid #526581;
-  border-radius: 6px;
-  background: #101a2e;
-  color: #e8ecf6;
-  font: inherit;
-  user-select: text;
-}
 html,
 body {
   height: 100%;
