@@ -7316,7 +7316,7 @@ mod tests {
     #[test]
     fn up_to_date_screen_with_installed_editor_offers_editor_launch() {
         let screen = up_to_date_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager"));
         assert!(screen.contains("choice=play\">Launch game"));
         assert!(screen.contains("choice=content-packs"));
     }
@@ -7324,7 +7324,7 @@ mod tests {
     #[test]
     fn launcher_staged_ready_screen_with_installed_editor_keeps_editor_available() {
         let screen = launcher_staged_ready_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager"));
         assert!(screen.contains("choice=play\">Play game"));
     }
 
@@ -7367,7 +7367,7 @@ mod tests {
     #[test]
     fn update_check_failed_screen_with_installed_editor_keeps_it_available_offline() {
         let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager"));
     }
 
     #[test]
