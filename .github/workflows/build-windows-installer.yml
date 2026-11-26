@@ -397,7 +397,7 @@ jobs:
             "$VERSION" \
             "$RELEASE_NOTES_HISTORY"
           echo null > "$RELEASE_NOTES_POINTER"
-          if jq -e '.sections | length > 0' "$RELEASE_NOTES" >/dev/null; then
+          if jq -e '(.sections | length > 0) or .breaksSaves == true or any(.releases[]?; .breaksSaves == true)' "$RELEASE_NOTES" >/dev/null; then
             NOTES_SHA=$(sha256sum "$RELEASE_NOTES" | cut -d' ' -f1)
             jq -n \
               --arg path "dist/${RELEASE_NOTES}" \

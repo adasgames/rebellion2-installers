@@ -2163,6 +2163,103 @@ try {
     );
   }
 
+  for (const compatibility of [
+    { name: "current release", breaksSaves: true, warning: true },
+    { name: "skipped release", breakingVersion: "2.5.0", warning: true },
+    {
+      name: "already installed release",
+      breakingVersion: "1.9.0",
+      warning: false,
+    },
+    { name: "legacy metadata", warning: false },
+  ]) {
+    await scenario(
+      `save compatibility warning (${compatibility.name})`,
+      async () => {
+        publishGame("3.0.0");
+        const notes = Buffer.from(
+          JSON.stringify({
+            version: "3.0.0",
+            breaksSaves: compatibility.breaksSaves,
+            sections: [
+              { title: "Fixes", items: ["Runtime compatibility update."] },
+            ],
+            releases: compatibility.breakingVersion
+              ? [
+                  {
+                    version: compatibility.breakingVersion,
+                    breaksSaves: true,
+                    sections: [],
+                  },
+                  {
+                    version: "3.0.0",
+                    sections: [
+                      {
+                        title: "Fixes",
+                        items: ["Runtime compatibility update."],
+                      },
+                    ],
+                  },
+                ]
+              : [],
+          }),
+        );
+        state.documents.set("/dist/runtime-notes.json", notes);
+        state.documents.get("/dist/game.json").content.releaseNotes = {
+          path: "dist/runtime-notes.json",
+          sha256: digest(notes),
+        };
+        const directory = await seedInstall(
+          `save-compatibility-${compatibility.name}`,
+          {
+            contentVersion: "2.0.0",
+          },
+        );
+        const session = await launch(directory);
+        await screen(session, "Runtime compatibility update.");
+        assert.equal(
+          await evaluate(
+            session,
+            'document.querySelector(".save-warning") !== null',
+          ),
+          compatibility.warning,
+        );
+        assert.equal(
+          await readText(path.join(directory, ".game-version")),
+          "2.0.0",
+        );
+        if (compatibility.warning) {
+          assert.equal(
+            await evaluate(
+              session,
+              `(() => {
+              const warning = document.querySelector('.save-warning');
+              const bounds = warning.getBoundingClientRect();
+              const notes = document.querySelector('.release-changes').getBoundingClientRect();
+              const buttons = [...document.querySelectorAll('.btns .b')];
+              return warning.getAttribute('role') === 'alert'
+                && bounds.top >= 0 && bounds.bottom <= notes.top
+                && buttons.every(button => button.getBoundingClientRect().bottom <= innerHeight);
+            })()`,
+            ),
+            true,
+          );
+          const screenshot = await debuggerCommand(
+            session,
+            "Page.captureScreenshot",
+            { format: "png" },
+          );
+          await fs.writeFile(
+            path.join(scratch, `save-warning-${compatibility.name}.png`),
+            Buffer.from(screenshot.data, "base64"),
+          );
+        }
+        await click(session, "game-update");
+        await ready(session);
+      },
+    );
+  }
+
   for (const channel of ["game", "launcher", "application"]) {
     await scenario(
       `Update responds immediately without fetching displayed patch notes again (${channel})`,

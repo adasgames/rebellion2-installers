@@ -179,6 +179,16 @@ pub(crate) fn update_available_screen(
 
 /// Renders structured release notes for the update confirmation screen.
 pub(crate) fn render_release_notes(notes: &ReleaseNotes) -> String {
+    let warning = if notes.breaks_saves {
+        "<aside class=\"save-warning\" role=\"alert\">\
+         <svg class=\"save-warning-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" \
+         stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">\
+         <path d=\"M12 3 2 21h20L12 3Z\"/><path d=\"M12 9v5m0 3h.01\"/></svg>\
+         <div><strong>New game required</strong>\
+         <p>Existing saves will no longer load after this update.</p></div></aside>"
+    } else {
+        ""
+    };
     let sections = notes
         .sections
         .iter()
@@ -196,7 +206,7 @@ pub(crate) fn render_release_notes(notes: &ReleaseNotes) -> String {
         .collect::<String>();
 
     format!(
-        "<div style=\"display:flex;flex:1;min-height:0;margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);flex-direction:column;text-align:left\"><h2 class=\"patch-title\" style=\"font-size:15px\">Patch Notes</h2><div class=\"release-changes\" style=\"flex:1;overflow-y:scroll;scrollbar-gutter:stable\">{sections}</div></div>"
+        "<div style=\"display:flex;flex:1;min-height:0;margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);flex-direction:column;text-align:left\">{warning}<h2 class=\"patch-title\" style=\"font-size:15px\">Patch Notes</h2><div class=\"release-changes\" style=\"flex:1;overflow-y:scroll;scrollbar-gutter:stable\">{sections}</div></div>"
     )
 }
 

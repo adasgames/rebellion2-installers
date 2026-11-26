@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 
 /**
  * Converts the supported release-description Markdown into launcher JSON.
- * Only second-level headings and the bullet items beneath them are published.
+ * Publishes second-level headings, their bullets, and explicit save-compatibility metadata.
  */
 export function parseReleaseNotes(markdown, version) {
   const sections = [];
@@ -26,6 +26,9 @@ export function parseReleaseNotes(markdown, version) {
 
   return {
     version,
+    ...(/^\s*<!--\s*breaksSaves:\s*true\s*-->\s*$/mu.test(markdown)
+      ? { breaksSaves: true }
+      : {}),
     sections: sections.filter(
       (section) => section.title.length > 0 && section.items.length > 0,
     ),
@@ -62,14 +65,12 @@ export function buildReleaseNotes(
     })
     .filter(
       (release) =>
-        release.sections.length > 0 && compareVersions(release.version, version) < 0,
+        (release.sections.length > 0 || release.breaksSaves) &&
+        compareVersions(release.version, version) < 0,
     );
 
-  if (current.sections.length > 0) {
-    releases.push({
-      version: current.version,
-      sections: current.sections,
-    });
+  if (current.sections.length > 0 || current.breaksSaves) {
+    releases.push(current);
   }
   releases.sort((left, right) => compareVersions(left.version, right.version));
 

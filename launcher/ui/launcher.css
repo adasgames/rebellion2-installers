@@ -141,14 +141,36 @@ h1 .two {
   font-size: 13px;
 }
 .save-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: none;
   margin: 0 0 16px;
-  color: #ff3434;
-  font-size: 12px;
-  font-weight: 900;
-  line-height: 1.25;
-  text-align: center;
-  text-transform: uppercase;
-  letter-spacing: 0.025em;
+  padding: 14px 16px;
+  border: 1px solid #41495e;
+  border-left: 4px solid #ffcf4d;
+  border-radius: 8px;
+  background: #202637;
+  color: #f0f3fa;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+}
+.save-warning-icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  color: #ffcf4d;
+}
+.save-warning strong {
+  display: block;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+}
+.save-warning p {
+  margin: 5px 0 0;
 }
 .changes + .changes {
   margin-top: 9px;

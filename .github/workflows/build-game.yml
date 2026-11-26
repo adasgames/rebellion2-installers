@@ -21,6 +21,11 @@ on:
         description: Game patch notes in Markdown
         required: true
         type: string
+      breaks_saves:
+        description: Breaks existing saves and requires a new game
+        required: true
+        default: false
+        type: boolean
       platform:
         description: Platforms to build and publish
         required: true
@@ -472,6 +477,7 @@ jobs:
 
       - name: Stage the GitHub release
         env:
+          BREAKS_SAVES: ${{ inputs.breaks_saves }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PLATFORM: ${{ inputs.platform }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
@@ -479,7 +485,13 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
+          if [ "$BREAKS_SAVES" = true ]; then
+            printf '%s\n\n' '<!-- breaksSaves: true -->' \
+              '**Warning: This update breaks existing saves and requires a new game.**' > game-release-notes.md
+            printf '%s\n' "$RELEASE_NOTES" >> game-release-notes.md
+          else
+            printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
+          fi
           assets=()
           if [ "$PLATFORM" = all ] || [ "$PLATFORM" = windows ]; then
             assets+=(windows/Rebellion2-Windows-Setup.exe)
@@ -511,7 +523,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GAME_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
           PLATFORM: ${{ inputs.platform }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
           STORAGE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           STORAGE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
@@ -523,7 +534,6 @@ jobs:
           set -euo pipefail
           content_pointer=content/latest.json
           notes="release-notes-${VERSION}.json"
-          printf '%s\n' "$RELEASE_NOTES" > game-release-notes.md
           gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq --slurp 'add' > release-history.json
           node scripts/release-notes.mjs game-release-notes.md "$notes" "$VERSION" release-history.json
           sign_manifest() {
