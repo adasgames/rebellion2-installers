@@ -174,9 +174,9 @@ or launcher versions, the corresponding view combines only that channel's newer 
 ### Save-breaking game updates
 
 Select **breaks_saves** in **Build game** when the release cannot load existing saves. The launcher
-shows **Save-breaking update** above the patch notes before the player chooses whether to update:
+shows **New game required** above the patch notes before the player chooses whether to update:
 
-> Existing saves will no longer load after this update. You will need to start a new game.
+> Existing saves will no longer load after this update.
 
 The release-notes JSON declares this with the optional boolean `"breaksSaves": true`, both at the
 document level for the current release and in that version's entry in `releases`. Omitted or false

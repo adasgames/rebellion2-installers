@@ -7530,7 +7530,7 @@ mod tests {
 
         assert!(screen.contains("role=\"alert\""));
         assert!(screen.contains("Existing saves will no longer load after this update."));
-        assert!(screen.find("Save-breaking update").unwrap() < screen.find("Patch Notes").unwrap());
+        assert!(screen.find("New game required").unwrap() < screen.find("Patch Notes").unwrap());
         assert!(screen.contains("choice=game-update"));
         assert!(screen.contains("choice=skip-game-update"));
     }
@@ -7539,7 +7539,7 @@ mod tests {
     fn game_update_screen_without_save_breaking_notes_omits_warning() {
         let screen = game_update_screen("1.2.3", Some(&release_notes()), false);
 
-        assert!(!screen.contains("Save-breaking update"));
+        assert!(!screen.contains("New game required"));
         assert!(screen.contains("Patch Notes"));
     }
 
