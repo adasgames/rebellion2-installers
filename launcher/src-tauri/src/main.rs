@@ -14,9 +14,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser_signin;
-mod content_packs;
 mod downloads;
 mod launch_settings;
+mod legacy_packs;
 #[cfg(target_os = "linux")]
 mod linux_audio;
 mod manifests;
@@ -41,16 +41,14 @@ use manifests::{
 #[cfg(test)]
 use presentation::update_check_failure_reason;
 use presentation::{
-    application_update_screen, content_pack_error_screen, game_update_screen,
-    launcher_staged_ready_screen, launcher_update_screen, operation_failure_status,
-    progress_screen, required_content_pack_update_screen, required_update_signin_screen,
-    retryable_failure_screen, up_to_date_screen, update_available_screen,
-    update_check_failed_screen, update_signin_screen, verification_failure_screen,
+    application_update_screen, game_update_screen, launcher_staged_ready_screen,
+    launcher_update_screen, operation_failure_status, progress_screen,
+    required_update_signin_screen, retryable_failure_screen, up_to_date_screen,
+    update_available_screen, update_check_failed_screen, update_signin_screen,
+    verification_failure_screen,
 };
 
-use presentation::{
-    button, disabled_button, html_escape, render, render_with_content, secondary_button,
-};
+use presentation::{button, disabled_button, render};
 #[cfg(any(debug_assertions, test))]
 use release_notes::ReleaseNoteSection;
 #[cfg(test)]
@@ -73,21 +71,21 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use content_packs::{ContentPackCatalog, ContentPackRelease, GAME_DEPENDENCY_ID};
 use downloads::{
     clear_cache, clear_download_metadata, download_to_path, known_download_size, DownloadError,
     DownloadSpec,
 };
 use launch_settings::LauncherSettings;
 #[cfg(test)]
+use rebellion2_update_core::apply;
+#[cfg(test)]
 use rebellion2_update_core::sha256_hex;
 use rebellion2_update_core::FileEntry;
 #[cfg(target_os = "windows")]
 use rebellion2_update_core::Plan;
 use rebellion2_update_core::{
-    apply, apply_verified_with_metadata, apply_with_metadata, diff, diff_verified,
-    recover_interrupted_apply, replace_file_atomically, sha256_file, store_metadata,
-    verify_install, BlobSource, InstallationLock, Manifest,
+    apply_verified_with_metadata, apply_with_metadata, diff, recover_interrupted_apply,
+    replace_file_atomically, sha256_file, store_metadata, BlobSource, InstallationLock, Manifest,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -107,8 +105,6 @@ const CONTENT_VERSION: Option<&str> = option_env!("REB2_CONTENT_VERSION");
 /// Public base URL of the release channel (REB2_CONTENT_BASE_URL): holds the public
 /// atomic application pointer and token-gated content manifests + blobs.
 const CONTENT_BASE: Option<&str> = option_env!("REB2_CONTENT_BASE_URL");
-/// Public base URL of the optional content-pack channel (REB2_CONTENT_PACK_BASE_URL).
-const CONTENT_PACK_BASE: Option<&str> = option_env!("REB2_CONTENT_PACK_BASE_URL");
 
 const CONTENT_VERSION_FILE: &str = ".content-version";
 const CONTENT_MANIFEST_FILE: &str = ".manifest.json";
@@ -188,7 +184,6 @@ static PENDING_LAUNCHER_UPDATE: Mutex<Option<PendingUpdate<LauncherUpdate>>> = M
 /// A newer game-player release waiting for approval.
 static PENDING_GAME_UPDATE: Mutex<Option<PendingUpdate<GameUpdate>>> = Mutex::new(None);
 /// The last validated optional-pack catalog shown by the launcher.
-static CONTENT_PACK_CATALOG: Mutex<Option<ContentPackCatalog>> = Mutex::new(None);
 /// Set after this launcher session downloads an update for its next start.
 static LAUNCHER_UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
 /// A newer application release waiting for the user to approve its installation.
@@ -1278,21 +1273,12 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
         return;
     }
 
-    if let Some(id) = choice.strip_prefix("content-pack-install:") {
-        start_content_pack_install(handle, id);
-        return;
-    }
-    if let Some(id) = choice.strip_prefix("content-pack-remove:") {
-        start_content_pack_remove(handle, id);
-        return;
-    }
-
     match choice {
         "play" | "open-editor" => {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
-            if show_required_content_pack_update(handle) {
+            if retire_optional_packs(handle) {
                 return;
             }
             let (name, result) = if choice == "open-editor" {
@@ -1322,14 +1308,6 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                     );
                 }
             }
-        }
-        "content-packs" => show_content_pack_manager(handle),
-        "back-to-ready" => {
-            let version = install_dir()
-                .ok()
-                .and_then(|directory| read_installed_version(&directory.join("Content")))
-                .unwrap_or_else(|| "installed".to_string());
-            show_up_to_date(handle, &version);
         }
         "quit" => handle.exit(0),
         "launcher-update" => start_launcher_update(handle),
@@ -3423,9 +3401,7 @@ fn scan_content_and_prompt(handle: &tauri::AppHandle) {
                 clear_approved_content_update();
                 update_status(handle, "Verifying installed content…");
                 match installed_content_matches_release(&base, &latest, &content_dir) {
-                    Ok(true) => {
-                        refresh_content_pack_catalog_and_show_ready(handle, &latest.version)
-                    }
+                    Ok(true) => show_up_to_date(handle, &latest.version),
                     Ok(false) => {
                         log_line("[launcher] installed Content does not match its release; offering repair.");
                         prompt_update(handle, &base, &latest, &content_dir);
@@ -3698,7 +3674,7 @@ fn run_update(
                 update_progress(handle, 100, "Update complete.");
                 // Let the filled bar sit a beat, then land on the up-to-date screen.
                 thread::sleep(Duration::from_millis(900));
-                refresh_content_pack_catalog_and_show_ready(handle, &latest.version);
+                show_up_to_date(handle, &latest.version);
             }
         }
         Err(err) if is_content_unavailable(err.as_ref()) => {
@@ -3743,7 +3719,7 @@ fn run_update(
 fn finish_application_update(handle: &tauri::AppHandle, version: &str) {
     update_progress(handle, 100, "Update complete.");
     thread::sleep(Duration::from_millis(900));
-    refresh_content_pack_catalog_and_show_ready(handle, version);
+    show_up_to_date(handle, version);
 }
 
 fn do_update(
@@ -4199,10 +4175,6 @@ fn content_base() -> Option<String> {
     normalized_base(CONTENT_BASE)
 }
 
-fn content_pack_base() -> Option<String> {
-    normalized_base(CONTENT_PACK_BASE)
-}
-
 fn normalized_base(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|v| !v.is_empty()).map(|v| {
         if v.ends_with('/') {
@@ -4369,11 +4341,41 @@ fn show_result(handle: &tauri::AppHandle, kicker: &str, status: &str, label: &st
     );
 }
 
+/// Retires registered optional packs before offering another game or editor launch.
+fn retire_optional_packs(handle: &tauri::AppHandle) -> bool {
+    let result = install_dir().and_then(|root| legacy_packs::retire(&root));
+    match result {
+        Ok(packs) if packs.is_empty() => false,
+        Ok(packs) => {
+            let backups = packs
+                .iter()
+                .map(|pack| format!("{}: {}", pack.name, pack.backup.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            log_line(&format!(
+                "[launcher] retired optional pack installations:\n{backups}"
+            ));
+            show_message(handle, "Content pack installation changed",
+                &format!("Optional packs are now managed through the content pack editor's mod manager. The old installations were removed and full backups were kept:\n\n{backups}\n\nInstall these packs again from Thunderstore to use them."),
+                Some(("Continue", "retry-update-check")));
+            true
+        }
+        Err(error) => {
+            log_line(&format!(
+                "[launcher] optional pack cleanup could not finish: {error}"
+            ));
+            show_message(handle, "Content pack cleanup incomplete",
+                &format!("The old installations could not be fully backed up and removed. Close other programs and retry. Existing backups are retained.\n\n{error}"),
+                Some(("Retry", "retry-update-check")));
+            true
+        }
+    }
+}
+
 fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
-    if show_required_content_pack_update(handle) {
+    if retire_optional_packs(handle) {
         return;
     }
-
     let editor_installed = editor_path().is_ok_and(|path| path.exists());
     let screen = if launcher_update_was_staged() {
         launcher_staged_ready_screen(version, editor_installed)
@@ -4381,519 +4383,6 @@ fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
         up_to_date_screen(version, editor_installed)
     };
     write_screen(handle, &screen);
-}
-
-/// Refreshes optional content metadata before exposing the launch action.
-fn refresh_content_pack_catalog_and_show_ready(handle: &tauri::AppHandle, version: &str) {
-    match fetch_content_pack_catalog() {
-        Ok(catalog) => *CONTENT_PACK_CATALOG.lock().unwrap() = Some(catalog),
-        Err(error) => log_line(&format!(
-            "[launcher] optional content-pack update check failed: {error}"
-        )),
-    }
-    show_up_to_date(handle, version);
-}
-
-/// Shows a blocking update action when installed optional content is behind its compatible release.
-fn show_required_content_pack_update(handle: &tauri::AppHandle) -> bool {
-    let Some(catalog) = CONTENT_PACK_CATALOG.lock().unwrap().clone() else {
-        return false;
-    };
-    let Ok(install_root) = install_dir() else {
-        return false;
-    };
-    let game_version = current_game_version();
-    let Some((release, installed)) =
-        pending_installed_content_pack_update(&catalog, &install_root, game_version.as_deref())
-    else {
-        return false;
-    };
-
-    write_screen(
-        handle,
-        &required_content_pack_update_screen(&release, &installed),
-    );
-    true
-}
-
-/// Finds the first installed optional pack with a newer compatible release.
-fn pending_installed_content_pack_update(
-    catalog: &ContentPackCatalog,
-    install_root: &Path,
-    game_version: Option<&str>,
-) -> Option<(ContentPackRelease, content_packs::InstalledContentPack)> {
-    catalog.packs.iter().find_map(|release| {
-        let installed = content_packs::read_installed(install_root, &release.id)?;
-        let minimum_supported_version = release.minimum_supported_version.as_deref()?;
-        if !version_gt(minimum_supported_version, &installed.version)
-            || !content_packs::supports_dependency_version(
-                release,
-                GAME_DEPENDENCY_ID,
-                game_version,
-            )
-        {
-            return None;
-        }
-        Some((release.clone(), installed))
-    })
-}
-
-fn show_content_pack_manager(handle: &tauri::AppHandle) {
-    write_screen(
-        handle,
-        &render(
-            "Content packs",
-            true,
-            "Checking available content packs\u{2026}",
-            &secondary_button("Back", "back-to-ready"),
-        ),
-    );
-    let handle = handle.clone();
-    thread::spawn(move || match fetch_content_pack_catalog() {
-        Ok(catalog) => {
-            *CONTENT_PACK_CATALOG.lock().unwrap() = Some(catalog.clone());
-            match content_pack_manager_screen(&catalog) {
-                Ok(screen) => write_screen(&handle, &screen),
-                Err(error) => show_content_pack_error(&handle, "Content packs unavailable", &error),
-            }
-        }
-        Err(error) => {
-            log_line(&format!("[launcher] content-pack catalog failed: {error}"));
-            show_content_pack_error(&handle, "Content packs unavailable", error.as_ref());
-        }
-    });
-}
-
-fn fetch_content_pack_catalog() -> Result<ContentPackCatalog, Box<dyn std::error::Error>> {
-    let base = content_pack_base().ok_or("content-pack channel is not configured")?;
-    let catalog: ContentPackCatalog =
-        fetch_json(&format!("{base}{}", content_packs::CATALOG_PATH), None)
-            .map_err(|error| content_pack_download_error("content-pack list", error))?;
-    content_packs::validate_catalog(&catalog)?;
-    Ok(catalog)
-}
-
-fn content_pack_manager_screen(catalog: &ContentPackCatalog) -> io::Result<String> {
-    let install_root = install_dir()?;
-    let game_version = current_game_version();
-    Ok(content_pack_manager_screen_for(
-        catalog,
-        &install_root,
-        game_version.as_deref(),
-    ))
-}
-
-/// Renders content-pack actions against an explicit installation and game version.
-fn content_pack_manager_screen_for(
-    catalog: &ContentPackCatalog,
-    install_root: &Path,
-    game_version: Option<&str>,
-) -> String {
-    let mut packs = String::from("<div class=\"pack-list\">");
-    if catalog.packs.is_empty() {
-        packs.push_str("<p>No optional content packs are currently available.</p>");
-    }
-    for pack in &catalog.packs {
-        let installed = content_packs::read_installed(install_root, &pack.id);
-        let game_compatible =
-            content_packs::supports_dependency_version(pack, GAME_DEPENDENCY_ID, game_version);
-        let unavailable_content = pack
-            .depends
-            .iter()
-            .filter(|(id, _)| id.as_str() != GAME_DEPENDENCY_ID)
-            .find_map(|(id, _)| {
-                let installed_version = installed_content_pack_version(install_root, id);
-                (!content_packs::supports_dependency_version(
-                    pack,
-                    id,
-                    installed_version.as_deref(),
-                ))
-                .then_some((id, installed_version))
-            });
-        let mut requirements = vec![format!(
-            "Rebellion 2 {}",
-            pack.depends[GAME_DEPENDENCY_ID].display()
-        )];
-        requirements.extend(
-            pack.depends
-                .iter()
-                .filter(|(id, _)| id.as_str() != GAME_DEPENDENCY_ID)
-                .map(|(id, requirement)| format!("{id} {}", requirement.display())),
-        );
-        let compatibility = format!("Requires {}", requirements.join(" · "));
-        let description = if pack.description.trim().is_empty() {
-            "Optional game content."
-        } else {
-            pack.description.trim()
-        };
-        let (release_status, action_label) = match installed.as_ref() {
-            Some(installed) if !game_compatible => (
-                match game_version {
-                    Some(version) => format!(
-                        "Installed {} · Incompatible with game {version}",
-                        installed.version
-                    ),
-                    None => format!(
-                        "Installed {} · Install the game to verify compatibility",
-                        installed.version
-                    ),
-                },
-                None,
-            ),
-            Some(installed) if unavailable_content.is_some() => (
-                match unavailable_content.as_ref() {
-                    Some((id, Some(version))) => format!(
-                        "Installed {} · Incompatible with {id} {version}",
-                        installed.version
-                    ),
-                    Some((id, None)) => format!(
-                        "Installed {} · Required content pack {id} is missing",
-                        installed.version
-                    ),
-                    None => unreachable!(),
-                },
-                None,
-            ),
-            Some(installed) if installed.version == pack.version => {
-                (format!("Installed {}", installed.version), None)
-            }
-            Some(installed) => (
-                format!(
-                    "Installed {} · Update {} available",
-                    installed.version, pack.version
-                ),
-                Some("Update"),
-            ),
-            None if !game_compatible => (
-                match game_version {
-                    Some(version) => {
-                        format!("Requires a compatible game version · Installed {version}")
-                    }
-                    None => "Install the game before installing this content pack".to_string(),
-                },
-                None,
-            ),
-            None if unavailable_content.is_some() => (
-                match unavailable_content.as_ref() {
-                    Some((id, Some(version))) => {
-                        format!("Requires compatible {id} content · Installed {version}")
-                    }
-                    Some((id, None)) => format!("Install required content pack {id} first"),
-                    None => unreachable!(),
-                },
-                None,
-            ),
-            None => (
-                format!(
-                    "Version {} · {}",
-                    pack.version,
-                    human_bytes(pack.download_size)
-                ),
-                Some("Install"),
-            ),
-        };
-        let status = format!("{release_status} · {compatibility}");
-        let mut actions = String::from("<div class=\"pack-actions\">");
-        if let Some(label) = action_label {
-            actions.push_str(&button(label, &format!("content-pack-install:{}", pack.id)));
-        }
-        if installed.is_some() {
-            actions.push_str(&secondary_button(
-                "Remove",
-                &format!("content-pack-remove:{}", pack.id),
-            ));
-        }
-        actions.push_str("</div>");
-        packs.push_str(&format!(
-            "<section class=\"pack\"><h2>{}</h2><p>{}</p><p class=\"meta\">{}</p>{}</section>",
-            html_escape(&pack.name),
-            html_escape(description),
-            html_escape(&status),
-            actions
-        ));
-    }
-    packs.push_str("</div>");
-    render_with_content(
-        "Content packs",
-        false,
-        "Install, update, or remove optional game content.",
-        &packs,
-        &secondary_button("Back", "back-to-ready"),
-    )
-}
-
-fn start_content_pack_install(handle: &tauri::AppHandle, id: &str) {
-    let pack = CONTENT_PACK_CATALOG
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|catalog| catalog.packs.iter().find(|pack| pack.id == id))
-        .cloned();
-    let Some(pack) = pack else {
-        show_content_pack_error(
-            handle,
-            "Content pack unavailable",
-            &io::Error::new(
-                io::ErrorKind::NotFound,
-                "Refresh the content-pack list and try again.",
-            ),
-        );
-        return;
-    };
-    let Some(operation) = begin_install_operation(handle) else {
-        return;
-    };
-    show_progress_ui(handle);
-    update_progress(handle, 0, &format!("Preparing {}\u{2026}", pack.name));
-    let handle = handle.clone();
-    thread::spawn(move || {
-        run_content_pack_install(&handle, &pack, operation);
-    });
-}
-
-fn run_content_pack_install(
-    handle: &tauri::AppHandle,
-    pack: &ContentPackRelease,
-    operation: InstallOperationGuard,
-) {
-    let result = install_content_pack(handle, pack);
-    drop(operation);
-    match result {
-        Ok(changed) => {
-            log_line(&format!(
-                "[launcher] content pack {} {} installed ({changed} files).",
-                pack.id, pack.version
-            ));
-            update_progress(handle, 100, "Content pack installed.");
-            thread::sleep(Duration::from_millis(500));
-            show_content_pack_manager(handle);
-        }
-        Err(error) => {
-            log_line(&format!("[launcher] content-pack install failed: {error}"));
-            show_content_pack_error(handle, "Installation failed", error.as_ref());
-        }
-    }
-}
-
-fn install_content_pack(
-    handle: &tauri::AppHandle,
-    pack: &ContentPackRelease,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    content_packs::validate_release(pack)?;
-    let game_version = current_game_version();
-    let game_requirement = &pack.depends[GAME_DEPENDENCY_ID];
-    if !content_packs::supports_dependency_version(
-        pack,
-        GAME_DEPENDENCY_ID,
-        game_version.as_deref(),
-    ) {
-        let installed = game_version.as_deref().unwrap_or("not installed");
-        return Err(format!(
-            "{} requires Rebellion 2 {}; installed version is {installed}",
-            pack.name,
-            game_requirement.display()
-        )
-        .into());
-    }
-    let base = content_pack_base().ok_or("content-pack channel is not configured")?;
-    let remote: Manifest = fetch_json(&format!("{base}{}", pack.manifest), None)
-        .map_err(|error| content_pack_download_error("content-pack manifest", error))?;
-    content_packs::validate_pack_manifest(&remote, pack)?;
-    let install_root = install_dir()?;
-    for (dependency_id, requirement) in pack
-        .depends
-        .iter()
-        .filter(|(id, _)| id.as_str() != GAME_DEPENDENCY_ID)
-    {
-        let installed_dependency_version =
-            installed_content_pack_version(&install_root, dependency_id);
-        match installed_dependency_version {
-            None => {
-                return Err(
-                    format!("required content pack {dependency_id} is not installed").into(),
-                );
-            }
-            Some(installed_version)
-                if !content_packs::supports_dependency_version(
-                    pack,
-                    dependency_id,
-                    Some(&installed_version),
-                ) =>
-            {
-                return Err(format!(
-                    "{} requires content pack {dependency_id} {}; installed version is {installed_version}",
-                    pack.name,
-                    requirement.display()
-                )
-                .into());
-            }
-            Some(_) => {}
-        }
-    }
-    let installed = content_packs::read_installed(&install_root, &pack.id);
-    if let Some(installed) = installed.as_ref() {
-        if installed.directory != pack.directory {
-            return Err("content-pack install directory changed unexpectedly".into());
-        }
-    }
-    let pack_directory = content_packs::install_directory(&install_root, pack)?;
-    let local = content_packs::read_manifest(&install_root, &pack.id);
-    let plan = diff_verified(
-        installed.as_ref().and(local.as_ref()),
-        &remote,
-        &pack_directory,
-    )?;
-    let changed = plan.changed.len();
-    let bytes = plan.download_size();
-    update_status(
-        handle,
-        &format!("Downloading {} · {}", pack.name, human_bytes(bytes)),
-    );
-    let progress_label = format!("Downloading {}", pack.name);
-    let blobs = HttpBlobs::new(
-        format!("{base}{}", pack.blobs),
-        None,
-        handle,
-        bytes,
-        0..=95,
-        &progress_label,
-        &format!("content-packs/{}", pack.id),
-    )?;
-    if installed.is_none() {
-        let changed = content_packs::install_fresh(&install_root, pack, &remote, &blobs)?;
-        blobs.clear_cache();
-        return Ok(changed);
-    }
-    content_packs::apply_update(&install_root, pack, &remote, &plan, &blobs)?;
-    if !verify_install(&pack_directory, &remote)? {
-        return Err("content-pack verification failed after installation".into());
-    }
-    blobs.clear_cache();
-    Ok(changed)
-}
-
-/// Returns the installed version for the built-in pack or a launcher-managed optional pack.
-fn installed_content_pack_version(install_root: &Path, id: &str) -> Option<String> {
-    if id == "classic-galactic-civil-war" {
-        return content_packs::read_pack_version(
-            &install_root
-                .join("Content")
-                .join("Packs")
-                .join("ClassicGalacticCivilWar")
-                .join("pack.xml"),
-            id,
-        );
-    }
-    let installed = content_packs::read_installed(install_root, id)?;
-    let definition_path = install_root
-        .join("Content")
-        .join("Packs")
-        .join(&installed.directory)
-        .join("pack.xml");
-    content_packs::read_pack_version(&definition_path, id)
-}
-
-fn start_content_pack_remove(handle: &tauri::AppHandle, id: &str) {
-    let Some(operation) = begin_install_operation(handle) else {
-        return;
-    };
-    let id = id.to_string();
-    show_progress_ui(handle);
-    update_progress(handle, 10, "Removing content pack\u{2026}");
-    let handle = handle.clone();
-    thread::spawn(move || {
-        let result = remove_content_pack(&id);
-        drop(operation);
-        match result {
-            Ok(()) => {
-                log_line(&format!("[launcher] content pack {id} removed."));
-                update_progress(&handle, 100, "Content pack removed.");
-                thread::sleep(Duration::from_millis(400));
-                show_content_pack_manager(&handle);
-            }
-            Err(error) => {
-                log_line(&format!("[launcher] content-pack removal failed: {error}"));
-                show_content_pack_error(&handle, "Removal failed", &error);
-            }
-        }
-    });
-}
-
-fn remove_content_pack(id: &str) -> io::Result<()> {
-    let install_root = install_dir()?;
-    let dependent_name = CONTENT_PACK_CATALOG
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|catalog| {
-            catalog
-                .packs
-                .iter()
-                .find(|pack| {
-                    pack.depends.contains_key(id)
-                        && content_packs::read_installed(&install_root, &pack.id).is_some()
-                })
-                .map(|pack| pack.name.clone())
-        });
-    if let Some(dependent_name) = dependent_name {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("remove {dependent_name} first because it depends on this pack"),
-        ));
-    }
-    let installed = content_packs::read_installed(&install_root, id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "content pack is not installed"))?;
-    let manifest = content_packs::read_manifest(&install_root, id).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "content-pack manifest is missing",
-        )
-    })?;
-    let directory = install_root
-        .join("Content")
-        .join("Packs")
-        .join(&installed.directory);
-    apply(
-        &content_packs::removal_plan(&installed, &manifest)?,
-        &install_root,
-        &EmptyBlobs,
-    )?;
-    if let Err(error) = remove_empty_directories(&directory) {
-        log_line(&format!(
-            "[launcher] unable to remove empty content-pack directories: {error}"
-        ));
-    }
-    if let Err(error) = content_packs::remove_install_metadata(&install_root, id) {
-        log_line(&format!(
-            "[launcher] unable to clean removed content-pack metadata: {error}"
-        ));
-    }
-    Ok(())
-}
-
-fn remove_empty_directories(directory: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is not a directory", directory.display()),
-            ))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error),
-    }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            remove_empty_directories(&entry.path())?;
-        }
-    }
-    if fs::read_dir(directory)?.next().is_none() {
-        fs::remove_dir(directory)?;
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 struct EmptyBlobs;
@@ -4904,29 +4393,6 @@ impl BlobSource for EmptyBlobs {
             io::ErrorKind::NotFound,
             "a removal plan cannot download files",
         ))
-    }
-}
-
-fn show_content_pack_error(
-    handle: &tauri::AppHandle,
-    title: &str,
-    error: &(dyn std::error::Error + 'static),
-) {
-    write_screen(
-        handle,
-        &content_pack_error_screen(title, &error.to_string()),
-    );
-}
-
-fn content_pack_download_error(
-    resource: &str,
-    error: Box<dyn std::error::Error>,
-) -> Box<dyn std::error::Error> {
-    if error.downcast_ref::<ContentUnavailable>().is_some() {
-        format!("The {resource} could not be found on the server (HTTP 404). Try again later.")
-            .into()
-    } else {
-        format!("Could not download the {resource}: {error}").into()
     }
 }
 
@@ -6435,16 +5901,6 @@ mod tests {
     }
 
     #[test]
-    fn content_pack_error_screen_separates_back_from_retry() {
-        let screen = content_pack_error_screen("Installation failed", "Missing manifest");
-
-        assert!(screen.contains("choice=back-to-ready\">Back</a>"));
-        assert!(screen.contains("choice=content-packs\">Retry</a>"));
-        assert!(!screen.contains("choice=content-packs\">Back</a>"));
-        assert!(screen.contains("Missing manifest"));
-    }
-
-    #[test]
     fn retryable_failure_screen_separates_retry_from_continue() {
         let screen = retryable_failure_screen(
             "Update failed",
@@ -6471,29 +5927,6 @@ mod tests {
         assert!(!presigned_download_requires_authorization(
             &DownloadError::InvalidData("truncated".to_string())
         ));
-    }
-
-    #[test]
-    fn content_pack_download_error_identifies_missing_resource() {
-        for resource in ["content-pack list", "content-pack manifest"] {
-            let error = content_pack_download_error(resource, Box::new(ContentUnavailable));
-
-            assert!(error.to_string().contains(resource));
-            assert!(error.to_string().contains("HTTP 404"));
-            assert!(!error.to_string().contains("launcher version"));
-        }
-    }
-
-    #[test]
-    fn content_pack_download_error_preserves_other_failure_details() {
-        let error = content_pack_download_error(
-            "content-pack list",
-            Box::new(io::Error::new(io::ErrorKind::TimedOut, "request timed out")),
-        );
-
-        assert!(error.to_string().contains("content-pack list"));
-        assert!(error.to_string().contains("request timed out"));
-        assert!(!error.to_string().contains("HTTP 404"));
     }
 
     #[test]
@@ -6539,187 +5972,6 @@ mod tests {
         assert_eq!(normalized_base(Some("   ")), None);
     }
 
-    #[test]
-    fn content_pack_manager_with_incompatible_game_keeps_only_remove_action() {
-        let root = tempfile::tempdir().unwrap();
-        let pack = content_pack_release("1.0.1");
-        let manifest = application_manifest("1.0.1", &["pack.xml"]);
-        content_packs::write_install(root.path(), &pack, &manifest).unwrap();
-        let catalog = ContentPackCatalog {
-            schema_version: 2,
-            packs: vec![pack],
-        };
-
-        let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.30"));
-
-        assert!(screen.contains("Incompatible with game 0.0.30"));
-        assert!(screen.contains("choice=content-pack-remove:sample-pack"));
-        assert!(!screen.contains("choice=content-pack-install:sample-pack"));
-    }
-
-    #[test]
-    fn content_pack_manager_with_newer_game_keeps_pack_compatible() {
-        let root = tempfile::tempdir().unwrap();
-        let pack = content_pack_release("1.0.1");
-        let manifest = application_manifest("1.0.1", &["pack.xml"]);
-        content_packs::write_install(root.path(), &pack, &manifest).unwrap();
-        write_pack_definition(
-            root.path(),
-            "ClassicGalacticCivilWar",
-            "classic-galactic-civil-war",
-            "1.0.0",
-        );
-        let catalog = ContentPackCatalog {
-            schema_version: 2,
-            packs: vec![pack],
-        };
-
-        let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.32"));
-
-        assert!(screen.contains("Installed 1.0.1"));
-        assert!(screen.contains("Requires Rebellion 2 &gt;=0.0.31"));
-        assert!(!screen.contains("Incompatible with game"));
-        assert!(screen.contains("choice=content-pack-remove:sample-pack"));
-    }
-
-    #[test]
-    fn content_pack_manager_with_incompatible_content_dependency_keeps_only_remove_action() {
-        let root = tempfile::tempdir().unwrap();
-        let installed_pack = content_pack_release("1.0.0");
-        let manifest = application_manifest("1.0.0", &["pack.xml"]);
-        content_packs::write_install(root.path(), &installed_pack, &manifest).unwrap();
-        write_pack_definition(
-            root.path(),
-            "ClassicGalacticCivilWar",
-            "classic-galactic-civil-war",
-            "0.9.0",
-        );
-        let catalog = ContentPackCatalog {
-            schema_version: 2,
-            packs: vec![content_pack_release("1.0.1")],
-        };
-
-        let screen = content_pack_manager_screen_for(&catalog, root.path(), Some("0.0.31"));
-
-        assert!(screen.contains("Incompatible with classic-galactic-civil-war 0.9.0"));
-        assert!(screen.contains("choice=content-pack-remove:sample-pack"));
-        assert!(!screen.contains("choice=content-pack-install:sample-pack"));
-    }
-
-    #[test]
-    fn pending_installed_content_pack_update_finds_newer_compatible_release() {
-        let root = tempfile::tempdir().unwrap();
-        let installed = content_pack_release("1.0.1");
-        let manifest = application_manifest("1.0.1", &["pack.xml"]);
-        content_packs::write_install(root.path(), &installed, &manifest).unwrap();
-        write_pack_definition(
-            root.path(),
-            "ClassicGalacticCivilWar",
-            "classic-galactic-civil-war",
-            "1.0.0",
-        );
-        let mut current = content_pack_release("1.0.3");
-        current.minimum_supported_version = Some("1.0.3".to_string());
-        let catalog = ContentPackCatalog {
-            schema_version: 2,
-            packs: vec![current],
-        };
-
-        let (release, installed) =
-            pending_installed_content_pack_update(&catalog, root.path(), Some("0.0.34"))
-                .expect("a compatible update should be required");
-
-        assert_eq!(release.version, "1.0.3");
-        assert_eq!(installed.version, "1.0.1");
-    }
-
-    #[test]
-    fn pending_installed_content_pack_update_current_release_returns_none() {
-        let root = tempfile::tempdir().unwrap();
-        let installed = content_pack_release("1.0.3");
-        let manifest = application_manifest("1.0.3", &["pack.xml"]);
-        content_packs::write_install(root.path(), &installed, &manifest).unwrap();
-        write_pack_definition(
-            root.path(),
-            "ClassicGalacticCivilWar",
-            "classic-galactic-civil-war",
-            "1.0.0",
-        );
-        let mut current = content_pack_release("1.0.3");
-        current.minimum_supported_version = Some("1.0.3".to_string());
-        let catalog = ContentPackCatalog {
-            schema_version: 2,
-            packs: vec![current],
-        };
-
-        assert!(
-            pending_installed_content_pack_update(&catalog, root.path(), Some("0.0.34")).is_none()
-        );
-    }
-
-    #[test]
-    fn pending_installed_content_pack_update_optional_release_returns_none() {
-        let root = tempfile::tempdir().unwrap();
-        let installed = content_pack_release("1.0.1");
-        let manifest = application_manifest("1.0.1", &["pack.xml"]);
-        content_packs::write_install(root.path(), &installed, &manifest).unwrap();
-        write_pack_definition(
-            root.path(),
-            "ClassicGalacticCivilWar",
-            "classic-galactic-civil-war",
-            "1.0.0",
-        );
-        let catalog = ContentPackCatalog {
-            schema_version: 2,
-            packs: vec![content_pack_release("1.0.3")],
-        };
-
-        assert!(
-            pending_installed_content_pack_update(&catalog, root.path(), Some("0.0.34")).is_none()
-        );
-    }
-
-    #[test]
-    fn required_content_pack_update_screen_omits_launch_bypass() {
-        let release = content_pack_release("1.0.3");
-        let installed = content_packs::InstalledContentPack {
-            id: release.id.clone(),
-            name: release.name.clone(),
-            version: "1.0.1".to_string(),
-            directory: release.directory.clone(),
-        };
-
-        let screen = required_content_pack_update_screen(&release, &installed);
-
-        assert!(screen.contains("Content pack update required"));
-        assert!(screen.contains("Update content pack"));
-        assert!(!screen.contains("choice=play"));
-    }
-
-    #[test]
-    fn installed_optional_base_version_uses_actual_pack_definition() {
-        let root = tempfile::tempdir().unwrap();
-        let mut base_pack = content_pack_release("2.0.0");
-        base_pack.id = "foundation-pack".to_string();
-        base_pack.directory = "FoundationPack".to_string();
-        base_pack.depends.remove("classic-galactic-civil-war");
-        let manifest = application_manifest("2.0.0", &["pack.xml"]);
-        content_packs::write_install(root.path(), &base_pack, &manifest).unwrap();
-        write_pack_definition(root.path(), "FoundationPack", "foundation-pack", "1.0.0");
-
-        assert_eq!(
-            installed_content_pack_version(root.path(), "foundation-pack").as_deref(),
-            Some("1.0.0")
-        );
-
-        write_pack_definition(root.path(), "FoundationPack", "foundation-pack", "2.0.0");
-
-        assert_eq!(
-            installed_content_pack_version(root.path(), "foundation-pack").as_deref(),
-            Some("2.0.0")
-        );
-    }
-
     fn entry_for_bytes(path: &str, bytes: &[u8]) -> FileEntry {
         FileEntry {
             path: path.to_string(),
@@ -6736,42 +5988,6 @@ mod tests {
                 .map(|path| entry_for_bytes(path, path.as_bytes()))
                 .collect(),
         }
-    }
-
-    fn content_pack_release(version: &str) -> ContentPackRelease {
-        ContentPackRelease {
-            id: "sample-pack".to_string(),
-            name: "Sample Pack".to_string(),
-            description: "Sample content.".to_string(),
-            version: version.to_string(),
-            directory: "SamplePack".to_string(),
-            manifest: format!("dist/content-packs/sample-pack/manifest-{version}.json"),
-            blobs: "content-pack-blobs/".to_string(),
-            download_size: 100,
-            minimum_supported_version: None,
-            depends: std::collections::BTreeMap::from([
-                (
-                    GAME_DEPENDENCY_ID.to_string(),
-                    content_packs::VersionRequirement::Single(">=0.0.31".to_string()),
-                ),
-                (
-                    "classic-galactic-civil-war".to_string(),
-                    content_packs::VersionRequirement::Single("1.0.0".to_string()),
-                ),
-            ]),
-        }
-    }
-
-    fn write_pack_definition(root: &Path, directory: &str, id: &str, version: &str) {
-        let pack_root = root.join("Content").join("Packs").join(directory);
-        fs::create_dir_all(&pack_root).unwrap();
-        fs::write(
-            pack_root.join("pack.xml"),
-            format!(
-                "<ContentPack><ID>{id}</ID><Version>{version}</Version><Preloads><Preload><ID>main-menu</ID><Path>Preload/main-menu.xml</Path></Preload><Preload><ID>strategy</ID><Path>Preload/strategy.xml</Path></Preload></Preloads></ContentPack>"
-            ),
-        )
-        .unwrap();
     }
 
     fn signed_launcher_layer(manifest: &str) -> SignedLauncherLayer {
@@ -7320,7 +6536,7 @@ mod tests {
         let screen = up_to_date_screen("1.2.3", true);
         assert!(screen.contains("choice=open-editor\">Open editor"));
         assert!(screen.contains("choice=play\">Launch game"));
-        assert!(screen.contains("choice=content-packs"));
+        assert!(!screen.contains("choice=content-packs"));
     }
 
     #[test]
