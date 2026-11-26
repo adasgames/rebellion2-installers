@@ -1282,7 +1282,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                 return;
             }
             let (name, result) = if choice == "open-editor" {
-                ("editor", launch_editor(handle))
+                ("mod manager and editor", launch_editor(handle))
             } else {
                 ("game", launch_game(handle))
             };
@@ -1292,7 +1292,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                     handle,
                     "Not installed",
                     if choice == "open-editor" {
-                        "The editor isn't installed. Update the game to a version that includes it."
+                        "The mod manager and editor aren't installed. Update the game to a version that includes them."
                     } else {
                         "The game files aren't here yet — reinstall from the latest build."
                     },
@@ -6534,7 +6534,7 @@ mod tests {
     #[test]
     fn up_to_date_screen_with_installed_editor_offers_editor_launch() {
         let screen = up_to_date_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager and editor"));
         assert!(screen.contains("choice=play\">Launch game"));
         assert!(!screen.contains("choice=content-packs"));
     }
@@ -6542,7 +6542,7 @@ mod tests {
     #[test]
     fn launcher_staged_ready_screen_with_installed_editor_keeps_editor_available() {
         let screen = launcher_staged_ready_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager and editor"));
         assert!(screen.contains("choice=play\">Play game"));
     }
 
@@ -6585,7 +6585,7 @@ mod tests {
     #[test]
     fn update_check_failed_screen_with_installed_editor_keeps_it_available_offline() {
         let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed", true);
-        assert!(screen.contains("choice=open-editor\">Open editor"));
+        assert!(screen.contains("choice=open-editor\">Mod manager and editor"));
     }
 
     #[test]
