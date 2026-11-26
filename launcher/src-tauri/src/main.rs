@@ -183,7 +183,6 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 static PENDING_LAUNCHER_UPDATE: Mutex<Option<PendingUpdate<LauncherUpdate>>> = Mutex::new(None);
 /// A newer game-player release waiting for approval.
 static PENDING_GAME_UPDATE: Mutex<Option<PendingUpdate<GameUpdate>>> = Mutex::new(None);
-/// The last validated optional-pack catalog shown by the launcher.
 /// Set after this launcher session downloads an update for its next start.
 static LAUNCHER_UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
 /// A newer application release waiting for the user to approve its installation.
