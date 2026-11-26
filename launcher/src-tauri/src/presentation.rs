@@ -179,6 +179,12 @@ pub(crate) fn update_available_screen(
 
 /// Renders structured release notes for the update confirmation screen.
 pub(crate) fn render_release_notes(notes: &ReleaseNotes) -> String {
+    let warning = if notes.breaks_saves {
+        "<aside class=\"save-warning\" role=\"alert\"><strong>Save-breaking update</strong>\
+         <p>Existing saves will no longer load after this update. You will need to start a new game.</p></aside>"
+    } else {
+        ""
+    };
     let sections = notes
         .sections
         .iter()
@@ -196,7 +202,7 @@ pub(crate) fn render_release_notes(notes: &ReleaseNotes) -> String {
         .collect::<String>();
 
     format!(
-        "<div style=\"display:flex;flex:1;min-height:0;margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);flex-direction:column;text-align:left\"><h2 class=\"patch-title\" style=\"font-size:15px\">Patch Notes</h2><div class=\"release-changes\" style=\"flex:1;overflow-y:scroll;scrollbar-gutter:stable\">{sections}</div></div>"
+        "<div style=\"display:flex;flex:1;min-height:0;margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);flex-direction:column;text-align:left\">{warning}<h2 class=\"patch-title\" style=\"font-size:15px\">Patch Notes</h2><div class=\"release-changes\" style=\"flex:1;overflow-y:scroll;scrollbar-gutter:stable\">{sections}</div></div>"
     )
 }
 

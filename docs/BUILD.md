@@ -75,6 +75,8 @@ Actions tab → **Build game** → **Run workflow**.
 - **asset_ref** selects the matching `rebellion2-media` revision.
 - **version** is the game/content version, such as `0.0.26`.
 - **release_notes** contains game-only Markdown notes.
+- **breaks_saves** marks an update that requires players to start a new game. Leave it unchecked
+  for releases that can load existing saves.
 - **publish** controls whether the run moves the live game channel.
 - **allow_rollback** is reserved for an intentional emergency rollback.
 
@@ -168,6 +170,22 @@ The generated document has this schema:
 The pointer records the document path and digest. The launcher ignores missing, corrupt,
 mismatched, or malformed notes so notes cannot prevent an update. When an installation skips game
 or launcher versions, the corresponding view combines only that channel's newer notes.
+
+### Save-breaking game updates
+
+Select **breaks_saves** in **Build game** when the release cannot load existing saves. The launcher
+shows **Save-breaking update** above the patch notes before the player chooses whether to update:
+
+> Existing saves will no longer load after this update. You will need to start a new game.
+
+The release-notes JSON declares this with the optional boolean `"breaksSaves": true`, both at the
+document level for the current release and in that version's entry in `releases`. Omitted or false
+means the release does not break saves. Players skipping a flagged release still see the warning;
+players already past it do not see it again for a compatible update.
+
+The workflow adds `<!-- breaksSaves: true -->` to the GitHub release description, along with a visible
+warning. Keep that metadata when editing the release description: subsequent builds read it to
+preserve the flag in cumulative history. Release notes without this metadata remain compatible.
 
 ## Local launcher walkthrough
 

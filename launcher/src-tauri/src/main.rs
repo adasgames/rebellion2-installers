@@ -359,7 +359,7 @@ enum Pending {
     /// Incremental patch to `latest` from `base`.
     Update {
         base: String,
-        latest: Latest,
+        latest: Box<Latest>,
         finishes_application_update: bool,
         progress_start: u8,
         release_notes: Option<ReleaseNotes>,
@@ -1527,6 +1527,7 @@ fn show_preview_launcher_update(handle: &tauri::AppHandle) {
 #[cfg(debug_assertions)]
 fn preview_launcher_release_notes() -> ReleaseNotes {
     ReleaseNotes {
+        breaks_saves: false,
         version: "1.0.1".to_string(),
         sections: vec![ReleaseNoteSection {
             title: "Fixes".to_string(),
@@ -1540,6 +1541,7 @@ fn preview_launcher_release_notes() -> ReleaseNotes {
 #[cfg(debug_assertions)]
 fn preview_game_release_notes() -> ReleaseNotes {
     ReleaseNotes {
+        breaks_saves: true,
         version: "0.0.26".to_string(),
         sections: vec![ReleaseNoteSection {
             title: "Fixes".to_string(),
@@ -1915,7 +1917,7 @@ fn run_game_update(
             };
             *PENDING.lock().unwrap() = Some(Pending::Update {
                 base: base.clone(),
-                latest: update.content.clone(),
+                latest: Box::new(update.content.clone()),
                 finishes_application_update: true,
                 progress_start,
                 release_notes,
@@ -2415,7 +2417,7 @@ async fn run_macos_application_update(
             ));
             *PENDING.lock().unwrap() = Some(Pending::Update {
                 base: base.clone(),
-                latest: latest.clone(),
+                latest: Box::new(latest.clone()),
                 finishes_application_update: true,
                 progress_start: 48,
                 release_notes,
@@ -2524,7 +2526,7 @@ fn run_windows_application_update(
             let progress_start = if download_size > 0 { 48 } else { 0 };
             *PENDING.lock().unwrap() = Some(Pending::Update {
                 base: base.clone(),
-                latest: latest.clone(),
+                latest: Box::new(latest.clone()),
                 finishes_application_update: true,
                 progress_start,
                 release_notes,
@@ -3514,7 +3516,7 @@ fn continue_approved_update(handle: &tauri::AppHandle, base: &str, latest: &Late
     let release_notes = fetch_release_notes(base, latest);
     *PENDING.lock().unwrap() = Some(Pending::Update {
         base: base.to_string(),
-        latest: latest.clone(),
+        latest: Box::new(latest.clone()),
         finishes_application_update: true,
         progress_start: 0,
         release_notes: release_notes.clone(),
@@ -3549,7 +3551,7 @@ fn prompt_update(handle: &tauri::AppHandle, base: &str, latest: &Latest, content
     );
     *PENDING.lock().unwrap() = Some(Pending::Update {
         base: base.to_string(),
-        latest: latest.clone(),
+        latest: Box::new(latest.clone()),
         finishes_application_update: requires_matching_content,
         progress_start: 0,
         release_notes: release_notes.clone(),
@@ -7520,6 +7522,28 @@ mod tests {
     }
 
     #[test]
+    fn game_update_screen_with_save_breaking_notes_warns_before_patch_notes() {
+        let mut notes = release_notes();
+        notes.breaks_saves = true;
+
+        let screen = game_update_screen("1.2.3", Some(&notes), false);
+
+        assert!(screen.contains("role=\"alert\""));
+        assert!(screen.contains("Existing saves will no longer load after this update."));
+        assert!(screen.find("Save-breaking update").unwrap() < screen.find("Patch Notes").unwrap());
+        assert!(screen.contains("choice=game-update"));
+        assert!(screen.contains("choice=skip-game-update"));
+    }
+
+    #[test]
+    fn game_update_screen_without_save_breaking_notes_omits_warning() {
+        let screen = game_update_screen("1.2.3", Some(&release_notes()), false);
+
+        assert!(!screen.contains("Save-breaking update"));
+        assert!(screen.contains("Patch Notes"));
+    }
+
+    #[test]
     fn parse_release_notes_with_malformed_json_returns_none() {
         let bytes = br#"{"version":"1.2.3","sections":[}"#;
 
@@ -7897,6 +7921,7 @@ mod tests {
 
     fn release_notes() -> ReleaseNotes {
         ReleaseNotes {
+            breaks_saves: false,
             version: "1.2.3".to_string(),
             sections: vec![ReleaseNoteSection {
                 title: "Fixes".to_string(),
@@ -7908,6 +7933,7 @@ mod tests {
 
     fn cumulative_release_notes() -> ReleaseNotes {
         ReleaseNotes {
+            breaks_saves: false,
             version: "0.0.21".to_string(),
             sections: vec![
                 ReleaseNoteSection {
@@ -7921,6 +7947,7 @@ mod tests {
             ],
             releases: vec![
                 VersionedReleaseNotes {
+                    breaks_saves: false,
                     version: "0.0.15".to_string(),
                     sections: vec![ReleaseNoteSection {
                         title: "Fixes".to_string(),
@@ -7928,6 +7955,7 @@ mod tests {
                     }],
                 },
                 VersionedReleaseNotes {
+                    breaks_saves: false,
                     version: "0.0.16".to_string(),
                     sections: vec![
                         ReleaseNoteSection {
@@ -7941,6 +7969,7 @@ mod tests {
                     ],
                 },
                 VersionedReleaseNotes {
+                    breaks_saves: false,
                     version: "0.0.17".to_string(),
                     sections: vec![ReleaseNoteSection {
                         title: "Changes".to_string(),
@@ -7948,6 +7977,7 @@ mod tests {
                     }],
                 },
                 VersionedReleaseNotes {
+                    breaks_saves: false,
                     version: "0.0.21".to_string(),
                     sections: vec![
                         ReleaseNoteSection {

@@ -30,6 +30,53 @@ test("parseReleaseNotes omits prose and empty sections", () => {
   assert.deepEqual(notes, { version: "0.0.13", sections: [] });
 });
 
+test("parseReleaseNotes reads save compatibility metadata independently of prose", () => {
+  const notes = parseReleaseNotes(
+    "<!-- breaksSaves: true -->\n\n**Warning: A new game is required.**\n\n## Changes\n\n* Changed saved data.",
+    "0.3.0",
+  );
+
+  assert.equal(notes.breaksSaves, true);
+  assert.deepEqual(notes.sections, [
+    { title: "Changes", items: ["Changed saved data."] },
+  ]);
+  assert.equal(
+    parseReleaseNotes("## Fixes\n* Fixed saves without breaking them.", "0.3.0")
+      .breaksSaves,
+    undefined,
+  );
+});
+
+test("buildReleaseNotes preserves skipped save-breaking releases without flagging every later release", () => {
+  const notes = buildReleaseNotes(
+    "## Fixes\n* Fixed a display issue.",
+    "0.3.1",
+    [
+      {
+        tag_name: "v0.3.0",
+        body: "<!-- breaksSaves: true -->\n\n## Changes\n* Changed saved data.",
+      },
+    ],
+  );
+
+  assert.equal(notes.breaksSaves, undefined);
+  assert.equal(notes.releases[0].breaksSaves, true);
+  assert.equal(notes.releases[1].breaksSaves, undefined);
+});
+
+test("buildReleaseNotes retains save-breaking releases that have no bullet sections", () => {
+  const notes = buildReleaseNotes("<!-- breaksSaves: true -->", "0.3.1", [
+    { tag_name: "v0.3.0", body: "<!-- breaksSaves: true -->" },
+  ]);
+
+  assert.equal(notes.breaksSaves, true);
+  assert.deepEqual(
+    notes.releases.map((release) => release.version),
+    ["0.3.0", "0.3.1"],
+  );
+  assert(notes.releases.every((release) => release.breaksSaves));
+});
+
 test("buildReleaseNotes includes published history through the current release", () => {
   const notes = buildReleaseNotes(
     "## Additions\n\n* Added current feature.\n\n## Fixes\n\n* Fixed current issue.",

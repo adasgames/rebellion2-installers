@@ -141,14 +141,23 @@ h1 .two {
   font-size: 13px;
 }
 .save-warning {
-  margin: 0 0 16px;
-  color: #ff3434;
+  flex: none;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 107, 115, 0.55);
+  border-radius: 8px;
+  background: rgba(255, 107, 115, 0.09);
+  color: #ffadb2;
   font-size: 12px;
-  font-weight: 900;
-  line-height: 1.25;
-  text-align: center;
-  text-transform: uppercase;
-  letter-spacing: 0.025em;
+  line-height: 1.5;
+  text-align: left;
+}
+.save-warning strong {
+  display: block;
+  color: #ff6b73;
+}
+.save-warning p {
+  margin: 4px 0 0;
 }
 .changes + .changes {
   margin-top: 9px;
