@@ -43,7 +43,7 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 3. Follow the installer. Rebellion 2 lands in your Start Menu.
 
 When included with your game version, the Content Pack Editor also appears in the Start Menu.
-Setup offers a separate optional desktop shortcut. You can also choose **Mod manager and editor** in the launcher.
+Setup offers a separate optional desktop shortcut. You can also choose **Open mod manager** or **Open mod editor** in the launcher.
 
 Before launching the game or editor on Windows, the launcher records an audio diagnostic in
 `launcher.log` beside the launcher. It includes default output devices, their current formats,

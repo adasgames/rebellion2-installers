@@ -55,6 +55,12 @@ fn player_command(
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("/usr/bin/open");
+        if extra_arguments
+            .iter()
+            .any(|argument| argument == "-startPage")
+        {
+            command.arg("-n");
+        }
         command
             .arg(executable)
             .arg("--args")
@@ -251,6 +257,21 @@ mod tests {
         );
         let arguments = command.get_args().collect::<Vec<_>>();
         assert!(arguments.ends_with(&extra.iter().map(OsString::as_os_str).collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn toolkit_page_is_forwarded_without_changing_its_value() {
+        let extra = [OsString::from("-startPage"), OsString::from("Projects")];
+        let command = player_command(
+            Path::new("Toolkit.app"),
+            Path::new("install"),
+            GraphicsApi::Auto,
+            &extra,
+        );
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert!(arguments.ends_with(&[OsStr::new("-startPage"), OsStr::new("Projects")]));
+        #[cfg(target_os = "macos")]
+        assert_eq!(arguments.first().copied(), Some(OsStr::new("-n")));
     }
 
     #[test]

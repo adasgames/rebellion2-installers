@@ -336,9 +336,15 @@ pub(crate) fn up_to_date_screen(version: &str, editor_installed: bool) -> String
 pub(crate) fn ready_buttons(play_label: &str, editor_installed: bool) -> String {
     let mut buttons = button(play_label, "play");
     if editor_installed {
-        buttons.push_str(&secondary_button("Mod manager and editor", "open-editor"));
+        buttons.push_str(&toolkit_buttons());
     }
     buttons
+}
+
+/// Opens the installed toolkit at the page matching the requested task.
+fn toolkit_buttons() -> String {
+    secondary_button("Open mod manager", "open-mod-manager")
+        + &secondary_button("Open mod editor", "open-editor")
 }
 
 /// Builds the ready screen after staging a launcher update and checking the game.
@@ -373,7 +379,7 @@ pub(crate) fn update_check_failed_screen(
     if installed_version.is_some() {
         buttons.push_str(&secondary_button("Launch game", "play"));
         if editor_installed {
-            buttons.push_str(&secondary_button("Mod manager and editor", "open-editor"));
+            buttons.push_str(&toolkit_buttons());
         }
     }
     render_with_content("Launcher", false, &note, &content, &buttons)

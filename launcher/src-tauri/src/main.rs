@@ -1273,24 +1273,24 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     }
 
     match choice {
-        "play" | "open-editor" => {
+        "play" | "open-editor" | "open-mod-manager" => {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
             if retire_optional_packs(handle) {
                 return;
             }
-            let (name, result) = if choice == "open-editor" {
-                ("mod manager and editor", launch_editor(handle))
-            } else {
-                ("game", launch_game(handle))
+            let (name, result) = match choice {
+                "open-mod-manager" => ("mod manager", launch_editor(handle, "Library")),
+                "open-editor" => ("mod editor", launch_editor(handle, "Projects")),
+                _ => ("game", launch_game(handle)),
             };
             match result {
                 Ok(true) => handle.exit(0),
                 Ok(false) => show_message(
                     handle,
                     "Not installed",
-                    if choice == "open-editor" {
+                    if choice != "play" {
                         "The mod manager and editor aren't installed. Update the game to a version that includes them."
                     } else {
                         "The game files aren't here yet — reinstall from the latest build."
@@ -1486,7 +1486,7 @@ fn on_preview_choice(handle: &tauri::AppHandle, choice: &str) {
             });
         }
         "skip-game-update" => write_screen(handle, &up_to_date_screen("0.0.25", true)),
-        "play" | "open-editor" | "quit" => handle.exit(0),
+        "play" | "open-editor" | "open-mod-manager" | "quit" => handle.exit(0),
         _ => {}
     }
 }
@@ -5129,16 +5129,20 @@ fn ensure_linux_player_executables(directory: &Path) -> io::Result<()> {
 }
 
 fn launch_game(handle: &tauri::AppHandle) -> io::Result<bool> {
-    launch_player(handle, &game_path()?)
+    launch_player(handle, &game_path()?, &[])
 }
 
 /// Starts the editor using the same installed-content and process-lifetime rules as the game.
-fn launch_editor(handle: &tauri::AppHandle) -> io::Result<bool> {
-    launch_player(handle, &editor_path()?)
+fn launch_editor(handle: &tauri::AppHandle, page: &str) -> io::Result<bool> {
+    launch_player(handle, &editor_path()?, &["-startPage", page])
 }
 
 /// Validates the installed player/content pair before starting a bundled Unity application.
-fn launch_player(handle: &tauri::AppHandle, exe: &Path) -> io::Result<bool> {
+fn launch_player(
+    handle: &tauri::AppHandle,
+    exe: &Path,
+    extra_arguments: &[&str],
+) -> io::Result<bool> {
     recover_interrupted_updates()?;
     let base = install_dir()?;
     let content_version = read_installed_version(&base.join("Content"));
@@ -5192,12 +5196,9 @@ fn launch_player(handle: &tauri::AppHandle, exe: &Path) -> io::Result<bool> {
     ));
     #[cfg(target_os = "linux")]
     ensure_linux_player_executables(&base)?;
-    player_launch::launch(
-        exe,
-        &base,
-        &settings,
-        &player_session::launch_arguments(&base, &launcher_path()?),
-    )?;
+    let mut arguments = player_session::launch_arguments(&base, &launcher_path()?);
+    arguments.extend(extra_arguments.iter().map(|argument| (*argument).into()));
+    player_launch::launch(exe, &base, &settings, &arguments)?;
     Ok(true)
 }
 
@@ -6528,12 +6529,14 @@ mod tests {
         assert!(screen.contains("Version 1.2.3 is up to date."));
         assert!(screen.contains("choice=play\">Launch game"));
         assert!(!screen.contains("choice=open-editor"));
+        assert!(!screen.contains("choice=open-mod-manager"));
     }
 
     #[test]
     fn up_to_date_screen_with_installed_editor_offers_editor_launch() {
         let screen = up_to_date_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Mod manager and editor"));
+        assert!(screen.contains("choice=open-editor\">Open mod editor"));
+        assert!(screen.contains("choice=open-mod-manager\">Open mod manager"));
         assert!(screen.contains("choice=play\">Launch game"));
         assert!(!screen.contains("choice=content-packs"));
     }
@@ -6541,7 +6544,8 @@ mod tests {
     #[test]
     fn launcher_staged_ready_screen_with_installed_editor_keeps_editor_available() {
         let screen = launcher_staged_ready_screen("1.2.3", true);
-        assert!(screen.contains("choice=open-editor\">Mod manager and editor"));
+        assert!(screen.contains("choice=open-editor\">Open mod editor"));
+        assert!(screen.contains("choice=open-mod-manager\">Open mod manager"));
         assert!(screen.contains("choice=play\">Play game"));
     }
 
@@ -6579,12 +6583,14 @@ mod tests {
         assert!(screen.contains("choice=retry-update-check\">Retry"));
         assert!(!screen.contains("choice=play"));
         assert!(!screen.contains("choice=open-editor"));
+        assert!(!screen.contains("choice=open-mod-manager"));
     }
 
     #[test]
     fn update_check_failed_screen_with_installed_editor_keeps_it_available_offline() {
         let screen = update_check_failed_screen(Some("1.2.3"), "Connection Failed", true);
-        assert!(screen.contains("choice=open-editor\">Mod manager and editor"));
+        assert!(screen.contains("choice=open-editor\">Open mod editor"));
+        assert!(screen.contains("choice=open-mod-manager\">Open mod manager"));
     }
 
     #[test]
