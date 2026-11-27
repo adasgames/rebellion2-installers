@@ -211,7 +211,7 @@ This builds and drives the actual debug launcher and self-update helper against 
 It uses isolated temporary installations, a stub game, and fixture signing keys. It does not publish
 updates or touch an installed game. Release builds always use the production verification key.
 
-The scenarios cover fresh installation, repair, content packs, independent and combined updates,
+The scenarios cover fresh installation, repair, preservation of optional files during base-content updates, independent and combined updates,
 helper relaunch, interrupted downloads and commits, simultaneous launchers, locked files,
 authorization renewal, invalid signatures and paths, corrupt data, HTTP resume, and failed servers.
 They also compile the production installer template with isolated fixture payloads and exercise
@@ -310,3 +310,13 @@ packaging/macos/build-zip.sh                  # complete macOS app archive
 packaging/linux/build-appimage.sh             # complete Linux AppImage
 packaging/linux/AppRun                        # writable Linux installation bootstrap
 ```
+
+## Retiring patcher-installed packs
+
+The launcher no longer reads the optional pack catalogue or installs optional pack releases.
+Its one-time cleanup reads each existing `.content-packs/<id>/install.json` and manifest,
+checks the native pack ID and owned folder, and atomically renames the complete folder to
+`.content-packs/<id>/retired/pack`. It then removes the registration. A later run can finish
+registration cleanup after an interrupted rename. Existing backups are never overwritten.
+Bundled content, unregistered folders, and mod-manager installations are excluded.
+Players see the backup locations and instructions to reinstall through the mod manager.

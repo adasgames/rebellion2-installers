@@ -1,4 +1,3 @@
-use crate::content_packs::{self, ContentPackRelease};
 use crate::downloads::DownloadError;
 use crate::launch_settings::{AudioBackend, GraphicsApi};
 use crate::release_notes::ReleaseNotes;
@@ -325,30 +324,6 @@ pub(crate) fn steam_verification_help_screen(
     )
 }
 
-/// Renders the required optional-content update without offering a launch bypass.
-pub(crate) fn required_content_pack_update_screen(
-    release: &ContentPackRelease,
-    installed: &content_packs::InstalledContentPack,
-) -> String {
-    let buttons = format!(
-        "{}{}",
-        button(
-            "Update content pack",
-            &format!("content-pack-install:{}", release.id)
-        ),
-        secondary_button("Manage content packs", "content-packs")
-    );
-    render(
-        "Content pack update required",
-        false,
-        &format!(
-            "{} must be updated from {} to {} before launching this game version.",
-            release.name, installed.version, release.version
-        ),
-        &buttons,
-    )
-}
-
 pub(crate) fn up_to_date_screen(version: &str, editor_installed: bool) -> String {
     render(
         "Up to date",
@@ -361,24 +336,15 @@ pub(crate) fn up_to_date_screen(version: &str, editor_installed: bool) -> String
 pub(crate) fn ready_buttons(play_label: &str, editor_installed: bool) -> String {
     let mut buttons = button(play_label, "play");
     if editor_installed {
-        buttons.push_str(&secondary_button("Open editor", "open-editor"));
+        buttons.push_str(&toolkit_buttons());
     }
-    buttons.push_str(&secondary_button("Content packs", "content-packs"));
     buttons
 }
 
-pub(crate) fn content_pack_error_screen(title: &str, error: &str) -> String {
-    let buttons = format!(
-        "{}{}",
-        button("Retry", "content-packs"),
-        secondary_button("Back", "back-to-ready")
-    );
-    render(
-        title,
-        false,
-        &format!("{error} See launcher.log for details."),
-        &buttons,
-    )
+/// Opens the installed toolkit at the page matching the requested task.
+fn toolkit_buttons() -> String {
+    secondary_button("Open mod manager", "open-mod-manager")
+        + &secondary_button("Open mod editor", "open-editor")
 }
 
 /// Builds the ready screen after staging a launcher update and checking the game.
@@ -413,7 +379,7 @@ pub(crate) fn update_check_failed_screen(
     if installed_version.is_some() {
         buttons.push_str(&secondary_button("Launch game", "play"));
         if editor_installed {
-            buttons.push_str(&secondary_button("Open editor", "open-editor"));
+            buttons.push_str(&toolkit_buttons());
         }
     }
     render_with_content("Launcher", false, &note, &content, &buttons)

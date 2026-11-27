@@ -43,7 +43,7 @@ either *Star Wars: Rebellion* or *Star Wars: Empire at War: Gold Pack* on **GOG*
 3. Follow the installer. Rebellion 2 lands in your Start Menu.
 
 When included with your game version, the Content Pack Editor also appears in the Start Menu.
-Setup offers a separate optional desktop shortcut. You can also choose **Open editor** in the launcher.
+Setup offers a separate optional desktop shortcut. You can also choose **Open mod manager** or **Open mod editor** in the launcher.
 
 Before launching the game or editor on Windows, the launcher records an audio diagnostic in
 `launcher.log` beside the launcher. It includes default output devices, their current formats,
@@ -141,3 +141,12 @@ those excluded materials; they remain subject to their respective rights and lic
 ---
 
 *Building the installers yourself or maintaining the release pipeline? See [`docs/BUILD.md`](docs/BUILD.md).*
+
+## Mods and content packs
+
+Browse, install, and update mods through the content pack editor’s mod manager, using
+[Thunderstore](https://thunderstore.io/c/rebellion-2/). The launcher updates the game and its
+bundled content. On the first run of the updated launcher, registered patcher-installed packs are removed from
+`Content/Packs` and kept as full backups in `.content-packs/<id>/retired/pack`, including local
+edits. Reinstall them through the mod manager before using those packs again. This cleanup does
+not remove Thunderstore installations in `Mods` or unregistered packs.

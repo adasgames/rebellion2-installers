@@ -75,7 +75,6 @@ jobs:
         env:
           REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
-          REB2_CONTENT_PACK_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content-packs.invalid/' || secrets.REB2_CONTENT_PACK_BASE_URL }}
           REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:REB2_AUTH_BASE_URL)) {
@@ -83,9 +82,6 @@ jobs:
           }
           if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_BASE_URL)) {
             throw "The update channel is not configured."
-          }
-          if ([string]::IsNullOrWhiteSpace($env:REB2_CONTENT_PACK_BASE_URL)) {
-            throw "The content-pack channel is not configured."
           }
           cargo build --release --manifest-path launcher/src-tauri/Cargo.toml
           cargo build --release --manifest-path launcher/self-update/Cargo.toml
@@ -166,13 +162,11 @@ jobs:
         env:
           REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
-          REB2_CONTENT_PACK_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content-packs.invalid/' || secrets.REB2_CONTENT_PACK_BASE_URL }}
           REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           test -n "$REB2_AUTH_BASE_URL"
           test -n "$REB2_CONTENT_BASE_URL"
-          test -n "$REB2_CONTENT_PACK_BASE_URL"
           jq --arg version "$REB2_LAUNCHER_VERSION" '.version = $version' \
             launcher/src-tauri/tauri.conf.json > launcher/src-tauri/tauri.launcher.conf.json
           (
@@ -255,13 +249,11 @@ jobs:
         env:
           REB2_AUTH_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://auth.invalid' || secrets.AUTH_BASE_URL }}
           REB2_CONTENT_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content.invalid/' || secrets.REB2_CONTENT_BASE_URL }}
-          REB2_CONTENT_PACK_BASE_URL: ${{ github.event_name == 'pull_request' && 'https://content-packs.invalid/' || secrets.REB2_CONTENT_PACK_BASE_URL }}
           REB2_LAUNCHER_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           test -n "$REB2_AUTH_BASE_URL"
           test -n "$REB2_CONTENT_BASE_URL"
-          test -n "$REB2_CONTENT_PACK_BASE_URL"
           jq --arg version "$REB2_LAUNCHER_VERSION" '.version = $version' \
             launcher/src-tauri/tauri.conf.json > launcher/src-tauri/tauri.launcher.conf.json
           (
