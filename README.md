@@ -146,7 +146,4 @@ those excluded materials; they remain subject to their respective rights and lic
 
 Browse, install, and update mods through the content pack editor’s mod manager, using
 [Thunderstore](https://thunderstore.io/c/rebellion-2/). The launcher updates the game and its
-bundled content. On the first run of the updated launcher, registered patcher-installed packs are removed from
-`Content/Packs` and kept as full backups in `.content-packs/<id>/retired/pack`, including local
-edits. Reinstall them through the mod manager before using those packs again. This cleanup does
-not remove Thunderstore installations in `Mods` or unregistered packs.
+bundled content. Existing packs in `Content/Packs` are left in place, including local edits.
