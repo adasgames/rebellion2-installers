@@ -16,7 +16,6 @@
 mod browser_signin;
 mod downloads;
 mod launch_settings;
-mod legacy_packs;
 #[cfg(target_os = "linux")]
 mod linux_audio;
 mod manifests;
@@ -1279,9 +1278,6 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
-            if retire_optional_packs(handle) {
-                return;
-            }
             let (name, result) = match choice {
                 "open-mod-manager" => ("mod manager", launch_editor(handle, "Library")),
                 "open-editor" => ("mod editor", launch_editor(handle, "Projects")),
@@ -4342,41 +4338,7 @@ fn show_result(handle: &tauri::AppHandle, kicker: &str, status: &str, label: &st
     );
 }
 
-/// Retires registered optional packs before offering another game or editor launch.
-fn retire_optional_packs(handle: &tauri::AppHandle) -> bool {
-    let result = install_dir().and_then(|root| legacy_packs::retire(&root));
-    match result {
-        Ok(packs) if packs.is_empty() => false,
-        Ok(packs) => {
-            let backups = packs
-                .iter()
-                .map(|pack| format!("{}: {}", pack.name, pack.backup.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            log_line(&format!(
-                "[launcher] retired optional pack installations:\n{backups}"
-            ));
-            show_message(handle, "Content pack installation changed",
-                &format!("Optional packs are now managed through the content pack editor's mod manager. The old installations were removed and full backups were kept:\n\n{backups}\n\nInstall these packs again from Thunderstore to use them."),
-                Some(("Continue", "retry-update-check")));
-            true
-        }
-        Err(error) => {
-            log_line(&format!(
-                "[launcher] optional pack cleanup could not finish: {error}"
-            ));
-            show_message(handle, "Content pack cleanup incomplete",
-                &format!("The old installations could not be fully backed up and removed. Close other programs and retry. Existing backups are retained.\n\n{error}"),
-                Some(("Retry", "retry-update-check")));
-            true
-        }
-    }
-}
-
 fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
-    if retire_optional_packs(handle) {
-        return;
-    }
     let editor_installed = editor_path().is_ok_and(|path| path.exists());
     let screen = if launcher_update_was_staged() {
         launcher_staged_ready_screen(version, editor_installed)

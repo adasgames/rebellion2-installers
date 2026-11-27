@@ -311,12 +311,7 @@ packaging/linux/build-appimage.sh             # complete Linux AppImage
 packaging/linux/AppRun                        # writable Linux installation bootstrap
 ```
 
-## Retiring patcher-installed packs
+## Existing pack installations
 
-The launcher no longer reads the optional pack catalogue or installs optional pack releases.
-Its one-time cleanup reads each existing `.content-packs/<id>/install.json` and manifest,
-checks the native pack ID and owned folder, and atomically renames the complete folder to
-`.content-packs/<id>/retired/pack`. It then removes the registration. A later run can finish
-registration cleanup after an interrupted rename. Existing backups are never overwritten.
-Bundled content, unregistered folders, and mod-manager installations are excluded.
-Players see the backup locations and instructions to reinstall through the mod manager.
+The launcher no longer downloads optional packs or removes existing installations. Use the mod
+manager for new installations. Existing pack folders and installation records are left in place.

@@ -2727,7 +2727,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
- "serde",
 ]
 
 [[package]]
@@ -2777,7 +2776,6 @@ dependencies = [
  "hex",
  "libloading 0.8.9",
  "open",
- "quick-xml",
  "rebellion2-update-core",
  "serde",
  "serde_json",
