@@ -78,6 +78,8 @@ use downloads::{
 use launch_settings::LauncherSettings;
 #[cfg(test)]
 use rebellion2_update_core::apply;
+#[cfg(not(target_os = "macos"))]
+use rebellion2_update_core::diff_verified;
 #[cfg(test)]
 use rebellion2_update_core::sha256_hex;
 use rebellion2_update_core::FileEntry;
