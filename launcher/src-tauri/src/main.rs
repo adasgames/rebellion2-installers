@@ -4348,8 +4348,10 @@ fn show_up_to_date(handle: &tauri::AppHandle, version: &str) {
     write_screen(handle, &screen);
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct EmptyBlobs;
 
+#[cfg(any(target_os = "macos", test))]
 impl BlobSource for EmptyBlobs {
     fn fetch_to(&self, _entry: &FileEntry, _destination: &Path) -> io::Result<()> {
         Err(io::Error::new(
