@@ -12,8 +12,18 @@ on:
         description: Launcher patch notes in Markdown
         required: true
         type: string
+      platform:
+        description: Launcher platforms to build and publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+          - linux
       publish:
-        description: Publish the Windows, macOS, and Linux launcher update together
+        description: Publish the selected launcher platforms
         required: true
         default: false
         type: boolean
@@ -42,14 +52,20 @@ jobs:
       - id: release
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '0.0.0-ci' }}
+          PLATFORM: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'all' }}
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           node scripts/semver.mjs "$VERSION" "$VERSION" >/dev/null
+          case "$PLATFORM" in
+            all|windows|macos|linux) ;;
+            *) echo "Unsupported launcher platform: $PLATFORM" >&2; exit 1 ;;
+          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build Windows launcher
+    if: github.event_name == 'pull_request' || inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     needs: prepare
     steps:
@@ -133,6 +149,7 @@ jobs:
 
   macos:
     name: Build macOS launcher
+    if: github.event_name == 'pull_request' || inputs.platform == 'all' || inputs.platform == 'macos'
     runs-on: macos-latest
     needs: prepare
     steps:
@@ -206,6 +223,7 @@ jobs:
 
   linux:
     name: Build Linux launcher
+    if: github.event_name == 'pull_request' || inputs.platform == 'all' || inputs.platform == 'linux'
     runs-on: ubuntu-22.04
     needs: prepare
     steps:
@@ -287,7 +305,20 @@ jobs:
 
   publish:
     name: Publish launcher release
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.publish &&
+        needs.prepare.result == 'success' &&
+        (inputs.platform != 'all' ||
+          (needs.windows.result == 'success' &&
+           needs.macos.result == 'success' &&
+           needs.linux.result == 'success')) &&
+        (inputs.platform != 'windows' || needs.windows.result == 'success') &&
+        (inputs.platform != 'macos' || needs.macos.result == 'success') &&
+        (inputs.platform != 'linux' || needs.linux.result == 'success')
+      }}
     runs-on: ubuntu-latest
     needs: [prepare, windows, macos, linux]
     permissions:
@@ -296,21 +327,24 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.platform == 'all' || inputs.platform == 'windows'
         with:
           name: launcher-windows
           path: windows
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.platform == 'all' || inputs.platform == 'macos'
         with:
           name: launcher-macos
           path: macos
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.platform == 'all' || inputs.platform == 'linux'
         with:
           name: launcher-linux
           path: linux
 
-      - name: Sign and publish one cross-platform launcher release
+      - name: Sign and publish the selected launcher platforms
         env:
           LAUNCHER_SIGNING_KEY: ${{ secrets.LAUNCHER_SIGNING_KEY }}
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
@@ -321,13 +355,11 @@ jobs:
           STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
           STORAGE_PROVIDER: ${{ secrets.STORAGE_PROVIDER }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ inputs.platform }}
           ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          windows_manifest="windows/launcher-manifest-windows.json"
-          macos_manifest="macos/launcher-manifest-macos.json"
-          linux_manifest="linux/launcher-manifest-linux.json"
           notes="release-notes-launcher-${VERSION}.json"
           printf '%s\n' "$RELEASE_NOTES" > launcher-release-notes.md
           gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq --slurp 'add' > release-history.json
@@ -346,29 +378,31 @@ jobs:
               process.stdout.write(c.sign(null,fs.readFileSync(process.argv[1]),key).toString("hex"));
             ' "$1"
           }
-          windows_signature=$(sign_manifest "$windows_manifest")
-          macos_signature=$(sign_manifest "$macos_manifest")
-          linux_signature=$(sign_manifest "$linux_manifest")
-          notes_sha=$(sha256sum "$notes" | cut -d' ' -f1)
+          platforms='{}'
+          assets=()
+          for platform in windows macos linux; do
+            if [ "$PLATFORM" != all ] && [ "$PLATFORM" != "$platform" ]; then continue; fi
+            manifest="$platform/launcher-manifest-$platform.json"
+            signature="$(sign_manifest "$manifest")"
+            platforms="$(jq \
+              --arg platform "$platform" \
+              --arg manifest "dist/launcher-manifest-${platform}-${VERSION}.json" \
+              --arg signature "$signature" \
+              '.[$platform]={manifest:$manifest,blobs:"launcher-blobs/",signature:$signature}' \
+              <<<"$platforms")"
+            case "$platform" in
+              windows) assets+=(windows/Rebellion2-launcher-Windows.zip) ;;
+              macos) assets+=(macos/Rebellion2-launcher-macOS.zip) ;;
+              linux) assets+=(linux/Rebellion2-launcher-Linux.tar.gz) ;;
+            esac
+          done
+          notes_sha=$(sha256sum "$notes" | cut -d ' ' -f1)
           jq -n \
             --arg version "$VERSION" \
-            --arg windows_manifest "dist/launcher-manifest-windows-${VERSION}.json" \
-            --arg windows_signature "$windows_signature" \
-            --arg macos_manifest "dist/launcher-manifest-macos-${VERSION}.json" \
-            --arg macos_signature "$macos_signature" \
-            --arg linux_manifest "dist/launcher-manifest-linux-${VERSION}.json" \
-            --arg linux_signature "$linux_signature" \
+            --argjson platforms "$platforms" \
             --arg notes_path "dist/${notes}" \
             --arg notes_sha "$notes_sha" \
-            '{
-              version:$version,
-              platforms:{
-                windows:{manifest:$windows_manifest,blobs:"launcher-blobs/",signature:$windows_signature},
-                macos:{manifest:$macos_manifest,blobs:"launcher-blobs/",signature:$macos_signature},
-                linux:{manifest:$linux_manifest,blobs:"launcher-blobs/",signature:$linux_signature}
-              },
-              releaseNotes:{path:$notes_path,sha256:$notes_sha}
-            }' > launcher.json
+            '{version:$version,platforms:$platforms,releaseNotes:{path:$notes_path,sha256:$notes_sha}}' > launcher.json
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone
           export RCLONE_S3_PROVIDER="$STORAGE_PROVIDER"
           export RCLONE_S3_ACCESS_KEY_ID="$STORAGE_ACCESS_KEY_ID"
@@ -391,9 +425,7 @@ jobs:
               exit 1
             fi
             gh release upload "$tag" \
-              windows/Rebellion2-launcher-Windows.zip \
-              macos/Rebellion2-launcher-macOS.zip \
-              linux/Rebellion2-launcher-Linux.tar.gz \
+              "${assets[@]}" \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
             gh release edit "$tag" \
@@ -409,16 +441,13 @@ jobs:
               --title "Rebellion 2 launcher $VERSION" \
               --notes-file launcher-release-body.md \
               --repo "$GITHUB_REPOSITORY" \
-              windows/Rebellion2-launcher-Windows.zip \
-              macos/Rebellion2-launcher-macOS.zip \
-              linux/Rebellion2-launcher-Linux.tar.gz
+              "${assets[@]}"
           fi
-          rclone copy windows/launcher-blobs-windows "${remote}/launcher-blobs" --ignore-existing
-          rclone copy macos/launcher-blobs-macos "${remote}/launcher-blobs" --ignore-existing
-          rclone copy linux/launcher-blobs-linux "${remote}/launcher-blobs" --ignore-existing
-          rclone copyto "$windows_manifest" "${remote}/dist/launcher-manifest-windows-${VERSION}.json"
-          rclone copyto "$macos_manifest" "${remote}/dist/launcher-manifest-macos-${VERSION}.json"
-          rclone copyto "$linux_manifest" "${remote}/dist/launcher-manifest-linux-${VERSION}.json"
+          for platform in windows macos linux; do
+            if [ "$PLATFORM" != all ] && [ "$PLATFORM" != "$platform" ]; then continue; fi
+            rclone copy "$platform/launcher-blobs-$platform" "${remote}/launcher-blobs" --ignore-existing
+            rclone copyto "$platform/launcher-manifest-$platform.json" "${remote}/dist/launcher-manifest-${platform}-${VERSION}.json"
+          done
           rclone copyto "$notes" "${remote}/dist/${notes}"
           rollback="$(mktemp -d)"
           previous_pointer=false

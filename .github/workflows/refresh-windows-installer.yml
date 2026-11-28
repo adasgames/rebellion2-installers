@@ -102,9 +102,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $base = $env:CHANNEL_BASE.TrimEnd('/') + '/'
-          $pointer = Invoke-RestMethod ($base + 'dist/launcher.json')
-          if ($pointer.version -ne $env:LAUNCHER_VERSION) { throw 'The requested launcher is not the current published launcher.' }
-          $relative = [string]$pointer.platforms.windows.manifest
+          $relative = "dist/launcher-manifest-windows-$env:LAUNCHER_VERSION.json"
           if ($relative -notmatch '^dist/[A-Za-z0-9._-]+\.json$') { throw 'Invalid launcher manifest location.' }
           Invoke-WebRequest ($base + $relative) -OutFile launcher-manifest.json
           $manifest = Get-Content -Raw launcher-manifest.json | ConvertFrom-Json

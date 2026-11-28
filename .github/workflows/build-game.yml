@@ -231,16 +231,23 @@ jobs:
         shell: pwsh
         env:
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $base = $env:CHANNEL_BASE.TrimEnd('/')
           $pointer = Invoke-RestMethod "$base/dist/launcher.json"
-          $version = $pointer.version
+          $pointer | ConvertTo-Json -Depth 20 | Set-Content launcher.json
+          gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq add | Set-Content launcher-releases.json
+          if ($LASTEXITCODE -ne 0) { throw "Could not list published launchers." }
+          node scripts/select-launcher-release.mjs launcher.json launcher-releases.json windows launcher-selection.json
+          if ($LASTEXITCODE -ne 0) { throw "Could not select a Windows launcher." }
+          $selection = Get-Content launcher-selection.json -Raw | ConvertFrom-Json
+          $version = $selection.version
           if ([string]::IsNullOrWhiteSpace($version)) { throw "The launcher channel has no version." }
           Invoke-WebRequest `
             "https://github.com/$env:GITHUB_REPOSITORY/releases/download/launcher-v$version/Rebellion2-launcher-Windows.zip" `
             -OutFile launcher.zip
           Expand-Archive launcher.zip launcher-bundle
-          Invoke-WebRequest "$base/$($pointer.platforms.windows.manifest)" -OutFile launcher-manifest.json
+          Invoke-WebRequest "$base/$($selection.manifest)" -OutFile launcher-manifest.json
           Set-Content launcher-version.txt -Value $version -NoNewline
 
       - name: Package Windows game layer
@@ -321,11 +328,14 @@ jobs:
       - name: Assemble the current launcher with the game
         env:
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           base="${CHANNEL_BASE%/}"
-          curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
-          launcher_version="$(jq -r .version launcher.json)"
+          curl --fail --location --silent --show-error "${base}/dist/launcher.json" -o launcher.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq add > launcher-releases.json
+          node scripts/select-launcher-release.mjs launcher.json launcher-releases.json macos launcher-selection.json
+          launcher_version="$(jq -r .version launcher-selection.json)"
           test -n "$launcher_version"
           curl --fail --location --silent --show-error \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${launcher_version}/Rebellion2-launcher-macOS.zip" \
@@ -382,12 +392,15 @@ jobs:
       - name: Download the current Linux launcher bundle
         env:
           CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           base="${CHANNEL_BASE%/}"
           curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
-          launcher_version="$(jq -er '.version | select(length > 0)' launcher.json)"
-          launcher_manifest="$(jq -er '.platforms.linux.manifest | select(length > 0)' launcher.json)"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq add > launcher-releases.json
+          node scripts/select-launcher-release.mjs launcher.json launcher-releases.json linux launcher-selection.json
+          launcher_version="$(jq -er '.version | select(length > 0)' launcher-selection.json)"
+          launcher_manifest="$(jq -er '.manifest | select(length > 0)' launcher-selection.json)"
           curl --fail --location --silent --show-error \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${launcher_version}/Rebellion2-launcher-Linux.tar.gz" \
             -o launcher.tar.gz
