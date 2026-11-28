@@ -1274,21 +1274,40 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
     }
 
     match choice {
-        "play" | "open-editor" | "open-mod-manager" => {
+        "play"
+        | "open-editor"
+        | "open-mod-manager"
+        | "retry-play"
+        | "retry-open-editor"
+        | "retry-open-mod-manager" => {
             APPLICATION_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             GAME_UPDATE_AUTH_PENDING.store(false, Ordering::Relaxed);
             clear_approved_content_update();
-            let (name, result) = match choice {
+            let retry = choice.strip_prefix("retry-");
+            let launch_choice = retry.unwrap_or(choice);
+            let (name, result) = match launch_choice {
                 "open-mod-manager" => ("mod manager", launch_editor(handle, "Library")),
                 "open-editor" => ("mod editor", launch_editor(handle, "Projects")),
                 _ => ("game", launch_game(handle)),
             };
             match result {
-                Ok(true) => handle.exit(0),
+                Ok(true) if retry.is_some() => {
+                    let editor_installed = editor_path().is_ok_and(|path| path.exists());
+                    write_screen(
+                        handle,
+                        &render(
+                            "Ready to play",
+                            false,
+                            &format!("The {name} started."),
+                            &presentation::ready_buttons("Launch game", editor_installed),
+                        ),
+                    );
+                }
+                Ok(true) => {}
                 Ok(false) => show_message(
                     handle,
                     "Not installed",
-                    if choice != "play" {
+                    if launch_choice != "play" {
                         "The mod manager and editor aren't installed. Update the game to a version that includes them."
                     } else {
                         "The game files aren't here yet — reinstall from the latest build."
@@ -1301,7 +1320,7 @@ fn on_choice(handle: &tauri::AppHandle, choice: &str) {
                         handle,
                         "Couldn't start",
                         &format!("The {name} failed to start: {err}"),
-                        Some(("Retry", choice)),
+                        Some(("Retry", &format!("retry-{launch_choice}"))),
                     );
                 }
             }
@@ -1484,7 +1503,7 @@ fn on_preview_choice(handle: &tauri::AppHandle, choice: &str) {
             });
         }
         "skip-game-update" => write_screen(handle, &up_to_date_screen("0.0.25", true)),
-        "play" | "open-editor" | "open-mod-manager" | "quit" => handle.exit(0),
+        "quit" => handle.exit(0),
         _ => {}
     }
 }
@@ -3950,7 +3969,7 @@ fn start_install(handle: tauri::AppHandle, url: String) {
         let result = install_content(&handle, &url);
         drop(operation);
         match result {
-            Ok(content_dir) => {
+            Ok((content_dir, version)) => {
                 clear_approved_content_update();
                 log_line(&format!(
                     "[launcher] Content installed to {}",
@@ -3958,7 +3977,7 @@ fn start_install(handle: tauri::AppHandle, url: String) {
                 ));
                 update_progress(&handle, 100, "Starting game…");
                 match launch_game(&handle) {
-                    Ok(true) => handle.exit(0),
+                    Ok(true) => show_up_to_date(&handle, &version),
                     Ok(false) => show_message(
                         &handle,
                         "Installed",
@@ -3971,7 +3990,7 @@ fn start_install(handle: tauri::AppHandle, url: String) {
                             &handle,
                             "Couldn't start",
                             &format!("The game failed to start: {err}"),
-                            Some(("Retry", "play")),
+                            Some(("Retry", "retry-play")),
                         );
                     }
                 }
@@ -4727,7 +4746,7 @@ fn format_log_entry(message: &str, timestamp: chrono::DateTime<chrono::Utc>) -> 
 fn install_content(
     handle: &tauri::AppHandle,
     url: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let base = install_dir()?;
     let archive_path = base.join("content.zip");
     let content_dir = base.join("Content");
@@ -4916,7 +4935,7 @@ fn install_content(
             "[launcher] unable to clear completed Content download metadata: {error}"
         ));
     }
-    Ok(content_dir)
+    Ok((content_dir, version))
 }
 
 /// Removes a completed Content archive that failed validation so Retry downloads it again.
