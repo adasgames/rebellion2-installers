@@ -3,12 +3,14 @@
 fn main() {
     let executable = std::env::current_exe().expect("fixture executable path");
     let directory = executable.parent().unwrap();
+    let working_directory = std::env::current_dir().expect("fixture working directory");
+    let start_page = std::env::args()
+        .skip_while(|argument| argument != "-startPage")
+        .nth(1)
+        .unwrap_or_default();
     std::fs::write(
         directory.join("editor-started"),
-        std::env::current_dir()
-            .unwrap()
-            .to_string_lossy()
-            .as_bytes(),
+        format!("{}\n{start_page}", working_directory.display()),
     )
     .expect("recording the fixture editor launch");
 
@@ -16,7 +18,7 @@ fn main() {
     while std::time::Instant::now() < deadline {
         if directory.join("editor-confirm").is_file() {
             std::fs::write(directory.join("editor-alive"), b"alive")
-                .expect("recording editor survival after launcher exit");
+                .expect("recording editor readiness");
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

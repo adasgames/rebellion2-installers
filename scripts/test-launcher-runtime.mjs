@@ -999,16 +999,12 @@ async function completeGogSignIn(session) {
   );
 }
 
-async function expectEditorLaunch(session) {
+async function expectEditorLaunch(session, startPage = "Projects") {
   await until(
     async () =>
       (await readText(path.join(session.directory, "editor-started"))) ===
-      session.directory,
-    "editor launch with installation working directory",
-  );
-  await until(
-    () => session.child.exitCode === 0,
-    "launcher exit after opening editor",
+      `${session.directory}\n${startPage}`,
+    `toolkit launch on ${startPage} with installation working directory`,
   );
   await fs.writeFile(
     path.join(session.directory, "editor-confirm"),
@@ -1018,11 +1014,23 @@ async function expectEditorLaunch(session) {
     async () =>
       (await readText(path.join(session.directory, "editor-alive"))) ===
       "alive",
-    "editor process surviving launcher exit",
+    "toolkit responding while the launcher is open",
   );
+  await expectLauncherReady(session);
   assert.equal(
     await readText(path.join(session.directory, "game-started")),
     null,
+  );
+}
+
+async function expectLauncherReady(session) {
+  assert.equal(session.child.exitCode, null);
+  assert.equal(
+    await evaluate(
+      session,
+      `Boolean(document.querySelector('a[href*="choice=play"]'))`,
+    ),
+    true,
   );
 }
 
@@ -1527,8 +1535,23 @@ try {
     );
   }
 
+  await scenario("launching the game keeps the launcher open", async () => {
+    const directory = await seedInstall("game-ready", {
+      contentVersion: "2.0.0",
+    });
+    const session = await launch(directory);
+    await screen(session, "up to date");
+    await click(session, "play");
+    await until(
+      async () =>
+        (await readText(path.join(directory, "game-started"))) === "started",
+      "game launch from the ready screen",
+    );
+    await expectLauncherReady(session);
+  });
+
   await scenario(
-    "content editor launches from the ready screen and survives launcher exit",
+    "content editor launches from the ready screen and keeps the launcher open",
     async () => {
       const directory = await seedInstall("editor-ready", {
         contentVersion: "2.0.0",
@@ -1560,6 +1583,23 @@ try {
       );
       await click(session, "open-editor");
       await expectEditorLaunch(session);
+    },
+  );
+
+  await scenario(
+    "mod manager opens the toolkit library and keeps the launcher open",
+    async () => {
+      const directory = await seedInstall("mod-manager-ready", {
+        contentVersion: "2.0.0",
+      });
+      await fs.writeFile(
+        path.join(directory, "rebellion2-editor.exe"),
+        editorBytes,
+      );
+      const session = await launch(directory);
+      await screen(session, "up to date");
+      await click(session, "open-mod-manager");
+      await expectEditorLaunch(session, "Library");
     },
   );
 
@@ -2602,7 +2642,7 @@ try {
   );
 
   await scenario(
-    "failed game launch after installation offers retry instead of staying busy",
+    "retrying game launch after installation keeps the launcher open",
     async () => {
       state.archive = zipArchive(state.newFiles);
       const directory = await seedInstall("failed-first-launch", {
@@ -2623,17 +2663,19 @@ try {
         "2.0.0",
       );
       await fs.writeFile(path.join(directory, ".game-version"), "2.0.0");
-      await click(session, "play");
+      await click(session, "retry-play");
       await until(
         async () =>
           (await readText(path.join(directory, "game-started"))) === "started",
         "game launch after retry",
       );
+      await screen(session, "The game started.");
+      await expectLauncherReady(session);
     },
   );
 
   await scenario(
-    "first install verifies the archive and launches the real game stub",
+    "first install verifies the archive, launches the game and keeps the launcher open",
     async () => {
       state.archive = zipArchive(state.newFiles);
       const directory = await seedInstall("first-install", {
@@ -2648,6 +2690,8 @@ try {
           (await readText(path.join(directory, "game-started"))) === "started",
         "game launch after first install",
       );
+      await screen(session, "up to date");
+      await expectLauncherReady(session);
       assert.equal(
         await readText(path.join(directory, "Content", ".content-version")),
         "2.0.0",
