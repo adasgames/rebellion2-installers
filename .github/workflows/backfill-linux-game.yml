@@ -98,10 +98,7 @@ jobs:
         run: |
           set -euo pipefail
           base="${CHANNEL_BASE%/}"
-          curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
-          published_version="$(jq -er '.version | select(length > 0)' launcher.json)"
-          test "$published_version" = "$LAUNCHER_VERSION"
-          launcher_manifest="$(jq -er '.platforms.linux.manifest | select(length > 0)' launcher.json)"
+          launcher_manifest="dist/launcher-manifest-linux-${LAUNCHER_VERSION}.json"
           curl --fail --location --silent --show-error \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${LAUNCHER_VERSION}/Rebellion2-launcher-Linux.tar.gz" \
             -o launcher.tar.gz

@@ -104,14 +104,10 @@ jobs:
 
       - name: Assemble the current launcher with the game
         env:
-          CHANNEL_BASE: ${{ secrets.REB2_CONTENT_BASE_URL }}
           LAUNCHER_VERSION: ${{ inputs.launcher_version }}
         run: |
           set -euo pipefail
-          base="${CHANNEL_BASE%/}"
-          curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
-          launcher_version="$(jq -r .version launcher.json)"
-          test "$launcher_version" = "$LAUNCHER_VERSION"
+          launcher_version="$LAUNCHER_VERSION"
           curl --fail --location --silent --show-error \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/launcher-v${launcher_version}/Rebellion2-launcher-macOS.zip" \
             -o launcher.zip

@@ -15,7 +15,7 @@ Launcher releases and game releases are independent:
   channel.
 
 The packages ship no licensed art. The launcher verifies ownership before downloading protected
-content. Windows, macOS, and Linux are released together within each channel.
+content. Each channel can publish all platforms or only the selected platform.
 
 | Platform | Package                                | Tool                     | Status |
 | -------- | -------------------------------------- | ------------------------ | ------ |
@@ -54,13 +54,17 @@ Actions tab → **Build launcher** → **Run workflow**.
 
 - **version** is the independent launcher version, such as `1.0.1`.
 - **release_notes** contains launcher-only Markdown notes.
+- **platform** selects all platforms, Windows, macOS, or Linux. Pull requests still validate all three.
 - **publish** controls whether the run moves the live launcher channel.
 - **allow_rollback** is reserved for an intentional emergency rollback.
 
-The workflow builds the Windows, universal macOS, and Linux launchers together. A non-publishing
+The workflow builds the selected launcher platforms. A non-publishing
 run uploads workflow artifacts only. A publishing run creates or updates GitHub Release
 `launcher-v<version>`, uploads signed manifests and content-addressed blobs, publishes launcher-only
-release notes, and moves `dist/launcher.json` last.
+release notes, and moves `dist/launcher.json` last. A platform-only release advertises only those
+platforms; other clients keep their installed launcher. Installer builders use the latest published
+launcher bundle for their platform when the current channel does not include it. Backfills use
+the explicitly selected published launcher version.
 
 Installed launchers display this as a **Launcher update**. After downloading and verifying the
 replacement, the launcher restarts before checking for game updates. It restores its window position,

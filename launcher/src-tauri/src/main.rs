@@ -5995,6 +5995,22 @@ mod tests {
     }
 
     #[test]
+    fn launcher_layer_windows_only_release_selects_only_on_windows() {
+        let update: LauncherUpdate = serde_json::from_value(serde_json::json!({
+            "version": "1.3.3",
+            "platforms": {
+                "windows": { "manifest": "windows", "signature": "signature" }
+            }
+        }))
+        .unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(launcher_layer(&update).unwrap().manifest, "windows");
+        #[cfg(not(target_os = "windows"))]
+        assert!(launcher_layer(&update).is_none());
+    }
+
+    #[test]
     fn game_layer_with_all_platforms_selects_current_platform() {
         let update = GameUpdate {
             version: "1.2.3".to_string(),

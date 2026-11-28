@@ -6,20 +6,23 @@ import { join } from "node:path";
 
 import { compareSemanticVersions } from "./semver.mjs";
 
-/** Selects the highest published stable game version with the requested platform download. */
+/** Selects the highest published stable version with the requested platform download. */
 export function latestPlatformRelease(releases, platform) {
   let latest = null;
+  const tagPrefix = platform.tagPrefix ?? "v";
   for (const release of releases) {
+    const tag = release.tag_name;
+    const version =
+      typeof tag === "string" && tag.startsWith(tagPrefix)
+        ? tag.slice(tagPrefix.length)
+        : "";
     if (
       release.draft ||
       release.prerelease ||
-      !/^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u.test(
-        release.tag_name,
-      )
+      !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u.test(version)
     ) {
       continue;
     }
-    const version = release.tag_name.slice(1);
     const asset = release.assets.find(
       (candidate) =>
         candidate.name === platform.versionedAssetName(version) &&
@@ -33,7 +36,7 @@ export function latestPlatformRelease(releases, platform) {
   }
   if (!latest) {
     throw new Error(
-      `No published stable ${platform.label} game download was found.`,
+      `No published stable ${platform.label} ${platform.releaseKind ?? "game"} download was found.`,
     );
   }
   return latest;
