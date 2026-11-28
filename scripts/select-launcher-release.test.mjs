@@ -112,32 +112,39 @@ test("selectLauncherRelease ignores incomplete uploaded bundles", () => {
   assert.equal(selectLauncherRelease({}, releases, "macos").version, "1.3.2");
 });
 
-test("selectLauncherRelease CLI writes the selected platform manifest", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "launcher-selection-"));
-  try {
-    const channelPath = join(directory, "channel.json");
-    const releasesPath = join(directory, "releases.json");
-    const outputPath = join(directory, "selection.json");
-    await writeFile(
-      channelPath,
-      JSON.stringify({
-        version: "1.3.3",
-        platforms: { windows: { manifest: "dist/windows.json" } },
-      }),
-    );
-    await writeFile(releasesPath, JSON.stringify([release("1.3.2", "macos")]));
-    execFileSync(process.execPath, [
-      fileURLToPath(new URL("./select-launcher-release.mjs", import.meta.url)),
-      channelPath,
-      releasesPath,
-      "macos",
-      outputPath,
-    ]);
-    assert.deepEqual(JSON.parse(await readFile(outputPath, "utf8")), {
-      version: "1.3.2",
-      manifest: "dist/launcher-manifest-macos-1.3.2.json",
-    });
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+for (const paginated of [false, true]) {
+  test(`selectLauncherRelease CLI reads ${paginated ? "paginated" : "flat"} releases`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "launcher-selection-"));
+    try {
+      const channelPath = join(directory, "channel.json");
+      const releasesPath = join(directory, "releases.json");
+      const outputPath = join(directory, "selection.json");
+      await writeFile(
+        channelPath,
+        JSON.stringify({
+          version: "1.3.3",
+          platforms: { windows: { manifest: "dist/windows.json" } },
+        }),
+      );
+      const releases = paginated
+        ? [[release("1.3.3", "windows")], [release("1.3.2", "macos")]]
+        : [release("1.3.2", "macos")];
+      await writeFile(releasesPath, JSON.stringify(releases));
+      execFileSync(process.execPath, [
+        fileURLToPath(
+          new URL("./select-launcher-release.mjs", import.meta.url),
+        ),
+        channelPath,
+        releasesPath,
+        "macos",
+        outputPath,
+      ]);
+      assert.deepEqual(JSON.parse(await readFile(outputPath, "utf8")), {
+        version: "1.3.2",
+        manifest: "dist/launcher-manifest-macos-1.3.2.json",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}

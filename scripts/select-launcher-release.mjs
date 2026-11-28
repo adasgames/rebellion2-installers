@@ -47,7 +47,7 @@ async function main() {
     );
   }
   const channel = JSON.parse(await readFile(channelPath, "utf8"));
-  const releases = JSON.parse(await readFile(releasesPath, "utf8"));
+  const releases = JSON.parse(await readFile(releasesPath, "utf8")).flat();
   await writeFile(
     outputPath,
     `${JSON.stringify(selectLauncherRelease(channel, releases, platform))}\n`,

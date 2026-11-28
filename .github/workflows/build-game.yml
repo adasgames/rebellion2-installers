@@ -236,7 +236,7 @@ jobs:
           $base = $env:CHANNEL_BASE.TrimEnd('/')
           $pointer = Invoke-RestMethod "$base/dist/launcher.json"
           $pointer | ConvertTo-Json -Depth 20 | Set-Content launcher.json
-          gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq add | Set-Content launcher-releases.json
+          gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | Set-Content launcher-releases.json
           if ($LASTEXITCODE -ne 0) { throw "Could not list published launchers." }
           node scripts/select-launcher-release.mjs launcher.json launcher-releases.json windows launcher-selection.json
           if ($LASTEXITCODE -ne 0) { throw "Could not select a Windows launcher." }
@@ -333,7 +333,7 @@ jobs:
           set -euo pipefail
           base="${CHANNEL_BASE%/}"
           curl --fail --location --silent --show-error "${base}/dist/launcher.json" -o launcher.json
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq add > launcher-releases.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > launcher-releases.json
           node scripts/select-launcher-release.mjs launcher.json launcher-releases.json macos launcher-selection.json
           launcher_version="$(jq -r .version launcher-selection.json)"
           test -n "$launcher_version"
@@ -397,7 +397,7 @@ jobs:
           set -euo pipefail
           base="${CHANNEL_BASE%/}"
           curl --fail --location --silent --show-error "$base/dist/launcher.json" -o launcher.json
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq add > launcher-releases.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > launcher-releases.json
           node scripts/select-launcher-release.mjs launcher.json launcher-releases.json linux launcher-selection.json
           launcher_version="$(jq -er '.version | select(length > 0)' launcher-selection.json)"
           launcher_manifest="$(jq -er '.manifest | select(length > 0)' launcher-selection.json)"
